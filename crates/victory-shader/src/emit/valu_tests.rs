@@ -112,12 +112,17 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    lower_cs(&words, threads, lds_bytes, 8)
+}
 
+/// Lowers (and validates, with `dxil.dll`) the wave32 compute program `words`
+/// with the root constants and UAV table of [`build_cs`].
+fn lower_cs(words: &[u32], threads: u32, lds_bytes: u32, vgprs: u16) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
-        vgprs: 8,
+        vgprs,
         layout: vec![
             RootParam {
                 root: RootType::Constants,
@@ -1258,4 +1263,116 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+// ---- lane masks read as numbers ----
+
+/// VOPC `op vcc_lo, src0, vsrc1` (`v_cmpx_*`: EXEC).
+const fn vopc(op: u8, src0: u16, vsrc1: u8) -> u32 {
+    0x7C00_0000 | (op as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
+/// SOP1 `op sdst, src0`.
+const fn sop1(op: u8, sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | src0 as u32
+}
+
+const VCC_LO: u8 = 106;
+const EXEC_LO: u8 = 126;
+
+/// A wave32 program of 32 threads like [`build_cs`]'s, each lane storing
+/// its `v0` to dword `lane` of the UAV (`v7`, the byte offset, kept).
+fn build_lanes_cs(body: &[u32]) -> HostShader {
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    for i in 0..4u8 {
+        words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
+    }
+    words.push(vop2(0x1A, 7, 0x82, 0)); // v_lshlrev_b32 v7, 2, v0
+    words.extend_from_slice(body);
+    // buffer_store_dword v0, v7, s[8:11], 0 offen
+    words.extend_from_slice(&[0xE070_1000, 0x80 << 24 | 2 << 16 | 7]);
+    words.push(S_ENDPGM);
+    lower_cs(&words, 32, 0, 16)
+}
+
+/// Runs a [`build_lanes_cs`] program once on the hardware GPU: the 32 lanes'
+/// dwords (0 where a lane stored nothing). Programs that read lane masks
+/// as numbers declare `WaveSize(32)`, which WARP's pipeline creation refuses.
+fn run_lanes(shader: &HostShader) -> Vec<u32> {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("no SM 6.6 hardware device");
+    let (root, pso) = host
+        .compute_pipeline(shader)
+        .unwrap_or_else(|e| panic!("compute_pipeline failed: {e}"));
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let words = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(32)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    words[0].clone()
+}
+
+#[test]
+fn a_lane_mask_carried_round_a_loop_with_numbers_is_its_number() {
+    // A ray traversal's loop: the lanes for a node start as a compare's
+    // mask, then come from a number (here the mask shifted by 8 lanes, in
+    // the title the node stack it keeps in VGPR lanes); each lane tests its
+    // own bit of the join as a number.
+    let body = [
+        vopc(0xC4, 0x88, 0),   // v_cmp_gt_u32 vcc_lo, 8, v0
+        s_mov_b32(20, VCC_LO), // s20 = lanes 0-7
+        s_mov_b32(21, 0x80),   // s21 = 0
+        vop1(0x001, 6, 0x80),  // v_mov_b32 v6, 0
+        vop3(0x365, 5, 0xC1, 0x80, 0)[0],
+        vop3(0x365, 5, 0xC1, 0x80, 0)[1], // v_mbcnt_lo_u32_b32 v5, -1, 0
+        vop3(0x11A, 5, vgpr(5), 0x81, 0)[0],
+        vop3(0x11A, 5, vgpr(5), 0x81, 0)[1], // v_lshlrev_b32 v5, v5, 1
+        // loop:
+        vop2(0x1B, 8, sgpr(20), 5), // v_and_b32 v8, s20, v5
+        vopc(0xC5, 0x80, 8),        // v_cmp_ne_u32 vcc_lo, 0, v8
+        sop2(0x00, 21, 21, 0x81),   // s_add_u32 s21, s21, 1
+        vop1(0x001, 9, sgpr(21)),   // v_mov_b32 v9, s21
+        vop2(0x01, 9, 0x80, 9),     // v_cndmask_b32 v9, 0, v9, vcc_lo
+        vop2(0x25, 6, vgpr(6), 9),  // v_add_nc_u32 v6, v6, v9
+        sop2(0x1E, 20, 20, 0x88),   // s_lshl_b32 s20, s20, 8
+        0xBF0A_8415,                // s_cmp_lt_u32 s21, 4
+        0xBF85_FFF7,                // s_cbranch_scc1 loop
+        vop1(0x001, 0, vgpr(6)),    // v_mov_b32 v0, v6
+    ];
+    let shader = build_lanes_cs(&body);
+    // Lanes 8k..8k+7 have their bit in iteration k.
+    let want: Vec<u32> = (0..32).map(|l| l / 8 + 1).collect();
+    assert_eq!(run_lanes(&shader), want);
+}
+
+#[test]
+fn a_lane_mask_holding_lanes_not_running_is_its_operation() {
+    // With lanes 16-31 out of EXEC, a mask of lanes 0-7 negated holds them
+    // too: the console's number has their bits set, which no ballot of the
+    // running lanes gives.
+    for (op, name, want) in [
+        (sop1(0x07, 20, VCC_LO), "s_not_b32", 0xFFFF_FF00u32),
+        (sop2(0x1C, 20, VCC_LO, EXEC_LO), "s_xnor_b32", 0xFFFF_00FF),
+        (sop2(0x16, 20, VCC_LO, EXEC_LO), "s_orn2_b32", 0xFFFF_00FF),
+    ] {
+        let body = [
+            vopc(0xD4, 0x90, 0),      // v_cmpx_gt_u32 exec_lo, 16, v0
+            vopc(0xC4, 0x88, 0),      // v_cmp_gt_u32 vcc_lo, 8, v0
+            op,                       // s20 = op(vcc_lo[, exec_lo])
+            vop1(0x001, 0, sgpr(20)), // v_mov_b32 v0, s20
+        ];
+        let shader = build_lanes_cs(&body);
+        // Lanes out of EXEC store nothing.
+        let want: Vec<u32> = (0..32).map(|l| if l < 16 { want } else { 0 }).collect();
+        assert_eq!(run_lanes(&shader), want, "{name}");
+    }
 }
