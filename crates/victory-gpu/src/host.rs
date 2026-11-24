@@ -1543,16 +1543,26 @@ fn rehash_runs() -> bool {
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
-/// default). The pieces the card's compare found differing come down in
-/// one fetch and were then merged one after the other on the thread that
-/// settles: about 630 pieces and 40 MB a frame (run 104), each compared
-/// with the copy's CPU side byte by byte and put into title memory through
-/// the kernel. A piece is its own bytes of its copy and of title memory,
-/// so eight threads take an eighth of them each.
+/// into title memory on several threads (on by default;
+/// `VICTORY_WIDE_MERGE=0` merges on one, as before). The pieces the card's
+/// compare found differing come down in one fetch and were then merged one
+/// after the other on the thread that settles: about 630 pieces and 40 MB
+/// a frame (run 104), each compared with the copy's CPU side byte by byte
+/// and put into title memory through the kernel. A piece is its own bytes
+/// of its copy, so eight threads take an eighth of them each, unless two
+/// pieces (of two copies, windows over the same memory) hold the same
+/// title bytes ([`pieces_apart`]): each merge reads the title's bytes and
+/// writes them back, so two at once could undo one another. Opening
+/// cutscene on an RTX 4090: copying back 42 -> 27 ms a frame.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
+}
+
+/// Whether no two of these title memory ranges `[start, end)` overlap.
+fn pieces_apart(mut ranges: Vec<(usize, usize)>) -> bool {
+    ranges.sort_unstable();
+    ranges.windows(2).all(|w| w[0].1 <= w[1].0)
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -1852,6 +1862,20 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// flag it.
 fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(usize, u32)> {
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::pieces_apart;
+
+    /// Pieces merged at once must not share title bytes; touching is fine.
+    #[test]
+    fn pieces_that_share_title_bytes_are_not_apart() {
+        assert!(pieces_apart(vec![]));
+        assert!(pieces_apart(vec![(0x2000, 0x3000), (0x1000, 0x2000), (0x5000, 0x6000)]));
+        assert!(!pieces_apart(vec![(0x1000, 0x2000), (0x5000, 0x6000), (0x1fff, 0x2800)]));
+        assert!(!pieces_apart(vec![(0x1000, 0x2000), (0x1000, 0x2000)]));
+    }
 }
 
 #[cfg(test)]
@@ -3585,7 +3609,18 @@ impl Host {
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
-            if wide_merge() && pieces.len() >= 8 {
+            let apart = || {
+                pieces_apart(
+                    pieces
+                        .iter()
+                        .map(|&(i, lo, hi, _)| {
+                            let start = plan.ranges[i].shadow.span().0 as usize;
+                            (start + lo, start + hi)
+                        })
+                        .collect(),
+                )
+            };
+            if wide_merge() && pieces.len() >= 8 && apart() {
                 // The pieces are apart from one another (each its own bytes
                 // of its copy and of title memory): several at a time.
                 let fetched = *data;
