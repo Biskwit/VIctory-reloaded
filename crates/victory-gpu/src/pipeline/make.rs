@@ -43,6 +43,11 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
+    /// Its shaders' hashes, as logged (diagnostics).
+    pub(crate) fn hashes(&self) -> Vec<&str> {
+        self.shaders.iter().map(|s| s.hash.as_str()).collect()
+    }
+
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {

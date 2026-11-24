@@ -398,18 +398,73 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
 fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
+    // A loop header's phis are taken alike until a pass shows one of their incoming values is
+    // not (their loop-back values come later in the order); the lanes still in a loop are at
+    // the same iteration, so a header needs no block every lane runs.
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut rpo = vec![usize::MAX; p.blocks.len()];
+    for (n, &b) in order.iter().enumerate() {
+        rpo[b] = n;
+    }
+    let header = |b: usize| p.blocks[b].preds.iter().any(|&q| rpo[q] != usize::MAX && rpo[b] <= rpo[q]);
+    let mut assumed: HashSet<Value> = order
+        .iter()
+        .filter(|&&b| header(b))
+        .flat_map(|&b| p.blocks[b].phis.iter())
+        .filter(|phi| matches!(phi.reg, Reg::V(_)))
+        .map(|phi| phi.value)
+        .collect();
+    loop {
+        let same = lane_uniform_pass(p, st, all, &order, &assumed);
+        let kept: HashSet<Value> = order
+            .iter()
+            .flat_map(|&b| p.blocks[b].phis.iter())
+            .filter(|phi| assumed.contains(&phi.value) && phi.args.iter().all(|a| same.contains(a)))
+            .map(|phi| phi.value)
+            .collect();
+        if kept.len() == assumed.len() {
+            return same;
+        }
+        assumed = kept;
+    }
+}
+
+/// One pass of [`lane_uniform`], with the loop-header phis in `assumed` taken alike.
+fn lane_uniform_pass(
+    p: &Program,
+    st: &Structured,
+    all: &[bool],
+    order: &[usize],
+    assumed: &HashSet<Value>,
+) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let mut same: HashSet<Value> = HashSet::new();
-    for b in crate::ir::reverse_postorder(&p.blocks) {
+    for &b in order {
         let block = &p.blocks[b];
         let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
         for phi in &block.phis {
-            if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
+            if matches!(phi.reg, Reg::V(_))
+                && (assumed.contains(&phi.value) || whole && phi.args.iter().all(|a| same.contains(a)))
+            {
                 same.insert(phi.value);
             }
         }
         for (i, inst) in block.insts.iter().enumerate() {
             let name = inst.name();
+            // An LDS read at an address every lane holds alike reads one value.
+            // shortcut: taken to see no write by another lane between the lanes' reads (the
+            // title's writes are behind a barrier where this matters).
+            if let Fields::Ds { .. } = &inst.fields
+                && name.starts_with("ds_read")
+                && st.guards[b][i].is_none()
+            {
+                let reads: Vec<Value> =
+                    inst.reads.iter().filter(|r| matches!(r.0, Reg::V(_))).map(|r| r.1).collect();
+                if !reads.is_empty() && reads.iter().all(|x| same.contains(x)) {
+                    same.extend(inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))).map(|w| w.1));
+                }
+                continue;
+            }
             let ops: Vec<Operand> = match &inst.fields {
                 Fields::Valu(v)
                     if v.dpp.is_none()

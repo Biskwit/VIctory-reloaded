@@ -295,6 +295,9 @@ pub(crate) fn builder_runs() -> bool {
     }
     let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
     if missing > 0 {
+        for p in b.pipelines.iter().filter(|p| !make::now(p)) {
+            tracing::warn!(shaders = ?p.hashes(), "a ray-tracing structure builder program without a host pipeline");
+        }
         b.off = true;
         tracing::warn!(
             missing,
