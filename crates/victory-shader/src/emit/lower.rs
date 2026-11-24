@@ -192,7 +192,8 @@ struct Lower<'a> {
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
     /// Descriptor dwords with no host value (addresses, formats, all of a constant
-    /// buffer's): no program reads them as numbers ([`Self::dead`]).
+    /// buffer's), and what the first half of an interpolation its second half lowers whole
+    /// leaves: no program reads them as numbers ([`Self::dead`]).
     stale: HashSet<Value>,
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
@@ -6889,7 +6890,10 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
+                // (a register whose old value is dead, the first half of an
+                // interpolation say, keeps no half anyone reads: 0)
                 let old = match inst.read(Reg::V(reg)) {
+                    Some(o) if self.stale.contains(&o) => self.i32_of(o).unwrap_or(self.s.m.i32(0)),
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
@@ -8361,6 +8365,9 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
+            // Its second half is the whole interpolation; the intermediate is read by
+            // nothing else, so the bits it leaves in its register are dead (`dead`).
+            self.stale.extend(inst.writes.iter().map(|w| w.1));
             return Err("the first half of an interpolation");
         };
         let name = inst.name();
