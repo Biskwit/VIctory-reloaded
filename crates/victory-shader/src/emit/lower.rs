@@ -1761,12 +1761,25 @@ impl<'a> Lower<'a> {
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
         self.s.flags |= flags::WAVE_OPS;
-        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        // An f16 sum is taken in f32 and rounded to f16 once, into the low
+        // half (each console step rounds; the sum may differ in its last bit).
+        // shortcut: the high half is 0, not the first lane's own high half.
+        let half = op == Op::AddH;
+        let float = matches!(op, Op::AddF | Op::AddH | Op::MinF | Op::MaxF);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
-        let arg = if float { self.as_float(x) } else { x };
+        let arg = if half {
+            let m = self.s.m.i32(0xFFFF);
+            let h = self.s.m.bin(c, Bin::And, x, m);
+            self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h])
+        } else if float {
+            self.as_float(x)
+        } else {
+            x
+        };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
+            (Op::AddH, Some(_)) => return Err("a wave prefix of f16 values"),
             (Op::AddU | Op::AddF, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
                 let r = self.s.op(
@@ -1796,7 +1809,7 @@ impl<'a> Lower<'a> {
             (_, None) => {
                 let (code, unsigned) = match op {
                     Op::AddU => (0, 1),
-                    Op::AddF => (0, 0),
+                    Op::AddF | Op::AddH => (0, 0),
                     Op::MinU => (2, 1),
                     Op::MaxU => (3, 1),
                     Op::MinI | Op::MinF => (2, 0),
@@ -1847,7 +1860,7 @@ impl<'a> Lower<'a> {
                     let (lo, hi) = self.exchange_halves(c, rb);
                     let (lo, hi) = (back(self, lo), back(self, hi));
                     match op {
-                        Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
+                        Op::AddU | Op::AddF | Op::AddH => self.s.m.bin(c, Bin::Add, lo, hi),
                         Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
                         Op::And => self.s.m.bin(c, Bin::And, lo, hi),
                         Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),
@@ -1869,7 +1882,13 @@ impl<'a> Lower<'a> {
         } else {
             r
         };
-        Ok(if float { self.as_int(r) } else { r })
+        Ok(if half {
+            self.s.op(self.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[r])
+        } else if float {
+            self.as_int(r)
+        } else {
+            r
+        })
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {

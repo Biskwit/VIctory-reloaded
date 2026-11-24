@@ -21,6 +21,8 @@ use crate::ir::{EXEC, Inst, Program, Reg, Value};
 pub(crate) enum Op {
     AddU,
     AddF,
+    /// An f16 sum, in the low half of each lane's dword.
+    AddH,
     MinU,
     MaxU,
     MinI,
@@ -39,6 +41,7 @@ impl Op {
             // the high one) is the 32-bit sum of the low dwords
             "v_add_nc_u32" | "v_add_co_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
+            "v_add_f16" => Op::AddH,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
             "v_min_i32" => Op::MinI,
@@ -57,6 +60,7 @@ impl Op {
         match self {
             Op::AddU | Op::Or | Op::Xor | Op::MaxU => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
+            Op::AddH => k & 0xFFFF == 0 || k & 0xFFFF == 0x8000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
             Op::MaxI => k == 0x8000_0000,
@@ -67,7 +71,7 @@ impl Op {
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::Xor)
+        matches!(self, Op::AddU | Op::AddF | Op::AddH | Op::Xor)
     }
 }
 
@@ -471,6 +475,8 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     .collect()
             }
             (n, Some(a)) => match (Op::of(n), src(1)) {
+                // An f16 sum of high halves is not the low halves' sum.
+                (Some(Op::AddH), _) if v.opsel != 0 => vec![Sym::Unknown; wave as usize],
                 (Some(op), Some(b)) => (0..wave as usize)
                     .map(|l| combine(op, a[l], b[l]))
                     .collect(),
@@ -948,5 +954,31 @@ mod tests {
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
         }
+    }
+
+    #[test]
+    fn wave64_f16_sum_is_a_reduction() {
+        // The console's WaveActiveSum of halves (Grand Theft Auto VI,
+        // b22a16a178976e1b): rows by DPP, rows' halves by v_permlanex16,
+        // halves of the wave by v_readlane 32.
+        let mut w = vec![sop1(0, 0x25, 193)];
+        w.extend(vop3(1, 0x101, 128, 256, 0));
+        for x in [1u16, 2, 4, 8] {
+            w.push(vop2(1, 0x32, 0xFA, 1));
+            w.push(dpp16(1, 0x160 + x, 0xF, 0xF, true));
+        }
+        w.extend(vop3(2, 0x378, 257, 128, 128));
+        w.push(vop2(1, 0x32, 258, 1));
+        w.extend(vop3(2, 0x360, 257, 128 + 32, 0));
+        w.push(vop2(1, 0x32, 2, 1));
+        w.extend(vop3(3, 0x360, 257, 128, 0));
+        w.push(sop1(EXEC, 0x04, 0));
+        let p = build(&w, true);
+        let insts = &p.blocks[0].insts;
+        let saved = insts[0].write(Reg::S(0)).unwrap();
+        let v0_in = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(0)).then_some(v)).unwrap();
+        let sum = insts[10].write(Reg::S(3)).unwrap();
+        let sec = &sections(&p, 0)[&0];
+        assert_eq!(sec.shapes.get(&sum), Some(&Shape::Active(Op::AddH, v0_in, saved, 0)));
     }
 }
