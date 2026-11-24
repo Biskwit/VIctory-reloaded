@@ -1134,6 +1134,12 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            // A script drives the stand-in pad, which a host pad would
+            // replace.
+            #[cfg(feature = "diagnostics")]
+            if scripting() {
+                return None;
+            }
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1196,6 +1202,14 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
+    }
+
+    /// Whether `VICTORY_KEYS` is set: host pads are then left out, so that
+    /// the keys drive the stand-in pad whatever pads the host has.
+    #[cfg(feature = "diagnostics")]
+    fn scripting() -> bool {
+        static SET: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_KEYS").is_some());
+        *SET
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
