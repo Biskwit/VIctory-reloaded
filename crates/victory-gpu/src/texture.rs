@@ -66,6 +66,9 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The guard missed a write to it (one through another view): it is
+    /// hashed at every check from then on.
+    blind: bool,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -646,8 +649,15 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        // A texture the guard once missed a write to (a video's planes, which
+        // the title's decoder writes through another view: their changes
+        // came up to eight frames late and each plane on its own turn, so
+        // frames mixed planes of different pictures) is hashed at every
+        // check from then on.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut missed = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
+            && !last.blind
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
@@ -657,7 +667,14 @@ impl Staging {
             if unwritten && !turn {
                 return 0;
             }
+            missed = unwritten;
         }
+        let blind = |last: &mut Last| {
+            if missed && !last.blind {
+                last.blind = true;
+                tracing::debug!(memory = ?start, size, "texture written behind its guard: hashed at every check from now on");
+            }
+        };
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
@@ -697,6 +714,7 @@ impl Staging {
                     return false;
                 }
                 last.hash = Some(hash);
+                blind(last);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -719,6 +737,7 @@ impl Staging {
                     return size;
                 }
                 last.hash = Some(hash);
+                blind(last);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -735,6 +754,7 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
+                blind(last);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
