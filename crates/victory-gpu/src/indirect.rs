@@ -690,7 +690,8 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::host::card_groups(PIECES);
+                warp.list.Dispatch(x, y, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -718,6 +719,25 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        // The first and last bytes of a piece (the first and last of the
+        // group's 64 slices) count as well.
+        for at in [2 * PIECE, 3 * PIECE - 1] {
+            // SAFETY (each): inside the mapping.
+            unsafe { now_ptr.add(at).write_volatile(content[at] ^ 1) };
+            assert_eq!(run(&mut warp, 2), [0, 0, 1]);
+            assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        }
+    }
+
+    /// A compare pass has a group per piece, in rows of 65,535.
+    #[test]
+    fn card_compare_groups_cover_every_piece() {
+        use crate::host::card_groups;
+        assert_eq!(card_groups(0), (0, 0));
+        assert_eq!(card_groups(3), (3, 1));
+        assert_eq!(card_groups(65_535), (65_535, 1));
+        assert_eq!(card_groups(65_536), (65_535, 2));
+        assert_eq!(card_groups(200_000), (65_535, 4));
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.

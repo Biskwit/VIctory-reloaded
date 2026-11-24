@@ -1442,11 +1442,18 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
+/// its bytes from before, one group of 64 threads per 64 KiB piece (cut at
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts them;
+/// groups in rows of 65,535, [`card_groups`]): `differs` gets a dword per
+/// piece, 1 where a byte differs. The offsets are widened to 16 bytes;
+/// buffers are multiples of 64 KiB, and a piece flagged for a byte just
+/// outside the range costs a fetch that finds nothing.
+///
+/// Each thread hashes a sixty-fourth of the piece and the first folds the
+/// 64 hashes in order. One thread walked the whole piece before: 4,096
+/// steps one after the other, so every pass took that long however few its
+/// pieces, and an RTX 4090 ran some 1,100 such passes a frame in the
+/// opening cutscene.
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1462,24 +1469,41 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+static const uint4 SEED = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+uint4 fold(uint4 h, uint4 x) {
+    h = (h ^ x) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    return h.yzwx ^ (h >> 15);
+}
+groupshared uint4 part[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
+void main(uint3 g : SV_GroupID, uint t : SV_GroupIndex) {
+    uint n = g.y * 65535u + g.x;
+    // The whole group leaves together, before the barrier.
+    if (n >= pieces) return;
+    uint piece = first + n;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    uint4 h = SEED;
+    // The last thread to the end: widened to 16 bytes, a piece may be 16
+    // bytes longer than 64 KiB.
+    uint end = t == 63u ? hi : min(lo + (t + 1u) * 1024u, hi);
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
+    for (uint at = lo + t * 1024u; at < end; at += 16u) {
+        h = fold(h, now.Load4(at));
+    }
+    part[t] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (t != 0u) return;
+    h = SEED;
+    for (uint i = 0u; i < 64u; i++) {
+        h = fold(h, part[i]);
     }
     if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        differs.Store(out_at + n * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
         if (compare == 2u) hashes.Store4(piece * 16u, h);
@@ -1489,15 +1513,22 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// The groups of a [`CARD_COMPARE`] pass over `pieces` pieces: one a piece,
+/// in rows of 65,535 (the most of one dimension).
+pub(crate) fn card_groups(pieces: u32) -> (u32, u32) {
+    (pieces.min(65_535), pieces.div_ceil(65_535))
+}
+
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
 /// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
 /// per range sent up.
 ///
 /// These passes are ours, they run on the card before every submission's
-/// lists, and no timing so far names them: each walks its 64 KiB pieces
-/// 16 bytes at a time, 4,096 steps one after the other, so a pass takes
-/// the time of one piece however few its pieces are. Run 102 sent up 514
+/// lists, and no timing so far names them: each walked its 64 KiB pieces
+/// 16 bytes at a time, 4,096 steps one after the other, so a pass took
+/// the time of one piece however few its pieces were (64 steps a thread
+/// since [`CARD_COMPARE`] has a group per piece). Run 102 sent up 514
 /// ranges a frame: 514 such passes. The same pieces are hashed either way;
 /// a piece hashed when it need not be, or not hashed when it should, costs
 /// a fetch that finds nothing and loses no shader write.
@@ -3077,7 +3108,8 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            let (x, y) = card_groups(run.pieces);
+                            list.Dispatch(x, y, 1);
                         }
                     }
                     list.Close()?;
@@ -3162,7 +3194,8 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        let (x, y) = card_groups(r.span.pieces);
+                        list.Dispatch(x, y, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
