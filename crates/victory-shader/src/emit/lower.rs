@@ -244,8 +244,8 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
-    /// With `exchange`: the two host waves of a console wave meet each other alone, six dwords
-    /// per console wave ([`with_pair_meetings`], [`Self::pair_meet`]).
+    /// With `exchange`: the two host waves of a console wave meet each other alone,
+    /// [`PAIR_DWORDS`] per console wave ([`with_pair_meetings`], [`Self::pair_meet`]).
     pair_meet: bool,
     /// With `pair_meet`: the lane masks a number is taken of, made where they are written
     /// (a meeting needs a block still open).
@@ -253,6 +253,10 @@ struct Lower<'a> {
     /// With `pair_meet`: a mask's number may be made now, between instructions (a meeting
     /// starts a new block, which the lowering of an instruction would not see).
     meeting_ok: bool,
+    /// With `pair_meet`: the LDS accesses of the current block since the halves last met there
+    /// in order (`pair_meet`'s `ordered`): none, reads only, or a write (`LDS_WROTE`, as at a
+    /// block's start).
+    lds_since: u8,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -1035,6 +1039,16 @@ thread_local! {
     static PAIR_MEET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// [`Lower::lds_since`]: an LDS write since the halves last met.
+const LDS_WROTE: u8 = 2;
+/// Values one [`Lower::pair_meet`] exchanges at most.
+const PAIR_VALUES: u32 = 2;
+/// Tagged words of a meeting: two per value.
+const PAIR_WORDS: u32 = 2 * PAIR_VALUES;
+/// LDS dwords per console wave where the halves meet alone: each half's words for even and odd
+/// meetings, then each half's count of meetings.
+const PAIR_DWORDS: u32 = 4 * PAIR_WORDS + 2;
+
 /// Runs `f` with the two host waves of each console wave meeting each other alone where they
 /// exchange (`Lower::pair_meet`), not with the whole group at a barrier. For a group of several
 /// console waves, which may go different ways at a branch on a value of their own (a
@@ -1054,7 +1068,7 @@ pub(super) fn with_pair_meetings<R>(f: impl FnOnce() -> R) -> R {
 /// 32..63 by half. Right for code that only relies on what HLSL's wave
 /// operations promise; a program that takes one wave to be its whole
 /// thread group gets per-half results. The last resort for programs that
-/// do not translate otherwise.
+/// do not translate otherwise, with `VICTORY_WAVE_LOCAL=any`.
 pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
     let was = LOCAL_ANY.replace(true);
     let r = with_local_waves(f);
@@ -1386,11 +1400,11 @@ impl<'a> Lower<'a> {
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
             // several whole console waves, whose halves meet alone (`with_pair_meetings`), where
-            // their six dwords each (and `halves`' one) still fit the host's 32 KB of LDS
+            // their dwords (and `halves`' one) still fit the host's 32 KB of LDS
             let pair_mode = PAIR_MEET.get()
                 && group > 64
                 && group.is_multiple_of(64)
-                && s.lds_dwords + 6 * group / 64 < 8192;
+                && s.lds_dwords + PAIR_DWORDS * group / 64 < 8192;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
             // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
@@ -1448,9 +1462,10 @@ impl<'a> Lower<'a> {
                             if crosses || pair_mode && split_lds {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
-                                // (six where the halves meet alone, `Lower::pair_meet`)
+                                // (`PAIR_DWORDS` where the halves meet alone, `Lower::pair_meet`)
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += if pair_mode { 6 } else { 2 } * group.div_ceil(64);
+                                s.lds_dwords +=
+                                    if pair_mode { PAIR_DWORDS } else { 2 } * group.div_ceil(64);
                                 pair_meet = pair_mode;
                             }
                         }
@@ -1632,6 +1647,7 @@ impl<'a> Lower<'a> {
                 HashSet::new()
             },
             meeting_ok: false,
+            lds_since: LDS_WROTE,
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
@@ -2137,6 +2153,7 @@ impl<'a> Lower<'a> {
                 self.vals.insert(phi.value, val);
             }
             self.eager_masks(p.blocks[b].phis.iter().map(|phi| phi.value));
+            self.lds_since = LDS_WROTE;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
             }
@@ -3637,7 +3654,7 @@ impl<'a> Lower<'a> {
         {
             // the meetings' dwords start at 0 (thread n zeroes dword n, the rest the last)
             let threads = self.s.threads.map_or(64, |t| t.iter().product::<u32>());
-            let last = self.s.m.i32(6 * threads.div_ceil(64) - 1);
+            let last = self.s.m.i32(PAIR_DWORDS * threads.div_ceil(64) - 1);
             let flat = self.s.op(
                 e,
                 "flattenedThreadIdInGroup.i32",
@@ -3734,7 +3751,7 @@ impl<'a> Lower<'a> {
             if at != self.cur {
                 return Err("an exchange in a block the host waves have left");
             }
-            return Ok(self.pair_meet(mine));
+            return Ok(self.pair_meet(&[mine], false)[0]);
         }
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
@@ -3758,73 +3775,113 @@ impl<'a> Lower<'a> {
     }
 
     /// The two host waves of this thread's console wave meet each other alone, at the current
-    /// block, which every lane of both runs: each gives `mine` (the same in all its lanes) and
-    /// both get (lower half's, upper half's); the current block is then a new one.
+    /// block, which every lane of both runs: each gives `mine` (up to [`PAIR_VALUES`], each the
+    /// same in all its lanes) and both get (lower half's, upper half's) of each; the current
+    /// block is then a new one. `ordered`: the halves' LDS accesses before the meeting are seen
+    /// by those after it, in both halves (fences around it); a meeting with nothing to give is
+    /// for that.
     ///
-    /// Per console wave six dwords: the halves' values for even and odd meetings, then each
-    /// half's count of meetings. A half counts this meeting (its `n`), writes its value for
-    /// `n`'s parity, fences, publishes `n`, waits for the other's count to reach `n`, fences and
-    /// reads the other's value. The other half rewrites a slot of that parity only at meeting
-    /// `n + 2`, after its meeting `n + 1` waited for this half's `n + 1`, published after this
-    /// read.
-    // shortcut: the wait gives up after PAIR_WAIT passes, leaving a value the other half may not
+    /// Each value goes as two words, its low and high 16 bits under the meeting's number (its
+    /// low 16 bits) as a tag, in a dword of the half's own for even or odd meetings (a plain
+    /// store: one dword is written whole); the other half spins on atomic reads of its dwords
+    /// until they carry this meeting's tag. A dword holds its tag and payload together, so no
+    /// fence orders the words (an atomic for every word cost a third more a meeting). Per
+    /// console wave [`PAIR_DWORDS`]: those dwords, then each half's count of meetings, which
+    /// only that half reads. A half rewrites a dword of a parity only at meeting `n + 2`, after
+    /// its meeting `n + 1` waited for the other's words of `n + 1`, written after the other
+    /// read those of `n`.
+    // shortcut: the wait gives up after PAIR_WAIT passes, leaving words the other half may not
     // have written, rather than hanging the GPU if it never comes.
-    fn pair_meet(&mut self, mine: V) -> (V, V) {
+    fn pair_meet(&mut self, mine: &[V], ordered: bool) -> Vec<(V, V)> {
         const PAIR_WAIT: u32 = 1 << 20;
         let slot = self.exchange.as_ref().map_or(0, |e| e.0);
         let pair = self.exchange_pair(slot);
         let cl = self.console_lane();
         let c = self.cur;
         let (i32t, lds) = (self.s.t.i32, self.s.lds());
-        let (k1, k2, k4, k5) = (
+        let (k1, k2, k5, k16) = (
             self.s.m.i32(1),
             self.s.m.i32(2),
-            self.s.m.i32(4),
             self.s.m.i32(5),
+            self.s.m.i32(16),
         );
+        let low = self.s.m.i32(0xFFFF);
         let half = self.s.m.bin(c, Bin::LShr, cl, k5);
         let other = self.s.m.bin(c, Bin::Xor, half, k1);
-        let counts = self.s.m.bin(c, Bin::Add, pair, k4);
-        let mine_at = self.s.m.bin(c, Bin::Add, counts, half);
-        let other_at = self.s.m.bin(c, Bin::Add, counts, other);
-        // this meeting's number, and the value slots of its parity
-        let ptr = self.s.m.element(c, lds, mine_at);
+        // this meeting's number, its tag and parity
+        let count = self.s.m.i32(4 * PAIR_WORDS);
+        let count = self.s.m.bin(c, Bin::Add, pair, count);
+        let count = self.s.m.bin(c, Bin::Add, count, half);
+        let ptr = self.s.m.element(c, lds, count);
         let before = self.s.m.load(c, ptr);
         let n = self.s.m.bin(c, Bin::Add, before, k1);
+        self.s.m.store(c, ptr, n);
         let parity = self.s.m.bin(c, Bin::And, n, k1);
-        let slot_of = |l: &mut Self, h: V| {
-            let x = l.s.m.bin(c, Bin::Mul, h, k2);
-            let x = l.s.m.bin(c, Bin::Add, x, parity);
-            l.s.m.bin(c, Bin::Add, pair, x)
+        let tag = self.s.m.bin(c, Bin::And, n, low);
+        let tagged = self.s.m.bin(c, Bin::Shl, tag, k16);
+        // word `w` of half `h`: pair + (w * 2 + h) * 2 + parity
+        let word_at = |l: &mut Self, block: usize, w: u32, h: V| {
+            let x = l.s.m.i32(4 * w);
+            let y = l.s.m.bin(block, Bin::Mul, h, k2);
+            let x = l.s.m.bin(block, Bin::Add, x, y);
+            let x = l.s.m.bin(block, Bin::Add, x, parity);
+            l.s.m.bin(block, Bin::Add, pair, x)
         };
-        let mine_slot = slot_of(self, half);
-        let other_slot = slot_of(self, other);
-        let ptr = self.s.m.element(c, lds, mine_slot);
-        self.s.m.store(c, ptr, mine);
-        self.lds_fence(c);
-        let ptr = self.s.m.element(c, lds, mine_at);
-        self.s.m.atomic(c, Rmw::Xchg, ptr, n);
+        let mut words = Vec::new();
+        for &v in mine {
+            let lo = self.s.m.bin(c, Bin::And, v, low);
+            let hi = self.s.m.bin(c, Bin::LShr, v, k16);
+            words.extend([lo, hi]);
+        }
+        if words.is_empty() {
+            words.push(self.s.m.i32(0));
+        }
+        if ordered {
+            self.lds_fence(c);
+        }
+        for (w, &x) in words.iter().enumerate() {
+            let at = word_at(self, c, w as u32, half);
+            let ptr = self.s.m.element(c, lds, at);
+            let x = self.s.m.bin(c, Bin::Or, tagged, x);
+            self.s.m.store(c, ptr, x);
+        }
         let (wait, done) = (self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(c, Term::Br(wait));
         let tries = self.s.m.phi(wait, i32t);
         let zero = self.s.m.i32(0);
-        let ptr = self.s.m.element(wait, lds, other_at);
-        let seen = self.s.m.atomic(wait, Rmw::Or, ptr, zero);
-        let arrived = self.s.m.cmp(wait, pred::IUGE, seen, n);
+        let mut theirs = Vec::new();
+        let mut arrived = None;
+        for w in 0..words.len() {
+            let at = word_at(self, wait, w as u32, other);
+            let ptr = self.s.m.element(wait, lds, at);
+            let seen = self.s.m.atomic(wait, Rmw::Or, ptr, zero);
+            let its = self.s.m.bin(wait, Bin::LShr, seen, k16);
+            let now = self.s.m.cmp(wait, pred::EQ, its, tag);
+            arrived = Some(arrived.map_or(now, |a| self.s.m.bin(wait, Bin::And, a, now)));
+            theirs.push(self.s.m.bin(wait, Bin::And, seen, low));
+        }
+        let arrived = arrived.expect("a word");
         let next = self.s.m.bin(wait, Bin::Add, tries, k1);
         let limit = self.s.m.i32(PAIR_WAIT);
         let gave_up = self.s.m.cmp(wait, pred::IUGE, next, limit);
         let leave = self.s.m.bin(wait, Bin::Or, arrived, gave_up);
         self.s.m.terminate(wait, Term::CondBr(leave, done, wait));
         self.s.m.set_phi(tries, vec![(zero, c), (next, wait)]);
-        self.lds_fence(done);
-        let ptr = self.s.m.element(done, lds, other_slot);
-        let theirs = self.s.m.load(done, ptr);
+        if ordered {
+            self.lds_fence(done);
+            self.lds_since = 0;
+        }
         self.cur = done;
         let upper = self.s.m.cmp(done, pred::NE, half, zero);
-        let lo = self.s.m.select(done, upper, theirs, mine);
-        let hi = self.s.m.select(done, upper, mine, theirs);
-        (lo, hi)
+        let mut out = Vec::new();
+        for (k, &v) in mine.iter().enumerate() {
+            let hi = self.s.m.bin(done, Bin::Shl, theirs[2 * k + 1], k16);
+            let other_v = self.s.m.bin(done, Bin::Or, theirs[2 * k], hi);
+            let lo = self.s.m.select(done, upper, other_v, v);
+            let hi = self.s.m.select(done, upper, v, other_v);
+            out.push((lo, hi));
+        }
+        out
     }
 
     /// A shared-memory fence in `block` (no wait for the group).
@@ -3836,8 +3893,8 @@ impl<'a> Lower<'a> {
     }
 
     /// The first of the exchange dwords of this thread's console wave (made in the entry
-    /// block): a group of several console waves has its own for each (two, or six where the
-    /// halves meet alone).
+    /// block): a group of several console waves has its own for each (two, or [`PAIR_DWORDS`]
+    /// where the halves meet alone).
     fn exchange_pair(&mut self, slot: u32) -> V {
         if let Some(v) = self.pair {
             return v;
@@ -3847,7 +3904,8 @@ impl<'a> Lower<'a> {
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
         let first = if self.pair_meet {
-            self.s.m.bin(e, Bin::Mul, wave, six)
+            let per = self.s.m.i32(PAIR_DWORDS);
+            self.s.m.bin(e, Bin::Mul, wave, per)
         } else {
             let one = self.s.m.i32(1);
             self.s.m.bin(e, Bin::Shl, wave, one)
@@ -4784,14 +4842,21 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
-        if self.split_lds
-            && matches!(inst.fields, Fields::Ds { .. })
-            && !(name.starts_with("ds_swizzle") || name.contains("permute"))
-            && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
-        {
+        let lds = matches!(inst.fields, Fields::Ds { .. })
+            && !(name.starts_with("ds_swizzle") || name.contains("permute"));
+        let read = name.starts_with("ds_read");
+        if self.split_lds && lds && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b]) {
             // the two host waves of a console wave meet before each LDS access: what the other
-            // half wrote is visible, and what it still reads is not overwritten
-            self.lds_meeting();
+            // half wrote is visible, and what it still reads is not overwritten (where they met
+            // alone, not again before a first access or a read after reads: both halves ran
+            // the same accesses since)
+            let met = self.pair_meet && (self.lds_since == 0 || read && self.lds_since == 1);
+            if !met {
+                self.lds_meeting();
+            }
+        }
+        if lds {
+            self.lds_since = self.lds_since.max(if read { 1 } else { LDS_WROTE });
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
@@ -4871,8 +4936,7 @@ impl<'a> Lower<'a> {
     /// fence, or [`Self::pair_meet`]): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
         if self.pair_meet {
-            let z = self.s.m.i32(0);
-            self.pair_meet(z);
+            self.pair_meet(&[], true);
             return;
         }
         let mode = self.s.m.i32(meeting_mode());
@@ -7410,7 +7474,7 @@ impl<'a> Lower<'a> {
                         let k31 = self.s.m.i32(31);
                         let here = self.s.m.bin(self.cur, Bin::And, lane, k31);
                         let mine = self.read_lane(a, here);
-                        let (lo, hi) = self.pair_meet(mine);
+                        let (lo, hi) = self.pair_meet(&[mine], false)[0];
                         let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
                         let upper = self.s.m.bin(self.cur, Bin::And, lane, k32);
                         let upper = self.s.m.cmp(self.cur, pred::NE, upper, z);
@@ -7482,8 +7546,16 @@ impl<'a> Lower<'a> {
                     }
                     let i32t = self.s.t.i32;
                     let has = self.s.m.cast(self.cur, Cast::ZExt, any, i32t);
-                    let (lo_has, hi_has) = self.exchange_halves(self.cur, has)?;
-                    let (lo, hi) = self.exchange_halves(self.cur, mine)?;
+                    let ((lo_has, hi_has), (lo, hi)) = if self.pair_meet {
+                        // (one meeting for both)
+                        let both = self.pair_meet(&[has, mine], false);
+                        (both[0], both[1])
+                    } else {
+                        (
+                            self.exchange_halves(self.cur, has)?,
+                            self.exchange_halves(self.cur, mine)?,
+                        )
+                    };
                     let c = self.cur;
                     let z = self.s.m.i32(0);
                     let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
