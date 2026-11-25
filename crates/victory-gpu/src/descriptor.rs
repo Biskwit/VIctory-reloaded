@@ -177,6 +177,9 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+    // Nanoseconds: asking which pages changed, reading them, looking at
+    // their records (and mirroring the new ones).
+    let (mut taking, mut reading, mut looking) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
@@ -191,7 +194,10 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
+        let took = std::time::Instant::now();
+        let changed = written.take(start as usize, end as usize);
+        taking += took.elapsed().as_nanos() as u64;
+        for (range_from, range_end) in changed {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
@@ -200,7 +206,11 @@ pub(crate) fn sync_heaps() {
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
+                let read = std::time::Instant::now();
+                let got = crate::host::read_into(from as *const u8, &mut page_bytes);
+                let looks = std::time::Instant::now();
+                reading += (looks - read).as_nanos() as u64;
+                if got {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     for index in slots {
@@ -220,39 +230,48 @@ pub(crate) fn sync_heaps() {
                             mirrored += 1;
                         }
                     }
+                    looking += looks.elapsed().as_nanos() as u64;
                 }
                 page += crate::watch::PAGE;
             }
         }
     }
     drop(heaps);
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
+    let parts = [pages, looked, mirrored, started.elapsed().as_micros() as u64, taking, reading, looking];
+    for (count, n) in SYNCED.iter().zip(parts) {
         count.fetch_add(n, Relaxed);
     }
 }
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
-/// not the one last seen (mirrored), and the microseconds it took.
+/// not the one last seen (mirrored), and the microseconds it took; of that
+/// the nanoseconds asking which pages changed, reading them, and looking
+/// at their records.
 #[cfg(windows)]
-pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
-    let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [pages, looked, mirrored, micros, taking, reading, looking] =
+        [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if pages == 0 {
         return;
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms",
+         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms (asking which pages          changed {:.2}, reading them {:.2}, looking at their records and mirroring {:.2}, of that making the new ones {:.2})",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
-        micros as f64 / 1000.0 / frames
+        micros as f64 / 1000.0 / frames,
+        taking as f64 / 1e6 / frames,
+        reading as f64 / 1e6 / frames,
+        looking as f64 / 1e6 / frames,
+        host::COPIED_MIRROR_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / frames
     );
 }
 

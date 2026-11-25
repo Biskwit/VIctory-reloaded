@@ -1436,7 +1436,9 @@ impl HostHeap {
             }
             *last = print;
         }
+        let mirroring = std::time::Instant::now();
         self.mirror(index, handle, false);
+        COPIED_MIRROR_NS.fetch_add(mirroring.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
@@ -1757,6 +1759,10 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame line: the nanoseconds [`HostHeap::mirror_copied`]
+/// spent making the records it found new ([`HostHeap::mirror`]).
+pub(crate) static COPIED_MIRROR_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
