@@ -72,8 +72,18 @@ pub fn set_memory_pages(on: bool) {
     MEMORY_PAGES_ON.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's [`memory_pages`], in place of the switch the test threads share.
+    pub(crate) static TEST_MEMORY_PAGES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether [`set_memory_pages`] is on.
 pub fn memory_pages() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_MEMORY_PAGES.get() {
+        return on;
+    }
     MEMORY_PAGES_ON.load(std::sync::atomic::Ordering::Relaxed)
 }
 

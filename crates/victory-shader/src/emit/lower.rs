@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Lookups in the directory of title memory.
+    #[cfg(test)]
+    pub lookups: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -187,6 +190,9 @@ struct Lower<'a> {
     /// The handle of the instruction being lowered, where its root view is reached as title
     /// memory by address (`paged_root`): [`Lower::handle`] gives it for the instruction's source.
     paged: Option<V>,
+    /// Lookups in the directory of title memory ([`Lower::memory`]).
+    #[cfg(test)]
+    lookups: u32,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
     /// DXIL block per IR block (unreachable: none).
@@ -1610,6 +1616,8 @@ impl<'a> Lower<'a> {
             lane_fail: HashMap::new(),
             fault_at: 0,
             paged: None,
+            #[cfg(test)]
+            lookups: 0,
             vals: HashMap::new(),
             floats: HashMap::new(),
             block: vec![None; p.blocks.len()],
@@ -1797,23 +1805,26 @@ impl<'a> Lower<'a> {
             let d = self.i32_of(d)?;
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
+        let src = Source::Built {
+            address: a,
+            bits: 0,
+            words: [0, 0],
+        };
+        // The byte in the root view, where `paged_root` gave a copy for it.
+        let mut paged = None;
         let h = if a.param == CODE {
             None
         } else {
-            let src = Source::Built {
-                address: a,
-                bits: 0,
-                words: [0, 0],
-            };
             if let Some(bias) = self.root_bias(a.param) {
                 off = self.s.m.bin(c, Bin::Add, off, bias);
             }
             if let Some((_, at)) = self.paged_root(&src, off, guard) {
+                paged = Some(off);
                 off = at;
             }
             Some(self.handle((b, i), &src, false, (11, 0))?)
         };
-        let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
+        let dword = |l: &mut Self, h: Option<V>, byte: V| -> Result<V, Why> {
             match h {
                 None => l.code_dword(byte),
                 Some(h) => {
@@ -1834,16 +1845,22 @@ impl<'a> Lower<'a> {
         };
         for k in 0..n {
             let x = match sub {
-                None => {
-                    let four = self.s.m.i32(4 * k);
-                    let at = self.s.m.bin(c, Bin::Add, off, four);
-                    dword(self, at)?
-                }
+                None => match paged {
+                    Some(first) if k > 0 => {
+                        let (h, at) = self.paged_dword(&src, first, k, guard)?;
+                        dword(self, Some(h), at)?
+                    }
+                    _ => {
+                        let four = self.s.m.i32(4 * k);
+                        let at = self.s.m.bin(c, Bin::Add, off, four);
+                        dword(self, h, at)?
+                    }
+                },
                 Some((width, signed)) => {
                     // shortcut: the field is taken not to cross a dword.
                     let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
                     let at = self.s.m.bin(c, Bin::And, off, not3);
-                    let w = dword(self, at)?;
+                    let w = dword(self, h, at)?;
                     let byte = self.s.m.bin(c, Bin::And, off, three);
                     let sh = self.s.m.bin(c, Bin::Shl, byte, three);
                     let x = self.s.m.bin(c, Bin::LShr, w, sh);
@@ -2204,6 +2221,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            lookups: self.lookups,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2727,6 +2746,10 @@ impl<'a> Lower<'a> {
     /// number is left for the host, for lanes that run (`guard`).
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        #[cfg(test)]
+        {
+            self.lookups += 1;
+        }
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -2843,25 +2866,33 @@ impl<'a> Lower<'a> {
             "dwordx4" => Ok(4),
             _ => Err(name),
         };
+        // Dwords looked up together: with page copies (`shader::memory_pages`) each on
+        // its own, as an access that begins in a page's last bytes ends in the next page,
+        // whose copy is another view.
+        let step = |n: u8| if super::shader::memory_pages() { 1 } else { n };
         if let Some(rest) = name.strip_prefix("global_load_") {
             let n = count(rest)?;
             let Some(Operand::Vector { reg, .. }) = *dst else {
                 return Err("a global load result");
             };
-            let (h, byte) = self.memory(lo, hi, guard);
-            let mask = self.s.m.i8((1u8 << n) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                res,
-                139,
-                &[h, byte, iu, mask, align],
-            );
-            for k in 0..n {
-                let x = self.s.m.extract(c, r, u32::from(k));
-                let x = self.as_int(x);
-                self.write(inst, Reg::V(reg + k), x, guard);
+            let step = step(n);
+            for first in (0..n).step_by(usize::from(step)) {
+                let (lo, hi) = self.address_plus(lo, hi, 4 * i32::from(first));
+                let (h, byte) = self.memory(lo, hi, guard);
+                let mask = self.s.m.i8((1u8 << step) - 1);
+                let r = self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    res,
+                    139,
+                    &[h, byte, iu, mask, align],
+                );
+                for k in 0..step {
+                    let x = self.s.m.extract(c, r, u32::from(k));
+                    let x = self.as_int(x);
+                    self.write(inst, Reg::V(reg + first + k), x, guard);
+                }
             }
             return Ok(());
         }
@@ -2869,15 +2900,29 @@ impl<'a> Lower<'a> {
             let n = count(rest)?;
             let d = data.as_ref().ok_or("global store data")?;
             let vals = self.vgprs(inst, d, n)?;
-            let (h, byte) = self.memory(lo, hi, guard);
-            let mut args = vec![h, byte, iu];
-            args.extend(&vals);
-            args.resize(3 + 4, iu);
-            args.push(self.s.m.i8((1u8 << n) - 1));
-            args.push(align);
+            let step = step(n);
+            let mut stores = Vec::new();
+            for first in (0..n).step_by(usize::from(step)) {
+                let (lo, hi) = self.address_plus(lo, hi, 4 * i32::from(first));
+                let (h, byte) = self.memory(lo, hi, guard);
+                let mut args = vec![h, byte, iu];
+                args.extend(&vals[usize::from(first)..usize::from(first + step)]);
+                args.resize(3 + 4, iu);
+                args.push(self.s.m.i8((1u8 << step) - 1));
+                args.push(align);
+                stores.push(args);
+            }
             let at = self.begin_guarded(guard);
-            self.s
-                .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+            for args in stores {
+                self.s.op(
+                    self.cur,
+                    "rawBufferStore.i32",
+                    Attr::NoUnwind,
+                    void,
+                    140,
+                    &args,
+                );
+            }
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -3027,8 +3072,10 @@ impl<'a> Lower<'a> {
             lo = sum;
         }
         let (iu, align) = (self.s.m.undef(i32t), self.s.m.i32(4));
-        for first in (0..count).step_by(4) {
-            let n = (count - first).min(4);
+        // With page copies (`shader::memory_pages`) a dword at a time (`memory_flat`).
+        let step = if super::shader::memory_pages() { 1 } else { 4 };
+        for first in (0..count).step_by(step) {
+            let n = (count - first).min(step as u8);
             let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
             let (h, byte) = self.memory(lo, hi, None);
             let mask = self.s.m.i8((1u8 << n) - 1);
@@ -5605,7 +5652,10 @@ impl<'a> Lower<'a> {
             let so = self.operand(inst, soffset)?;
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
+        // The byte in the root view, where `paged_root` gave a copy for it.
+        let mut paged = None;
         if let Some((_, at)) = self.paged_root(src, addr, None) {
+            paged = Some(addr);
             addr = at;
         }
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
@@ -5678,10 +5728,15 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if self.paged.is_some() || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+            let first = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
+                let (h, a) = match paged {
+                    Some(byte) if k > 0 => self.paged_dword(src, byte, k, None)?,
+                    _ => {
+                        let off = self.s.m.i32(4 * k);
+                        (first, self.s.m.bin(c, Bin::Add, addr, off))
+                    }
+                };
                 let mask = self.s.m.i8(1);
                 let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
                 let r = self.s.op(
@@ -6219,7 +6274,8 @@ impl<'a> Lower<'a> {
     /// With [`Lower::pages_roots`], for an access at byte `byte` of the root view (not a
     /// constant buffer) the descriptor `src` is built around: the handle of the copy that
     /// holds that byte of title memory and the byte in it ([`Lower::memory`]). The handle
-    /// is then what [`Lower::handle`] gives for the rest of the instruction.
+    /// is then what [`Lower::handle`] gives for the rest of the instruction. An access of
+    /// more than one dword takes each of the others from [`Lower::paged_dword`].
     fn paged_root(&mut self, src: &Source, byte: V, guard: Option<V>) -> Option<(V, V)> {
         use super::shader::USER_ROOT_ADDRESS;
         if !self.pages_roots() {
@@ -6246,6 +6302,22 @@ impl<'a> Lower<'a> {
         let (h, at) = self.memory(sum, hi, guard);
         self.paged = Some(h);
         Some((h, at))
+    }
+
+    /// Dword `k` of an access at byte `first` of a root view [`Lower::paged_root`] gave a
+    /// copy for: the handle of the copy that holds it and the byte in it. The access may
+    /// begin in a page's last bytes and end in the next page, whose copy is another view.
+    fn paged_dword(
+        &mut self,
+        src: &Source,
+        first: V,
+        k: u32,
+        guard: Option<V>,
+    ) -> Result<(V, V), Why> {
+        let four = self.s.m.i32(4 * k);
+        let byte = self.s.m.bin(self.cur, Bin::Add, first, four);
+        self.paged_root(src, byte, guard)
+            .ok_or("a root view as title memory")
     }
 
     /// For a root view the host binds as a raw view that may begin before
@@ -10073,6 +10145,8 @@ impl<'a> Lower<'a> {
             index = None;
         }
         // A root view reached as title memory by address (`paged_root`): raw bytes there.
+        // `paged`: the byte in the root view and the handle of its copy.
+        let mut paged = None;
         if !typed {
             let byte = match index {
                 None => Some(off),
@@ -10080,8 +10154,9 @@ impl<'a> Lower<'a> {
                 Some(_) => None,
             };
             if let Some(byte) = byte
-                && let Some((_, at)) = self.paged_root(src, byte, guard)
+                && let Some((h, at)) = self.paged_root(src, byte, guard)
             {
+                paged = Some((byte, h));
                 off = at;
                 index = None;
             }
@@ -10138,10 +10213,26 @@ impl<'a> Lower<'a> {
             let zero = self.s.m.i32(0);
             let k8 = self.s.m.i32(8);
             let straddles = self.s.m.cmp(c, pred::EQ, within, k3);
+            // Through a root view by address the next dword may be in the next page, whose
+            // copy is another view: looked up on its own, for the lanes whose value
+            // continues there.
+            let (hn, next) = match paged {
+                Some((first, _)) if bits == 16 => {
+                    let up = self.s.m.bin(c, Bin::Sub, four, within);
+                    let byte = self.s.m.bin(c, Bin::Add, first, up);
+                    let g = match guard {
+                        Some(g) => self.s.m.bin(c, Bin::And, g, straddles),
+                        None => straddles,
+                    };
+                    self.paged_root(src, byte, Some(g))
+                        .ok_or("a root view as title memory")?
+                }
+                _ => (h, next),
+            };
             if !store {
                 let mask = self.s.m.i8(1);
                 let align = self.s.m.i32(4);
-                let dword = |l: &mut Self, at: V| {
+                let dword = |l: &mut Self, h: V, at: V| {
                     let r = l.s.op(
                         c,
                         "rawBufferLoad.f32",
@@ -10153,10 +10244,10 @@ impl<'a> Lower<'a> {
                     let f = l.s.m.extract(c, r, 0);
                     l.as_int(f)
                 };
-                let low = dword(self, aligned);
+                let low = dword(self, h, aligned);
                 let mut x = self.s.m.bin(c, Bin::LShr, low, shift);
                 if bits == 16 {
-                    let high = dword(self, next);
+                    let high = dword(self, hn, next);
                     let high = self.s.m.bin(c, Bin::Shl, high, k8);
                     let high = self.s.m.select(c, straddles, high, zero);
                     x = self.s.m.bin(c, Bin::Or, x, high);
@@ -10193,7 +10284,7 @@ impl<'a> Lower<'a> {
             if bits == 16 {
                 let second = self.begin_guarded(Some(straddles));
                 for (op, x) in [(and, keep_next), (or, set_next)] {
-                    let args = [h, op, next, iu, iu, x];
+                    let args = [hn, op, next, iu, iu, x];
                     self.s
                         .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
                 }
@@ -10279,6 +10370,32 @@ impl<'a> Lower<'a> {
                 }
                 vals = wide;
             }
+            if let Some((first, h)) = paged {
+                // Each dword in its own page's copy (`paged_dword`).
+                let mut stores = Vec::new();
+                for (k, &x) in vals.iter().enumerate() {
+                    let (h, at) = match k {
+                        0 => (h, off),
+                        _ => self.paged_dword(src, first, k as u32, guard)?,
+                    };
+                    let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+                    stores.push([h, at, iu, x, iu, iu, iu, mask, align]);
+                }
+                let at = self.begin_guarded(guard);
+                let void = self.s.t.void;
+                for args in stores {
+                    self.s.op(
+                        self.cur,
+                        "rawBufferStore.i32",
+                        Attr::NoUnwind,
+                        void,
+                        140,
+                        &args,
+                    );
+                }
+                self.end_guarded(at, &[]);
+                return Ok(());
+            }
             let mut args = Vec::new();
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
@@ -10336,6 +10453,31 @@ impl<'a> Lower<'a> {
                 return Err("a buffer result");
             };
             for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
+        if let Some((first, h)) = paged {
+            // Each dword from its own page's copy (`paged_dword`).
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+            for k in 0..count {
+                let (h, at) = match k {
+                    0 => (h, off),
+                    _ => self.paged_dword(src, first, k, guard)?,
+                };
+                let r = self.s.op(
+                    self.cur,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, at, iu, mask, align],
+                );
+                let x = self.s.m.extract(self.cur, r, 0);
+                let x = self.as_int(x);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -11288,6 +11430,115 @@ mod tests {
         // host to invalidate its cached view of a buffer.
         assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
         assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
+    }
+
+    /// `words` lowered as a program of the ray-tracing structure builder's kind (a spilled
+    /// user-data table, a root UAV at its first two dwords), with page copies
+    /// (`shader::memory_pages`) or without.
+    fn lower_spilled(words: &[u32], pages: bool) -> Lowered {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![root(RootType::Descriptor, 16, 0)],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 16,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::spill::build(&native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        super::super::shader::TEST_MEMORY_PAGES.set(Some(pages));
+        let l = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        });
+        super::super::shader::TEST_MEMORY_PAGES.set(None);
+        let l = l.unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone()).unwrap();
+        }
+        l
+    }
+
+    #[test]
+    fn with_page_copies_each_dword_of_an_access_finds_its_own_page() {
+        // Three dwords that may begin in a page's last bytes: with page copies each is
+        // looked up on its own, the last ones in the next page's copy when they lie there.
+        let values = [
+            0x7E02_0281, // v_mov_b32 v1, 1
+            0x7E04_0282, // v_mov_b32 v2, 2
+            0x7E06_0283, // v_mov_b32 v3, 3
+        ];
+        // Through the root view: a buffer of the host's without page copies. A 16-bit
+        // value continues in the next dword when it begins in a dword's last byte.
+        for (access, lookups) in [
+            ([0xE07C_1000, 0x8001_0100], 3), // buffer_store_dwordx3 v[1:3], v0, s[4:7], 0 offen
+            ([0xE03C_1000, 0x8001_0100], 3), // buffer_load_dwordx3 v[1:3], v0, s[4:7], 0 offen
+            ([0xE068_1000, 0x8001_0100], 2), // buffer_store_short v1, v0, s[4:7], 0 offen
+            ([0xE028_1000, 0x8001_0100], 2), // buffer_load_ushort v1, v0, s[4:7], 0 offen
+            ([0xF428_0202, 0xFA00_0000], 4), // s_buffer_load_dwordx4 s[8:11], s[4:7], 0
+            ([0xDC3C_8000, 0x0104_0000], 3), // global_load_dwordx3 v[1:3], v0, s[4:5]
+        ] {
+            let mut root = vec![
+                0x8703_FF01,
+                0x0000_00FF, // s_and_b32 s3, s1, 0xff
+                0xBE82_0300, // s_mov_b32 s2, s0
+                0xF404_0101,
+                0xFA00_0000, // s_load_dwordx2 s[4:5], s[2:3], 0
+                0xBE86_03C1, // s_mov_b32 s6, -1
+                0xBE87_03FF,
+                0x1101_4FAC, // s_mov_b32 s7, 0x11014fac
+            ];
+            root.extend(values);
+            root.extend(access);
+            root.push(S_ENDPGM);
+            assert_eq!(lower_spilled(&root, false).lookups, 0, "{access:x?}");
+            assert_eq!(lower_spilled(&root, true).lookups, lookups, "{access:x?}");
+        }
+        // By address: one lookup for the three without page copies.
+        let by_address = [
+            0x3408_0084, // v_lshlrev_b32 v4, 4, v0
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0xDC3C_8000,
+            0x017D_0004, // global_load_dwordx3 v[1:3], v[4:5], off
+            S_ENDPGM,
+        ];
+        assert_eq!(lower_spilled(&by_address, false).lookups, 1);
+        assert_eq!(lower_spilled(&by_address, true).lookups, 3);
+        // And a store by address.
+        let mut store = by_address[..2].to_vec();
+        store.extend(values);
+        store.extend([
+            0xDC7C_8000,
+            0x007D_0104, // global_store_dwordx3 v[4:5], v[1:3], off
+            S_ENDPGM,
+        ]);
+        assert_eq!(lower_spilled(&store, false).lookups, 1);
+        assert_eq!(lower_spilled(&store, true).lookups, 3);
     }
 
     #[test]
