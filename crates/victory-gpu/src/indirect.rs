@@ -49,6 +49,9 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+// A dispatch record written as two (`bound_wide`): the first group in x and
+// the groups of each, for up to twice the host's 65,535 groups in x.
+static const uint WIDE = 4u;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -57,7 +60,15 @@ void main(uint3 id : SV_DispatchThreadID) {
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    if (id.x >= eff_count) return;
+    if (id.x >= eff_count) {
+        // The host runs every slot of two-dispatch records: past the count
+        // they are written empty.
+        if (kind == WIDE && id.x < records) {
+            dst_args.Store4(id.x * 32u, uint4(0u, 0u, 0u, 0u));
+            dst_args.Store4(id.x * 32u + 16u, uint4(0u, 0u, 0u, 0u));
+        }
+        return;
+    }
     uint src_at = args_offset + id.x * stride;
     uint dst_at = id.x * stride;
     uint cost;
@@ -73,8 +84,21 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint instances = min(asked.y, (1u << 26) / max(count, 1u));
         cost = count * instances;
         draw_counts = uint2(count, instances);
-    } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+    } else if (kind == 2 || kind == WIDE) {
+        uint3 asked = src_args.Load3(src_at);
+        // Diagnostics, in the budget buffer's words after the mesh ones:
+        // the largest x a compute record asked for, and the records that
+        // asked for more groups in x than run (cut below: the groups past
+        // 65,535, or past 131,070 for a record written as two, never run).
+        // Not the garbage of a slot nothing wrote.
+        if (asked.x <= (1u << 24) && asked.y <= 64u && asked.z <= 64u) {
+            uint noted;
+            budget.InterlockedMax(12, asked.x, noted);
+            if (asked.x > (kind == WIDE ? 131070u : 65535u)) {
+                budget.InterlockedAdd(16, 1u, noted);
+            }
+        }
+        uint3 g = min(asked, uint3(kind == WIDE ? 131070u : 65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -121,6 +145,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         for (uint off = 8; off < stride; off += 4) {
             dst_args.Store(dst_at + off, src_args.Load(src_at + off));
         }
+    } else if (kind == WIDE) {
+        if (over) {
+            groups = uint3(0, 0, 0);
+        }
+        uint first = min(groups.x, 65535u);
+        dst_args.Store4(id.x * 32u, uint4(0u, first, groups.y, groups.z));
+        dst_args.Store4(id.x * 32u + 16u, uint4(65535u, groups.x - first, groups.y, groups.z));
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
@@ -216,7 +247,7 @@ fn min_stride(kind: u32) -> Option<u32> {
     match kind {
         0 => Some(16),
         1 => Some(20),
-        2 | 10 => Some(12),
+        2 | WIDE | 10 => Some(12),
         _ => None,
     }
 }
@@ -251,6 +282,29 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+}
+
+/// The clamp's kind for dispatch records written as two ([`bound_wide`]).
+pub(crate) const WIDE: u32 = 4;
+
+/// [`bound`] for dispatch records (`stride` bytes apart, up to `records`)
+/// of a program that adds the first group of its dispatch to its group
+/// number in x (`victory_shader::emit::USER_GROUP_BASE`): each record is
+/// written as two, `[first group in x, groups in x, y, z]`, 16 bytes each,
+/// the first from group 0 with up to 65,535 groups, the second from group
+/// 65,535 with the rest (none if there is none), so a record of up to
+/// 131,070 groups in x runs whole. Every slot is written, past the count
+/// too (empty): the caller runs `2 * records` commands, with no count.
+pub(crate) fn bound_wide(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (stride, records): (u32, u32),
+) -> Option<ID3D12Resource> {
+    let spec = (WIDE, stride, records);
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?.max(32 * u64::from(records));
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
 }
@@ -777,6 +831,62 @@ void main() {
     /// (b) `src_args` (and `count_buf`) are NOT mutated in-place, and
     /// (c) full `stride` bytes (`stride = 24` > `12`) are copied for active
     ///     records into `dst_args` at offset `0`.
+    /// Dispatch records written as two (`bound_wide`): a record of more
+    /// than 65,535 groups in x runs from group 0 and from group 65,535, a
+    /// small one in its first part (the second empty), and a slot past the
+    /// count is written empty.
+    #[test]
+    fn warp_wide_records_run_past_65535_groups() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const STRIDE: u32 = 12;
+        const MAX: u32 = 3;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(256);
+        let (count_buf, count_ptr, _) = warp.shared_buffer(256);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(32 * u64::from(MAX));
+        let dst_buf = warp.default_uav(32 * u64::from(MAX));
+        let records: [u32; 9] = [70_000, 1, 1, 3, 2, 1, 9, 9, 9];
+        // SAFETY: buffers mapped with the sizes above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(records.as_ptr().cast::<u8>(), src_ptr, 36);
+            (count_ptr as *mut u32).write_volatile(2);
+            (budget_ptr as *mut u32).write_volatile(0);
+            std::ptr::write_bytes(readback_ptr, 0xcc, 32 * MAX as usize);
+        }
+        assert!(record_clamp(
+            &warp.clamp,
+            &warp.list,
+            &dst_buf,
+            budget_gpu,
+            (&src_buf, 0),
+            Some((&count_buf, 0)),
+            (WIDE, STRIDE, MAX),
+        ));
+        done_on(&warp.list, &dst_buf);
+        // SAFETY: open list; `dst_buf` back in `COMMON`.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, 32 * u64::from(MAX));
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the copy finished; 8 words a record.
+        let words = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>(), 8 * MAX as usize).to_vec() };
+        assert_eq!(words[0..8], [0, 65_535, 1, 1, 65_535, 4_465, 1, 1]);
+        assert_eq!(words[8..16], [0, 3, 2, 1, 65_535, 0, 2, 1]);
+        assert_eq!(words[16..24], [0; 8], "a slot past the count is empty");
+    }
+
     #[test]
     fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
         let Some(mut warp) = WarpHarness::new() else {

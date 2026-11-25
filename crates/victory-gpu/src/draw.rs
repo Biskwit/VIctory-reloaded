@@ -736,6 +736,11 @@ impl State {
         if kind == USER_THREADS {
             return self.threads.unwrap_or(u32::MAX);
         }
+        if kind == victory_shader::emit::USER_GROUP_BASE {
+            // A dispatch runs from group 0; the parts of an indirect record
+            // over 65,535 groups in x set their own (`execute_indirect`).
+            return 0;
+        }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             // The root view the program reaches as title memory by address.
             return match self.roots_ref(compute).get(usize::from(slot)) {
@@ -2664,10 +2669,26 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+        // A dispatch of a program that adds the first group of its dispatch
+        // to its group number in x: each record runs as two dispatches, so
+        // that one of more than the host's 65,535 groups in x runs whole
+        // (`crate::indirect::bound_wide`). Grand Theft Auto VI asks for
+        // 74,000 to 86,000 in one record about once a frame; cut to 65,535,
+        // the groups past that left a strip of blocks of other textures
+        // along the bottom of the picture (runs late-44 to late-57). With
+        // those records run empty the strip was gone (late-58), and run
+        // whole as two it is (late-59, late-60).
+        let wide = (kind == DISPATCH)
+            .then(|| wide_dispatch(p))
             .flatten()
-        else {
+            .filter(|_| wide_on());
+        let signature = match wide {
+            Some((param, index)) => wide_signature(&p.root, param, index),
+            None => matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+                .then(|| host_signature(kind, stride))
+                .flatten(),
+        };
+        let Some(signature) = signature else {
             why("no host signature");
             return false;
         };
@@ -2746,7 +2767,9 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                let bounded = if wide.is_some() {
+                    crate::indirect::bound_wide(list, (&args.buffer, offset), count_arg, (stride, max))
+                } else if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
@@ -2791,14 +2814,24 @@ impl State {
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
+            if wide.is_some() {
+                // Two commands a record, every slot written (empty past the
+                // count): no count buffer.
+                list.list.ExecuteIndirect(&signature, max.saturating_mul(2), &bounded, 0, None, 0);
+                // The command signature set a root constant, which is
+                // undefined afterwards: the next bind sets the user data again.
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            } else {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                )
+            }
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
@@ -2811,6 +2844,76 @@ impl State {
         }
         true
     }
+}
+
+/// Whether indirect dispatches run their records as two dispatches when
+/// the program takes the first group of its dispatch
+/// (`VICTORY_WIDE_DISPATCH=0`: one, cut to 65,535 groups in x, as before).
+fn wide_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_DISPATCH").is_none_or(|v| v != "0"))
+}
+
+/// For a compute pipeline whose program adds the first group of its
+/// dispatch to its group number in x (`victory_shader::emit::USER_GROUP_BASE`):
+/// the root parameter of its user data and the dword there that holds it.
+fn wide_dispatch(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    let [stage] = &p.stages[..] else {
+        return None;
+    };
+    let (param, _) = stage.user_data?;
+    let base = RootType::Other(victory_shader::emit::USER_GROUP_BASE);
+    let u = stage.translated().host.user_data.iter().find(|u| u.root == base)?;
+    Some((param, u.index))
+}
+
+/// The host command signature for dispatch records written as two by
+/// `crate::indirect::bound_wide`: 16 bytes each, a root constant (the
+/// first group in x, dword `index` of root parameter `param`) and the
+/// dispatch. It names a root argument, so it is made for the pipeline's
+/// root signature, once per root signature, parameter and dword.
+fn wide_signature(root: &ID3D12RootSignature, param: u32, index: u32) -> Option<ID3D12CommandSignature> {
+    type Made = Vec<((usize, u32, u32), ID3D12RootSignature, ID3D12CommandSignature)>;
+    static MADE: std::sync::Mutex<Made> = std::sync::Mutex::new(Vec::new());
+    let key = (windows::core::Interface::as_raw(root) as usize, param, index);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, s)) = made.iter().find(|(k, _, _)| *k == key) {
+        return Some(s.clone());
+    }
+    let arguments = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: index,
+                    Num32BitValuesToSet: 1,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: 16,
+        NumArgumentDescs: arguments.len() as u32,
+        pArgumentDescs: arguments.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: a description of two arguments; the root signature names the
+    // parameter the constant goes to.
+    let result = unsafe { crate::host::host()?.device.CreateCommandSignature(&desc, root, &mut signature) };
+    if let Err(e) = result {
+        once!(error = %e, param, index, "host command signature for two-part dispatches refused");
+        return None;
+    }
+    let signature = signature?;
+    // The root signature is held with it: its address is the key.
+    made.push((key, root.clone(), signature.clone()));
+    Some(signature)
 }
 
 /// The host command signature for one argument of `kind` with records

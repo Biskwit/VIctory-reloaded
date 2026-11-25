@@ -1319,6 +1319,51 @@ fn check_counted(shader: &HostShader, group: u32, threads: Option<u32>, groups: 
     }
 }
 
+/// A compute program numbers its groups in x from the first group of its
+/// dispatch, which the host gives it (`USER_GROUP_BASE`): a console dispatch
+/// of more than the host's 65,535 groups runs in parts, each numbering its
+/// groups on from where it begins.
+#[test]
+fn a_dispatch_part_numbers_its_groups_from_its_base() {
+    if hardware_wave().is_none_or(|lanes| lanes < 32) {
+        eprintln!("no hardware adapter with waves of 32 lanes; skipped");
+        return;
+    }
+    let shader = build_counted_cs(32, false);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("a hardware adapter");
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let mut asked = false;
+    for u in &shader.user_data {
+        if u.root == RootType::Other(super::USER_THREADS) {
+            ud[u.index as usize] = u32::MAX;
+        }
+        if u.root == RootType::Other(super::USER_GROUP_BASE) {
+            ud[u.index as usize] = 3;
+            asked = true;
+        }
+    }
+    assert!(asked, "the program does not ask for the first group of its dispatch");
+    // Two groups of 32 from group 3: the threads of groups 3 and 4 store.
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(5 * 32)],
+                samplers: &[],
+                groups: [2, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    for (thread, &got) in out[0].iter().enumerate() {
+        let want = if (96..160).contains(&thread) { 32 } else { 0 };
+        assert_eq!(got, want, "thread {thread}");
+    }
+}
+
 #[test]
 fn a_count_of_threads_starts_the_last_group_in_part() {
     // The console's dispatch flag that makes the counts threads: the last

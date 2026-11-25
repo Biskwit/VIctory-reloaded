@@ -2295,7 +2295,7 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => return self.group_id(c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::Launched => {
                 // The dispatch's threads less those of the groups before
@@ -2304,7 +2304,7 @@ impl<'a> Lower<'a> {
                 let StageIo::Cs(cs) = self.x.native.io else {
                     unreachable!()
                 };
-                let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+                let Val::I32(group) = self.group_id(0) else {
                     unreachable!()
                 };
                 let threads = self.host_word(RootType::Other(super::shader::USER_THREADS), 0, 0);
@@ -2377,6 +2377,19 @@ impl<'a> Lower<'a> {
     }
 
     /// A component of a compute thread or group id, read in the entry block.
+    /// The program's group number in `c`: the host's, and in x for a
+    /// compute program the group the host's dispatch begins at
+    /// ([`super::shader::USER_GROUP_BASE`]).
+    fn group_id(&mut self, c: u8) -> Val {
+        let id = self.compute_id("groupId.i32", 94, c);
+        if c != 0 || self.x.native.stage != HwStage::Cs {
+            return id;
+        }
+        let Val::I32(id) = id else { unreachable!() };
+        let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
+        Val::I32(self.s.m.bin(self.s.entry, Bin::Add, id, base))
+    }
+
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
         let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
         Val::I32(

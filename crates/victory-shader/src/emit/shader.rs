@@ -118,6 +118,14 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// on; `u32::MAX` for a dispatch of whole groups. Asked for by programs
 /// run with a count of threads (`spill::counts_threads`).
 pub const USER_THREADS: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// first group in x of the dispatch the program runs in, added to its
+/// group number in x. The console runs more than the host's 65,535 groups
+/// in x in one dispatch (Grand Theft Auto VI asks for about 74,000 in an
+/// indirect compute record every frame); the host runs such a dispatch in
+/// parts, each told where it begins. Asked for by compute programs that
+/// read their group number in x.
+pub const USER_GROUP_BASE: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
