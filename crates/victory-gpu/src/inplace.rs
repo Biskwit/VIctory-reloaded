@@ -269,9 +269,49 @@ struct Views {
     views: BTreeMap<usize, (usize, usize, u64)>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
+    /// By 64 KiB of a section (its handle, the offset): the addresses that
+    /// show it. The title shows the same physical pages in several places
+    /// ([`other_views`]).
+    slices: BTreeMap<(usize, u64), Vec<usize>>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new(), slices: BTreeMap::new() });
+
+impl Views {
+    /// Notes (`add`) or forgets the 64 KiB slices of a view.
+    fn slices_of(&mut self, at: usize, (len, section, offset): (usize, usize, u64), add: bool) {
+        for k in (0..len).step_by(K64) {
+            let key = (section, offset + k as u64);
+            if add {
+                self.slices.entry(key).or_default().push(at + k);
+            } else if let Some(shown) = self.slices.get_mut(&key) {
+                shown.retain(|&a| a != at + k);
+                if shown.is_empty() {
+                    self.slices.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+/// The other addresses that show the 64 KiB of physical pages that `at` (a
+/// multiple of 64 KiB) shows. Grand Theft Auto VI has its streamed
+/// resources at one address for its own code and 0x6_0000_0000 higher for
+/// the card (run bvh-04: an object at 0x6e1c9f000 held what a shader had
+/// stored at 0xce1c9f000).
+pub(crate) fn other_views(at: usize) -> Vec<usize> {
+    let v = views();
+    let Some((&base, &(_, section, offset))) = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at) else {
+        return Vec::new();
+    };
+    let key = (section, offset + (at - base) as u64);
+    v.slices.get(&key).map_or_else(Vec::new, |shown| shown.iter().copied().filter(|&a| a != at).collect())
+}
+
+/// The addresses that show the 64 KiB at `offset` of `section`.
+pub(crate) fn views_of(section: usize, offset: u64) -> Vec<usize> {
+    views().slices.get(&(section, offset)).cloned().unwrap_or_default()
+}
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -290,7 +330,14 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     #[cfg(feature = "diagnostics")]
     crate::pipeline::audit(|| format!("view {at:#x}+{len:#x} {section:#x}@{offset:#x}"));
-    views().views.insert(at, (len, section, offset));
+    {
+        let mut v = views();
+        if let Some(old) = v.views.insert(at, (len, section, offset)) {
+            v.slices_of(at, old, false);
+        }
+        v.slices_of(at, (len, section, offset), true);
+    }
+    crate::watch::view_mapped(at, len);
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -307,7 +354,9 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
-        v.views.remove(&base);
+        if let Some(view) = v.views.remove(&base) {
+            v.slices_of(base, view, false);
+        }
     }
 }
 
