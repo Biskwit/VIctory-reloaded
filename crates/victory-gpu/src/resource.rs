@@ -2634,8 +2634,11 @@ mod tests {
         let host_image = host_resource(image).unwrap();
         let back = host.new_list().unwrap();
         let (_, before) = host_transition(image, 0x800).unwrap();
-        // The upload list holds the texture until it is reset.
-        assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
+        // The upload list holds the texture until it is reset; with the
+        // relay (on by default, `crate::host::relay`) the flight may have
+        // landed and the list been reset already, so only the table's hold
+        // is sure here. What the test is about is the read-back below.
+        assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) >= 2);
         use windows::core::Interface;
         let out_to = Location {
             resource: readback.as_raw().cast_const().cast(),

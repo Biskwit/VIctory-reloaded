@@ -159,11 +159,11 @@ fn lower_cs(words: &[u32], threads: u32, lds_bytes: u32, vgprs: u16) -> HostShad
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    lower_cs(&native, &p)
+    lower_program(&native, &p)
 }
 
 /// Lowers the compute program `native`, built as `p`, and validates it.
-fn lower_cs(native: &NativeProgram, p: &ir::Program) -> HostShader {
+fn lower_program(native: &NativeProgram, p: &ir::Program) -> HostShader {
     let st = structure::structure(p).expect("structure");
     let res =
         resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
@@ -1252,7 +1252,7 @@ fn build_counted_cs(group: u32, wave64: bool) -> HostShader {
     };
     assert!(crate::spill::counts_threads(&native));
     let p = crate::spill::build(&native).expect("spill::build");
-    lower_cs(&native, &p)
+    lower_program(&native, &p)
 }
 
 /// The hardware adapter's widest wave, if there is an adapter.
