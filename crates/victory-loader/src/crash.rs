@@ -509,6 +509,33 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
+    // `VICTORY_CRASH_PEEK=1`: the memory each register points at, and what
+    // the pointers found there point at (a title object holding values
+    // that are no pointers shows what was written over it).
+    if std::env::var_os("VICTORY_CRASH_PEEK").is_some() {
+        let peek = |at: usize, n: usize| -> Option<Vec<u64>> {
+            crate::console_insn::readable(at, n * 8).then(|| {
+                // SAFETY: just found readable.
+                (0..n).map(|i| unsafe { ((at + i * 8) as *const u64).read_unaligned() }).collect()
+            })
+        };
+        let words = |w: &[u64]| w.iter().map(|x| format!("{x:016x}")).collect::<Vec<_>>().join(" ");
+        let registers = [
+            ("rax", context.Rax), ("rbx", context.Rbx), ("rcx", context.Rcx), ("rdx", context.Rdx),
+            ("rsi", context.Rsi), ("rdi", context.Rdi), ("rbp", context.Rbp), ("r8", context.R8),
+            ("r9", context.R9), ("r10", context.R10), ("r11", context.R11), ("r12", context.R12),
+            ("r13", context.R13), ("r14", context.R14), ("r15", context.R15),
+        ];
+        for (name, value) in registers {
+            let Some(found) = peek(value as usize, 16) else { continue };
+            line(format!("  [{name} {value:#x}] {}", words(&found)));
+            for (i, &inner) in found.iter().enumerate() {
+                if inner > 0x1_0000 && let Some(more) = peek(inner as usize, 8) {
+                    line(format!("    [{name}+{:#x} -> {inner:#x}] {}", i * 8, words(&more)));
+                }
+            }
+        }
+    }
     if to_file {
         let said = title_output();
         eprint!("{said}");

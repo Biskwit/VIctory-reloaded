@@ -1316,6 +1316,8 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 /// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
 /// host has no use for (the ray-tracing builder dispatches this way).
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::pipeline::audit(|| format!("dispatchx {x}x{y}x{z} flags {_flags:#x} thread {:?}", std::thread::current().id()));
     #[cfg(windows)]
     state::dispatch(this, x, y, z);
     #[cfg(not(windows))]

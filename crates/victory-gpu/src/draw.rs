@@ -1711,6 +1711,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            crate::pipeline::audit(|| self.op_text(format!("list {:#x} thread {:?} dispatch {x}x{y}x{z}", std::ptr::from_ref(list) as usize, std::thread::current().id()), true));
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);

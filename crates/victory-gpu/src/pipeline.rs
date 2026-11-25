@@ -262,6 +262,28 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_BVH_AUDIT=<file>` (diagnostics): a line per dispatch of the
+/// structure builder (its program and root arguments), per stretch of
+/// title memory that takes what shaders wrote, and per page a shader found
+/// without a copy, each with the frame being built. For finding which
+/// stage's stores land outside the structures: the stretch that holds a
+/// crashing object names the frame, and the dispatches of that frame name
+/// the structures around it.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn audit(line: impl FnOnce() -> String) {
+    use std::io::Write;
+    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_BVH_AUDIT")?;
+        std::fs::File::create(path).ok().map(Mutex::new)
+    });
+    if let Some(file) = file {
+        let line = format!("{} {}
+", crate::queue::presented() + 1, line());
+        let _ = file.lock().unwrap_or_else(|e| e.into_inner()).write_all(line.as_bytes());
+    }
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {

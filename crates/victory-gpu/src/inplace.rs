@@ -288,6 +288,8 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
+    #[cfg(feature = "diagnostics")]
+    crate::pipeline::audit(|| format!("view {at:#x}+{len:#x} {section:#x}@{offset:#x}"));
     views().views.insert(at, (len, section, offset));
 }
 
@@ -295,6 +297,8 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    crate::pipeline::audit(|| format!("gone {at:#x}+{len:#x}"));
     let mut v = views();
     if v.views.is_empty() {
         return;

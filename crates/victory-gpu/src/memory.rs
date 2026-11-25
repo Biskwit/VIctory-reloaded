@@ -220,6 +220,8 @@ impl Memory {
                 );
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::pipeline::audit(|| format!("faults {pages:x?}"));
         for page in pages {
             self.map(u64::from(page) * PAGE);
         }
