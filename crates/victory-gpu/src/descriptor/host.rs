@@ -1394,6 +1394,23 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
+/// The title address a shader that takes one out of `view` gets: a buffer
+/// view's first byte, or the structure an acceleration structure view
+/// names (dimension 11: no resource, the address in the description). The
+/// ray-tracing shaders of the opening cutscene take their structures'
+/// addresses from such views and read them by address; they got 0 and
+/// read page 0 every frame (run bvh-46: views of 0xd5f207f00, 0xd5d3ef800
+/// and 0xd601a1b00).
+pub(crate) fn view_address(view: &View) -> Option<u64> {
+    const ACCELERATION_STRUCTURE: u32 = 11;
+    match view {
+        View::Shader(_, Some(desc)) if desc[1] == ACCELERATION_STRUCTURE => {
+            Some(u64::from(desc[4]) | u64::from(desc[5]) << 32)
+        }
+        _ => buffer_range(view).map(|range| range.0),
+    }
+}
+
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
@@ -2188,6 +2205,15 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An acceleration structure view has no resource: the structure's
+    /// address is in its description (run bvh-46's view).
+    #[test]
+    fn an_acceleration_structure_view_gives_its_structure() {
+        let view = View::Shader(0, Some([0, 11, 0x1688, 0, 0x5f20_7f00, 0xd, 0, 0, 0, 0]));
+        assert_eq!(view_address(&view), Some(0xd_5f20_7f00));
+        assert_eq!(buffer_range(&view), None);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
