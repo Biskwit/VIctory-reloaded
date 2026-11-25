@@ -187,6 +187,28 @@ pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The null slot [`set_view_heap_limit`] set (0: none), for a replay that
+/// translates as the run did.
+pub fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// See [`set_salt`].
+    static SALT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// With `salt` above 0, compute and mesh programs this thread translates
+/// from now on get thread-group memory of their own, `salt` dwords declared
+/// ahead of theirs, where each thread stores `salt` first thing: the same
+/// program in another DXIL, which the host driver compiles anew instead of
+/// serving the compilation of the same bytes (the replay's `--variants`).
+/// It moves where the driver may place the program's own thread-group
+/// memory, and nothing reads it. 0 (the default) translates as usual.
+pub fn set_salt(salt: u32) {
+    SALT.set(salt);
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -221,6 +243,8 @@ pub(crate) struct Shader {
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
+    /// [`set_salt`]'s memory, declared ahead of `lds`.
+    salt: Option<V>,
     main: V,
     pub entry: usize,
 }
@@ -274,6 +298,7 @@ impl Shader {
             wave_size: None,
             lds_dwords: 0,
             lds: None,
+            salt: None,
             main,
             entry,
         }
@@ -285,6 +310,7 @@ impl Shader {
         if let Some(g) = self.lds {
             return g;
         }
+        self.salt_memory();
         let arr = self.m.array(self.lds_dwords, self.t.i32);
         let g = self.m.global("lds", arr, 3);
         self.lds = Some(g);
@@ -496,8 +522,33 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
+    /// [`set_salt`]'s thread-group memory, made once.
+    fn salt_memory(&mut self) -> Option<V> {
+        let salt = SALT.get();
+        if salt == 0 {
+            return None;
+        }
+        if self.salt.is_none() {
+            let arr = self.m.array(salt, self.t.i32);
+            self.salt = Some(self.m.global("salt", arr, 3));
+        }
+        self.salt
+    }
+
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        // [`set_salt`]: the store opens the entry block (only programs with
+        // thread groups may declare thread-group memory).
+        if (self.threads.is_some() || self.mesh.is_some())
+            && let Some(salt) = self.salt_memory()
+        {
+            let e = self.entry;
+            let zero = self.m.i32(0);
+            let value = self.m.i32(SALT.get());
+            let at = self.m.element(e, salt, zero);
+            self.m.store(e, at, value);
+            self.m.to_front(e, 2);
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;

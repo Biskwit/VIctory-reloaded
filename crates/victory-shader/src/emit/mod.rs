@@ -112,8 +112,14 @@ pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_THREADS,
     USER_VIEW_ADDRESS, USER_ROOT_ADDRESS, USER_VIEW_BIAS, fault_tag, memory_pages, set_memory_pages,
-    set_view_heap_limit,
+    set_salt, set_view_heap_limit, view_heap_limit,
 };
+
+/// The widest host wave [`set_host_max_wave`] set (0: not known), for a
+/// replay that translates as the run did.
+pub fn host_max_wave() -> u32 {
+    lower::host_max_wave()
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
