@@ -115,6 +115,15 @@ pub use shader::{
     set_salt, set_view_heap_limit, view_heap_limit,
 };
 
+/// Writes the digest D3D12 checks into `container` again, after a change
+/// of its parts (a replay that varies the shader hash part alone).
+pub fn rehash_container(container: &mut [u8]) {
+    if container.len() > 20 {
+        let digest = container::hash(&container[20..]);
+        container[4..20].copy_from_slice(&digest);
+    }
+}
+
 /// The widest host wave [`set_host_max_wave`] set (0: not known), for a
 /// replay that translates as the run did.
 pub fn host_max_wave() -> u32 {

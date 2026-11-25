@@ -114,6 +114,18 @@ enum Command {
         /// first run's into this folder.
         #[arg(long)]
         diffs: Option<PathBuf>,
+        /// Make the first program first with these static sampler changes
+        /// (comma-separated; `none`: the captured root signature) and hold
+        /// it: whether the driver serves that compile to other samplers.
+        #[arg(long)]
+        prime: Option<String>,
+        /// Xor the programs' shader hash part with this (nothing else
+        /// changes): whether that part keys what the driver serves.
+        #[arg(long, default_value_t = 0)]
+        hash_salt: u8,
+        /// Run on the software adapter (WARP): a reference.
+        #[arg(long)]
+        warp: bool,
         /// Change a static sampler of the root signature the programs are
         /// made with: `s<register>.<field>=<value>`, fields filter, u, v, w,
         /// func, border, aniso, bias, minlod, maxlod (repeatable).
@@ -234,6 +246,9 @@ fn main() -> Result<()> {
             retranslate,
             show,
             diffs,
+            prime,
+            hash_salt,
+            warp,
             samplers,
             expect,
             library,
@@ -248,6 +263,9 @@ fn main() -> Result<()> {
                 retranslate,
                 show,
                 diffs,
+                prime,
+                hash_salt,
+                warp,
                 samplers,
                 expect,
                 library,
@@ -280,6 +298,9 @@ struct Options {
     retranslate: bool,
     show: usize,
     diffs: Option<PathBuf>,
+    prime: Option<String>,
+    hash_salt: u8,
+    warp: bool,
     samplers: Vec<String>,
     expect: Option<PathBuf>,
     library: Option<PathBuf>,

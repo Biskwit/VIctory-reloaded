@@ -462,6 +462,17 @@ pub struct Options {
     /// differ from the first run's (white), each program's first outputs
     /// (packed rows) and its driver blob (`program-<n>.pso`), if anywhere.
     pub diffs: Option<PathBuf>,
+    /// Before the programs, the first one is made (and held) with these
+    /// static sampler changes (comma-separated; `none`: the captured root
+    /// signature): whether the driver serves what it compiled then to a
+    /// pipeline with other samplers.
+    pub prime: Option<String>,
+    /// Changes the programs' shader hash part (its digest xored with this)
+    /// and nothing else: whether that part keys what the driver serves.
+    pub hash_salt: u8,
+    /// Runs on the software adapter (WARP), a reference for what the
+    /// program computes as D3D12 specifies it.
+    pub warp: bool,
     /// Static sampler changes, `s<register>.<field>=<value>` (fields:
     /// filter, u, v, w, func, border, aniso, bias, minlod, maxlod): the
     /// programs are made with the root signature so changed.
@@ -640,7 +651,8 @@ struct Gpu {
 }
 
 impl Gpu {
-    fn new() -> Result<Gpu> {
+    /// On the GPU, or with `warp` on the software adapter.
+    fn new(warp: bool) -> Result<Gpu> {
         // SAFETY: plain D3D12 object creation.
         unsafe {
             // `VICTORY_D3D12_DEBUG`: the debug layer, its messages printed
@@ -654,7 +666,15 @@ impl Gpu {
                 }
             }
             let mut device: Option<ID3D12Device> = None;
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
+            let adapter: Option<windows::Win32::Graphics::Dxgi::IDXGIAdapter> = if warp {
+                Some(crate::host::warp_adapter().context("no WARP adapter")?)
+            } else {
+                None
+            };
+            match &adapter {
+                Some(adapter) => D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device),
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device),
+            }
                 .context("no D3D12 device")?;
             let device = device.context("no D3D12 device")?;
             let queue: ID3D12CommandQueue =
@@ -901,7 +921,10 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
         programs.push((format!("salt {salt}"), translate(salt)?.dxil));
     }
 
-    let mut gpu = Gpu::new()?;
+    let mut gpu = Gpu::new(o.warp)?;
+    if o.warp {
+        println!("on the software adapter (WARP)");
+    }
     let device = gpu.device.clone();
     let root_blob = read("root-signature.bin")?;
     // The root signature the programs are made with: the captured one, or
@@ -1267,8 +1290,43 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
     let mut reference: Option<(String, Vec<Vec<u8>>)> = None;
     let mut cached: Option<Vec<u8>> = None;
     let mut first_pso: Option<ID3D12PipelineState> = None;
+    // `prime`: the first program made first with other samplers, held.
+    let _primed = match &o.prime {
+        Some(spec) => {
+            let patches: Vec<String> = spec.split(',').filter(|p| *p != "none").map(str::to_owned).collect();
+            let blob = if patches.is_empty() { root_blob.clone() } else { patch_samplers(&root_blob, &patches)? };
+            // SAFETY: a serialized root signature.
+            let primed_root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, &blob) }?;
+            let dxil = &programs.first().context("no program")?.1;
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                // SAFETY: a borrowed pointer the description never releases.
+                pRootSignature: unsafe { std::mem::transmute_copy(&primed_root) },
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+                ..Default::default()
+            };
+            // SAFETY: the description points at live data.
+            let pso: ID3D12PipelineState = unsafe { device.CreateComputePipelineState(&desc) }?;
+            println!("primed: the first program made first with samplers {spec}");
+            Some((primed_root, pso))
+        }
+        None => None,
+    };
     let mut summary = Summary::default();
     for (number, (name, dxil)) in programs.iter().enumerate() {
+        // `hash_salt`: the same code under another shader hash.
+        let salted;
+        let dxil = if o.hash_salt != 0 {
+            let mut c = dxil.clone();
+            let at = c.windows(4).position(|w| w == b"HASH").context("no HASH part")?;
+            for b in &mut c[at + 12..at + 28] {
+                *b ^= o.hash_salt;
+            }
+            victory_shader::emit::rehash_container(&mut c);
+            salted = c;
+            &salted
+        } else {
+            dxil
+        };
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -1994,6 +2052,9 @@ mod tests {
             retranslate: false,
             show: 2,
             diffs: None,
+            prime: None,
+            hash_salt: 0,
+            warp: false,
             samplers: Vec::new(),
             expect: None,
             library: None,
