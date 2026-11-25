@@ -2487,7 +2487,14 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        #[cfg(feature = "diagnostics")]
+        let moved = std::time::Instant::now();
+        if crate::watch::copy_guarded(at, from, to - from) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+        } else {
+            crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);

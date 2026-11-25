@@ -127,6 +127,21 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Guards put back (`crate::watch`): VirtualProtect calls for runs of
+    /// blocks and their microseconds, for other views of the same pages and
+    /// theirs, and blocks looked at outside clean runs.
+    GuardProtects,
+    GuardProtectUs,
+    GuardMirrors,
+    GuardMirrorUs,
+    GuardBlocks,
+    /// Questions to Windows about unmapped view memory (`VirtualQuery`) in
+    /// guarding and their microseconds; microseconds waited for the guards'
+    /// lock in guarding; bytes copied in place (`watch::copy_guarded`).
+    GuardQueries,
+    GuardQueryUs,
+    GuardLockUs,
+    InPlaceBytes,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1090,7 +1105,9 @@ pub(crate) fn log(frames: f64) {
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
          refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
-         guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
+         guards {:.1} ms ({:.0} blocks outside clean runs; {:.0} runs guarded again {:.1} ms, \
+         {:.0} other views {:.1} ms; {:.0} questions about unmapped memory {:.1} ms; waiting for \
+         the guards' lock {:.1} ms; {:.1} MB copied in place); {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
          {:.0} steps {:.1} MB left out",
         c[C::RecordCalls as usize],
@@ -1106,6 +1123,15 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::BackCompared as usize]),
         ms(c[C::SparseUs as usize]),
         ms(c[C::GuardUs as usize]),
+        c[C::GuardBlocks as usize],
+        c[C::GuardProtects as usize],
+        ms(c[C::GuardProtectUs as usize]),
+        c[C::GuardMirrors as usize],
+        ms(c[C::GuardMirrorUs as usize]),
+        c[C::GuardQueries as usize],
+        ms(c[C::GuardQueryUs as usize]),
+        ms(c[C::GuardLockUs as usize]),
+        mb(c[C::InPlaceBytes as usize]),
         mb(c[C::WholeBytes as usize]),
         c[C::PaceWaits as usize],
         ms(c[C::PaceUs as usize]),
