@@ -261,6 +261,33 @@ impl Memory {
         }
     }
 
+    /// A root view above the title's 40 bits is a table the structure
+    /// builder's own code keeps in the host's heap: per geometry the
+    /// addresses of its vertices, its indices and its transform, which the
+    /// stage then reads by address. Those are named too, so that their
+    /// copies are there when the stage runs. Without it the first build of
+    /// a structure read zeros for every vertex (run bvh-11: 263, 54 and 47
+    /// pages in the builder's first three frames, all touched by the stage
+    /// that loads triangles), and a structure is built once.
+    /// shortcut: the table's length is not known: its first 16 KiB are
+    /// looked through for address pairs on 8 bytes (low dword, then bits 32
+    /// to 39), which other data there may look like; what is not the title's
+    /// memory is refused.
+    fn name_table(&mut self, table: u64) {
+        const LOOKED: usize = 16 << 10;
+        if table >> 40 == 0 || !crate::texture::committed(table as *const u8, LOOKED) {
+            return;
+        }
+        // SAFETY: just found committed; the builder's code may be writing
+        // it, and any value read is looked at as a number only.
+        let pairs = unsafe { std::slice::from_raw_parts(table as *const [u32; 2], LOOKED / 8) };
+        for &[low, high] in pairs {
+            if (1..=0xFF).contains(&high) && low >= 0x1_0000 {
+                self.name(u64::from(low) | u64::from(high) << 32);
+            }
+        }
+    }
+
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it.
     fn name(&mut self, address: u64) {
@@ -296,6 +323,7 @@ pub(crate) fn ready(
     let numbered = m.copies.len();
     for &address in addresses {
         m.name(address);
+        m.name_table(address);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
