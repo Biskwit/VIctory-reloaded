@@ -615,6 +615,16 @@ impl Gpu {
     fn new() -> Result<Gpu> {
         // SAFETY: plain D3D12 object creation.
         unsafe {
+            // `VICTORY_D3D12_DEBUG`: the debug layer, its messages printed
+            // after each run (a replay set up otherwise than the run).
+            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+                let mut layer: Option<ID3D12Debug> = None;
+                if D3D12GetDebugInterface(&mut layer).is_ok()
+                    && let Some(layer) = layer
+                {
+                    layer.EnableDebugLayer();
+                }
+            }
             let mut device: Option<ID3D12Device> = None;
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
                 .context("no D3D12 device")?;
@@ -651,6 +661,7 @@ impl Gpu {
             self.queue.Signal(&self.fence, self.value)?;
             self.fence
                 .SetEventOnCompletion(self.value, windows::Win32::Foundation::HANDLE::default())?;
+            self.messages();
             if let Err(e) = self.device.GetDeviceRemovedReason() {
                 bail!("the replay's device was removed: {e}");
             }
@@ -658,6 +669,31 @@ impl Gpu {
             self.list.Reset(&self.allocator, None)?;
         }
         Ok(())
+    }
+
+    /// Prints and clears the debug layer's messages, if it is on.
+    fn messages(&self) {
+        let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
+            return;
+        };
+        // SAFETY: each message is read into a buffer of the size the queue
+        // reports, then the queue is emptied.
+        unsafe {
+            for i in 0..queue.GetNumStoredMessages() {
+                let mut size = 0;
+                if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                    continue;
+                }
+                let mut buffer = vec![0u64; size.div_ceil(8)];
+                let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if queue.GetMessage(i, Some(message), &mut size).is_ok() {
+                    let m = &*message;
+                    let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                    println!("D3D12: {}", String::from_utf8_lossy(text).trim_end_matches('\0'));
+                }
+            }
+            queue.ClearStoredMessages();
+        }
     }
 
     fn buffer(
@@ -827,6 +863,11 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
         programs.push(("translated again".into(), t.dxil));
     } else {
         programs.push(("captured".into(), captured.dxil.clone()));
+        // The salted ones differ from the captured code by their salt only
+        // if this build translates as the run's did.
+        if o.variants > 1 && translate(0)?.dxil != captured.dxil {
+            println!("note: this build translates the shader otherwise than the run did: the salted programs differ by more than their salt");
+        }
     }
     for salt in 1..o.variants.max(1) {
         programs.push((format!("salt {salt}"), translate(salt)?.dxil));
