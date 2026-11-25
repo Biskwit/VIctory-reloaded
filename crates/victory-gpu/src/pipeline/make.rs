@@ -115,7 +115,8 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
-        start(p, REQUESTED);
+        let priority = if urgent_compute() && is_compute(p) { URGENT } else { REQUESTED };
+        start(p, priority);
         wait(p, crate::frame::current());
     }
     let made = p.made.get()?.as_ref();
@@ -211,9 +212,32 @@ fn wait(p: &Pending, frame: u64) {
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
-const MAKING: u8 = 3;
+/// A compute pipeline a dispatch asked for ([`urgent_compute`]).
+const URGENT: u8 = 3;
+const MAKING: u8 = 4;
+
+/// Whether a compute pipeline a dispatch asks for goes ahead of every other
+/// queued pipeline, not in turn behind the draws' (`VICTORY_COMPUTE_FIRST=0`:
+/// in turn, as before). A cold launch's first world frame asks for some
+/// 2,000 pipelines at once (1,932 first uses within 5 s, run chain-cold),
+/// made in the order asked: the compute chain that keeps a persistent
+/// 384x384 lighting map (ef05293f, 4ceef06f, f42a5dca, 5b2ce592, 89106710)
+/// waited behind 1,285 others, four minutes, while the passes reading its
+/// map ran; the map then started from that stale state and the launch kept
+/// the pale picture. Compute passes keep state from frame to frame like
+/// that; a draw dropped for a frame leaves nothing behind.
+fn urgent_compute() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPUTE_FIRST").is_none_or(|v| v != "0"))
+}
+
+/// Whether `p` is a compute pipeline (one compute shader).
+fn is_compute(p: &Pending) -> bool {
+    matches!(&p.shaders[..], [s] if s.stage == "compute")
+}
 
 struct Queue {
+    urgent: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
 }
@@ -221,6 +245,7 @@ struct Queue {
 impl Queue {
     const fn new() -> Self {
         Self {
+            urgent: VecDeque::new(),
             early: VecDeque::new(),
             requested: VecDeque::new(),
         }
@@ -234,20 +259,23 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
-            self.requested.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
+        match priority {
+            URGENT => self.urgent.push_back(p.clone()),
+            REQUESTED => self.requested.push_back(p.clone()),
+            _ => self.early.push_back(p.clone()),
         }
         Some(prev == NOT_QUEUED)
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+        // An entry can have been promoted (and claimed from the queue it
+        // was promoted to) since it was queued: only taken at its state.
+        let at = |q: &mut VecDeque<Arc<Pending>>, state: u8| {
+            std::iter::from_fn(|| q.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == state)
+        };
+        let p = at(&mut self.urgent, URGENT)
+            .or_else(|| at(&mut self.requested, REQUESTED))
+            .or_else(|| at(&mut self.early, EARLY))?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -375,6 +403,28 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
+        assert!(queue.pop().is_none());
+    }
+
+    /// A compute pipeline a dispatch asks for is made before every draw's
+    /// and early pipeline queued before it, once (also when it was queued
+    /// as a draw's first).
+    #[test]
+    fn urgent_pipelines_go_first_and_once() {
+        let early = Arc::new(Pending::new(Vec::new(), None));
+        let drawn = Arc::new(Pending::new(Vec::new(), None));
+        let chain = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+
+        assert_eq!(queue.push(&early, EARLY), Some(true));
+        assert_eq!(queue.push(&drawn, REQUESTED), Some(true));
+        assert_eq!(queue.push(&chain, REQUESTED), Some(true));
+        // The dispatch asks: promoted ahead of the draw queued before it.
+        assert_eq!(queue.push(&chain, URGENT), Some(false));
+
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &chain));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &drawn));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &early));
         assert!(queue.pop().is_none());
     }
 }
