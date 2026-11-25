@@ -1958,6 +1958,8 @@ impl Shadow {
                 if differs != 0 {
                     crate::watch::writing(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    #[cfg(feature = "diagnostics")]
+                    self.audit(at, n, title);
                     written += n;
                 }
             }
@@ -1970,6 +1972,17 @@ impl Shadow {
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
         written
+    }
+
+    /// Offsets `[at, at + n)` took what shaders wrote and went into title
+    /// memory as `title` (`crate::pipeline::audit`).
+    #[cfg(feature = "diagnostics")]
+    fn audit(&self, at: usize, n: usize, title: &[u8]) {
+        crate::pipeline::audit(|| {
+            let head: String = title.iter().take(24).map(|b| format!("{b:02x}")).collect();
+            let kind = if self.window { "window" } else { "buffer" };
+            format!("back {:#x}+{n:#x} {kind} {:#x}+{:#x} {head}", self.start as usize + at, self.start, self.len)
+        });
     }
 
     /// Offsets `[from, to)` of the copy are compared with the snapshot: for
@@ -2047,6 +2060,8 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        #[cfg(feature = "diagnostics")]
+        self.audit(at, n, title);
         n
     }
 
@@ -2575,6 +2590,8 @@ impl Shadow {
             if differs != 0 {
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                #[cfg(feature = "diagnostics")]
+                self.audit(at, n, title);
                 written = n;
             }
         } else {
@@ -2650,6 +2667,8 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        #[cfg(feature = "diagnostics")]
+        self.audit(at, n, title);
         n
     }
 }

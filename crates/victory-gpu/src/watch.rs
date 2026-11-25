@@ -14,11 +14,14 @@
 //! wholly uncommitted are skipped while they remain so; one query can
 //! confirm a whole region, including ordinary reservations between views.
 //!
-//! shortcut: writes into physical pages through another view (xmem's
-//! `write_physical`, DirectStorage's page destinations) are not seen at
-//! the guarded addresses; they go to the texture pool, whose textures are
-//! hashed, not guarded. A system call writing into a guarded block fails
-//! (none is known to).
+//! The title shows the same physical pages at several addresses, and
+//! writes them at one while shaders read them at another (Grand Theft Auto
+//! VI's streamed resources: its code at one address, the card 0x6_0000_0000
+//! higher). A guarded block's other views are made read-only with it
+//! ([`mirror`]), and a write at any of them counts for all. Writes that go
+//! through no view of the title's (xmem's `write_physical`, DirectStorage's
+//! page destinations) are told by the runtime ([`title_pages_written`]).
+//! A system call writing into a guarded block fails (none is known to).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -379,12 +382,17 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
+    /// Blocks made read-only because they show the pages of guarded
+    /// blocks ([`mirror`]), with those blocks: a write here is a write
+    /// there.
+    mirrored: BTreeMap<usize, Vec<usize>>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    mirrored: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -450,6 +458,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+                mirror(&mut g, block);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -526,6 +535,9 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
+        for block in from..to {
+            mirror(g, block);
+        }
     };
     if set(from, to) {
         note(g, from, to);
@@ -536,6 +548,62 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
+        }
+    }
+}
+
+/// Makes the other views of guarded block `block`'s pages read-only too,
+/// so that a write through one of them is taken for a write to `block`
+/// ([`open`]). The structure builder's inputs showed what this is for: the
+/// title wrote a level's nodes at its own address, the builder read the
+/// copy of the card's address, which nothing had marked written, and
+/// stored parent links where the stale bytes pointed (run bvh-06: a clip
+/// object's pointer became 0x5000007c4).
+fn mirror(g: &mut Guards, block: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    for other in crate::inplace::other_views(block * BLOCK) {
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes.
+        unsafe { VirtualProtect(other as *const _, BLOCK, PAGE_READONLY, &mut old) };
+        let of = g.mirrored.entry(other / BLOCK).or_default();
+        if !of.contains(&block) {
+            of.push(block);
+        }
+    }
+}
+
+/// The runtime mapped `[at, at + len)` as a view of physical pages: where
+/// guarded blocks show the same pages, the new view mirrors them.
+pub(crate) fn view_mapped(at: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    let mut g = guards();
+    if g.protected.is_empty() {
+        return;
+    }
+    for block in at / BLOCK..at.saturating_add(len).div_ceil(BLOCK) {
+        for other in crate::inplace::other_views(block * BLOCK) {
+            if g.protected.contains(&(other / BLOCK)) {
+                let mut old = 0;
+                // SAFETY: title view memory; only its protection changes.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) };
+                g.mirrored.entry(block).or_default().push(other / BLOCK);
+            }
+        }
+    }
+}
+
+/// The runtime wrote `len` bytes of physical pages from `offset` of
+/// `section` on through a view of its own (DirectStorage's destinations):
+/// the guarded blocks that show them count as written.
+pub fn title_pages_written(section: usize, offset: u64, len: usize) {
+    let mut g = guards();
+    if g.clean.is_empty() {
+        return;
+    }
+    let first = offset - offset % BLOCK as u64;
+    for slice in (first..offset + len as u64).step_by(BLOCK) {
+        for at in crate::inplace::views_of(section, slice) {
+            g.clean.remove(&(at / BLOCK));
         }
     }
 }
@@ -560,11 +628,19 @@ fn uncommitted_end(block: usize) -> usize {
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let range = start / BLOCK..end.div_ceil(BLOCK);
+    let mut blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
+    // Blocks that mirror guarded ones: those are written too (they stay
+    // read-only: the next asking about them says so and mirrors again).
+    let mirrors: Vec<usize> = g.mirrored.range(range).map(|(&block, _)| block).collect();
+    for block in mirrors {
+        for of in g.mirrored.remove(&block).unwrap_or_default() {
+            g.clean.remove(&of);
+        }
+        if !blocks.contains(&block) {
+            blocks.push(block);
+        }
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
@@ -652,10 +728,16 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    // A view mapped anew is read-write: it mirrors nothing until
+    // `view_mapped` says so.
+    let mirrors: Vec<usize> = g.mirrored.range(range).map(|(&block, _)| block).collect();
+    for block in mirrors {
+        g.mirrored.remove(&block);
     }
 }
 
@@ -754,6 +836,58 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The title shows the same pages at two addresses: a write at one is
+    /// a write to the guarded block at the other, each time it is guarded
+    /// again; so is a write the runtime tells of that went through neither.
+    #[test]
+    fn a_write_through_another_view_of_the_pages_is_reported() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write twice.
+        let (section, card, own) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let map = || MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            (section as usize, map(), map())
+        };
+        assert!(card != 0 && own != 0);
+        crate::inplace::title_memory_view(card, 2 * BLOCK, section, 0);
+        crate::inplace::title_memory_view(own, 2 * BLOCK, section, 0);
+        let second = Some((card / PAGE + 1..card / PAGE + 2).collect::<Vec<_>>());
+        assert!(guard(card, card + 2 * BLOCK).is_some());
+        assert_eq!(guard(card, card + 2 * BLOCK), Some(Vec::new()));
+        for round in 0..2u8 {
+            // SAFETY: our view; the handler opens it.
+            unsafe { ((own + BLOCK + 8) as *mut u8).write(round) };
+            assert_eq!(guard(card, card + 2 * BLOCK), second, "round {round}");
+            assert_eq!(guard(card, card + 2 * BLOCK), Some(Vec::new()));
+        }
+        title_pages_written(section, BLOCK as u64 + 100, 4);
+        assert_eq!(guard(card, card + 2 * BLOCK), second);
+        // A view mapped after the block was guarded mirrors it as well.
+        // SAFETY: as above.
+        let late = unsafe { MapViewOfFile(section as _, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize };
+        assert_ne!(late, 0);
+        assert_eq!(guard(card, card + 2 * BLOCK), Some(Vec::new()));
+        crate::inplace::title_memory_view(late, 2 * BLOCK, section, 0);
+        // SAFETY: our view; the handler opens it.
+        unsafe { ((late + BLOCK) as *mut u8).write(7) };
+        assert_eq!(guard(card, card + 2 * BLOCK), second);
+        for view in [card, own, late] {
+            // SAFETY: our views.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+            title_memory_remapped(view, 2 * BLOCK);
+        }
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

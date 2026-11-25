@@ -178,6 +178,9 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// The threads the dispatch being bound starts, if its counts are
+    /// threads ([`State::dispatch_threads`]).
+    threads: Option<u32>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -679,9 +682,12 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_MEMORY_BASE, USER_THREADS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_THREADS {
+            return self.threads.unwrap_or(u32::MAX);
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -1663,8 +1669,28 @@ impl State {
         });
     }
 
+    /// Runs a dispatch of `x` threads on the host (`DispatchX` with the
+    /// console's flag that makes its counts threads): the groups that hold
+    /// them, the last one started whole, with the count given to the
+    /// program, whose code leaves the threads past it out
+    /// (`victory_shader::spill::counts_threads`).
+    ///
+    /// The ray-tracing structure builder runs its level passes this way,
+    /// one thread a node. Run as that many groups (runs 26 to bvh-05), a
+    /// level of 1,606 nodes ran 102,784 threads: each stored a node of 128
+    /// bytes, 13 MiB from a structure of 2, and the title died on its own
+    /// objects holding bounding boxes.
+    pub(crate) fn dispatch_threads(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        self.dispatch_of(list, [x, y, z], true);
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        self.dispatch_of(list, [x, y, z], false);
+    }
+
+    /// [`State::dispatch`], or with `threads` [`State::dispatch_threads`].
+    fn dispatch_of(&mut self, list: &HostList, [mut x, y, z]: [u32; 3], threads: bool) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -1700,7 +1726,32 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        if threads {
+            use victory_shader::emit::USER_THREADS;
+            let group = match &p.stages[..] {
+                [stage] if y == 1 && z == 1 => {
+                    let t = stage.translated();
+                    let takes = t.host.user_data.iter().any(|u| u.root == RootType::Other(USER_THREADS));
+                    (takes && t.group > 0).then_some(t.group)
+                }
+                _ => None,
+            };
+            let Some(group) = group else {
+                // As whole groups it would run threads the title never
+                // started.
+                once!(x, y, z, "a dispatch of a count of threads that its program does not take: dropped");
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                if crate::pipeline::is_builder(self.pipeline as This) {
+                    crate::pipeline::builder_off("a dispatch of a count of threads could not be run");
+                }
+                return;
+            };
+            self.threads = Some(x);
+            x = x.div_ceil(group);
+        }
+        let bound = self.bind(list, p, true);
+        self.threads = None;
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -1711,6 +1762,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            crate::pipeline::audit(|| self.op_text(format!("list {:#x} thread {:?} dispatch {x}x{y}x{z}", std::ptr::from_ref(list) as usize, std::thread::current().id()), true));
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);

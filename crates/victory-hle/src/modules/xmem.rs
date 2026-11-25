@@ -552,6 +552,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        victory_gpu::title_pages_written(slice.section.0 as usize, (slice.index * PAGE + within) as u64, k);
         (within, done) = (0, done + k);
     }
     true
@@ -564,6 +565,15 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
+    /// The section and the offset in it of the window's first byte.
+    place: (usize, u64),
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        // What was written here is in pages the title may show elsewhere.
+        victory_gpu::title_pages_written(self.place.0, self.place.1, self.len);
+    }
 }
 
 impl PageWindow {
@@ -587,6 +597,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
+        place: (slice.section.0 as usize, (slice.index * PAGE + offset % PAGE) as u64),
     })
 }
 

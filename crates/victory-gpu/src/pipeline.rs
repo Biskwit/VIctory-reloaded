@@ -125,6 +125,8 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// A compute program's threads a group along x (0: not one).
+    pub(crate) group: u32,
 }
 
 #[cfg(windows)]
@@ -183,6 +185,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let group = programs
+        .iter()
+        .find_map(|p| match &p.io {
+            victory_shader::native::StageIo::Cs(cs) => Some(cs.threads[0]),
+            _ => None,
+        })
+        .unwrap_or(0);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -193,7 +202,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, group })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -260,6 +269,28 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_BVH_AUDIT=<file>` (diagnostics): a line per dispatch of the
+/// structure builder (its program and root arguments), per stretch of
+/// title memory that takes what shaders wrote, and per page a shader found
+/// without a copy, each with the frame being built. For finding which
+/// stage's stores land outside the structures: the stretch that holds a
+/// crashing object names the frame, and the dispatches of that frame name
+/// the structures around it.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn audit(line: impl FnOnce() -> String) {
+    use std::io::Write;
+    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_BVH_AUDIT")?;
+        std::fs::File::create(path).ok().map(Mutex::new)
+    });
+    if let Some(file) = file {
+        let line = format!("{} {}
+", crate::queue::presented() + 1, line());
+        let _ = file.lock().unwrap_or_else(|e| e.into_inner()).write_all(line.as_bytes());
+    }
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.

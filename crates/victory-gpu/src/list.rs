@@ -1313,14 +1313,24 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with the console's dispatch
+/// flags (the ray-tracing structure builder dispatches this way: 0x20, and
+/// 0x8020 for its programs of 32-lane waves). Bit 5 makes the counts
+/// threads instead of thread groups, the last group started in part
+/// (`State::dispatch_threads`); the host has no use for the others.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    const THREADS: u32 = 1 << 5;
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::pipeline::audit(|| format!("dispatchx {x}x{y}x{z} flags {flags:#x} thread {:?}", std::thread::current().id()));
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    if flags & THREADS != 0 {
+        state::dispatch_threads(this, x, y, z);
+    } else {
+        state::dispatch(this, x, y, z);
+    }
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags, THREADS);
         count_dispatch();
     }
 }
@@ -1588,6 +1598,11 @@ mod state {
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
+    }
+    /// A dispatch whose counts are threads (`DispatchX`).
+    pub(super) fn dispatch_threads(this: This, x: u32, y: u32, z: u32) {
+        super::count_dispatch();
+        with_state(this, |list, s| s.dispatch_threads(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.

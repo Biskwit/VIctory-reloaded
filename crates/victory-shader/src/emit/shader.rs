@@ -69,6 +69,11 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: how
+/// many threads the dispatch starts, counted along x from the first group
+/// on; `u32::MAX` for a dispatch of whole groups. Asked for by programs
+/// run with a count of threads (`spill::counts_threads`).
+pub const USER_THREADS: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
