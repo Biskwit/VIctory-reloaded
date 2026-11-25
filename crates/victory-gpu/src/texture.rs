@@ -1053,6 +1053,22 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         )
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    // Diagnostics: title memory that a texture the host writes lies in
+    // holds what was there before (the host's writes stay on the host).
+    #[cfg(feature = "diagnostics")]
+    if let Some(target) = crate::resource::target_over(memory as u64, layout.size) {
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
+            tracing::info!(
+                ?resource,
+                memory = ?memory,
+                bytes = layout.size,
+                ?desc,
+                target,
+                "a texture filled from title memory lies in the memory of a texture the host writes"
+            );
+        }
+    }
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
