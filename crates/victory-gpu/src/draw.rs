@@ -210,6 +210,10 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    /// Root SRVs of the host's own memory in this list (`root_srv_now`):
+    /// (title heap, address, early start) → dynamic slot, and the bytes it
+    /// shows (in upload memory the list holds).
+    root_now_slots: std::collections::HashMap<(usize, u64), (u32, usize, usize)>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
 }
@@ -244,6 +248,7 @@ impl State {
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
+        self.root_now_slots.clear();
         self.tables_gone = true;
     }
 }
@@ -1092,6 +1097,76 @@ impl State {
         true
     }
 
+    /// Binds a root SRV of the host's own memory (an address past the
+    /// title's 40 bits: the structure builder's tables, in the host's heap)
+    /// as a one-view table of the bytes there now, not of a copy brought up
+    /// to date when the list is submitted: the builder writes the next
+    /// dispatch's table over the last one's. (Run bvh-33: 74 tables read
+    /// differently by two dispatches of one list, the level passes' and
+    /// InitHeaders' among them; each pass ran on the last one's table.)
+    /// shortcut: a table is taken as 256 KiB, or what is committed of that.
+    #[allow(clippy::too_many_arguments)]
+    fn root_srv_now(
+        &mut self,
+        list: &HostList,
+        host: &crate::descriptor::host::HostHeap,
+        key: (usize, u64),
+        address: u64,
+        param: u32,
+        compute: bool,
+        biased: bool,
+    ) -> bool {
+        // Raw views start on 16 bytes, as in `root_srv_table`.
+        let start = address & !15;
+        let mut len = 256usize << 10;
+        while len >= 4096 && !crate::texture::committed(start as *const u8, len) {
+            len /= 2;
+        }
+        let there = len >= 4096 && (biased || start == address);
+        // SAFETY: just found committed; the builder's thread is this one.
+        let now = there.then(|| unsafe { std::slice::from_raw_parts(start as *const u8, len) });
+        let same = self.root_now_slots.get(&key).filter(|&&(_, data, had)| {
+            // SAFETY: upload memory the list holds until it is reset.
+            now.is_some_and(|now| had == len && now == unsafe { std::slice::from_raw_parts(data as *const u8, had) })
+        });
+        let index = match same {
+            Some(&(index, _, _)) => index,
+            None => {
+                let Some(index) = host.dynamic(1) else {
+                    return false;
+                };
+                self.dynamic.push((key.0, index, 1));
+                let taken = now.and_then(|now| {
+                    let (buffer, data) = list.upload(crate::host::host()?, len as u64)?;
+                    // SAFETY: the buffer's mapping, `len` bytes.
+                    unsafe { std::ptr::copy_nonoverlapping(now.as_ptr(), data, len) };
+                    host.raw_at(index, &buffer, 0, len as u64);
+                    Some(data as usize)
+                });
+                match taken {
+                    Some(data) => {
+                        self.root_now_slots.insert(key, (index, data, len));
+                    }
+                    None => {
+                        once!(address = format_args!("{address:#x}"), "a root SRV of the host's memory reads zeros");
+                        host.null_raw_at(index);
+                    }
+                }
+                index
+            }
+        };
+        let handle = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound view heap.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, handle);
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, handle);
+            }
+        }
+        true
+    }
+
     /// Binds a root UAV: a raw unordered access view of the title buffer's
     /// host copy from `address` on, as a one-view table (a null view
     /// without an address, without a host copy shaders can write, or at an
@@ -1236,6 +1311,9 @@ impl State {
             std::ptr::from_ref(heap) as usize,
             address.unwrap_or(0) | u64::from(biased) << 63,
         );
+        if let Some(a) = address.filter(|a| a >> 40 != 0) {
+            return self.root_srv_now(list, host, key, a, param, compute, biased);
+        }
         let (index, shadow) = match self.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
