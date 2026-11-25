@@ -351,7 +351,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         let guarding = std::time::Instant::now();
         let written = guard(first * PAGE, last * PAGE);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+        crate::copystat::add(crate::copystat::C::GuardNs, guarding.elapsed().as_nanos() as u64);
         written?
     } else {
         Vec::new()
@@ -558,7 +558,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.holding(first).is_some()
     };
-    if !known && !is_view(start, end) {
+    #[cfg(feature = "diagnostics")]
+    let asking = std::time::Instant::now();
+    let view = known || is_view(start, end);
+    #[cfg(feature = "diagnostics")]
+    if !known {
+        use crate::copystat::{C, add};
+        add(C::GuardViewAsks, 1);
+        add(C::GuardViewAskNs, asking.elapsed().as_nanos() as u64);
+    }
+    if !view {
         return None;
     }
     install();
@@ -566,7 +575,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let locking = std::time::Instant::now();
     let mut g = guards();
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::GuardLockUs, locking.elapsed().as_micros() as u64);
+    crate::copystat::add(crate::copystat::C::GuardLockNs, locking.elapsed().as_nanos() as u64);
     let mut written = Vec::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // Nothing written, mapped or new since the range was last taken: one
@@ -693,7 +702,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         {
             use crate::copystat::{C, add};
             add(C::GuardProtects, 1);
-            add(C::GuardProtectUs, started.elapsed().as_micros() as u64);
+            add(C::GuardProtectNs, started.elapsed().as_nanos() as u64);
         }
         done
     };
@@ -731,7 +740,16 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 /// object's pointer became 0x5000007c4).
 fn mirror(g: &mut Guards, block: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    for other in crate::inplace::other_views(block * BLOCK) {
+    #[cfg(feature = "diagnostics")]
+    let looking = std::time::Instant::now();
+    let others = crate::inplace::other_views(block * BLOCK);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::GuardLookups, 1);
+        add(C::GuardLookupNs, looking.elapsed().as_nanos() as u64);
+    }
+    for other in others {
         // Not under a write of the kernel's: the end of that write counts
         // for `block` instead ([`Writing`]).
         if !g.held(other / BLOCK) {
@@ -744,7 +762,7 @@ fn mirror(g: &mut Guards, block: usize) {
             {
                 use crate::copystat::{C, add};
                 add(C::GuardMirrors, 1);
-                add(C::GuardMirrorUs, started.elapsed().as_micros() as u64);
+                add(C::GuardMirrorNs, started.elapsed().as_nanos() as u64);
             }
         }
         let of = g.mirrored.entry(other / BLOCK).or_default();
@@ -807,7 +825,7 @@ fn uncommitted_end(block: usize) -> usize {
     {
         use crate::copystat::{C, add};
         add(C::GuardQueries, 1);
-        add(C::GuardQueryUs, asked.elapsed().as_micros() as u64);
+        add(C::GuardQueryNs, asked.elapsed().as_nanos() as u64);
     }
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
         (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
