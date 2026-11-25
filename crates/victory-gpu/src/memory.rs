@@ -81,9 +81,10 @@ fn copies_most() -> u32 {
 
 /// Copies that can be numbered with [`pages`]: a page each, so many more.
 const PAGE_COPIES: u32 = 65535;
-/// A copy of view memory with [`pages`]: its page, and the page after it
-/// for an access that begins in the page's last bytes.
-const PAGE_COPY: u64 = 2 * PAGE;
+/// A copy of view memory with [`pages`]: its page. (The translation looks up
+/// each dword of an access on its own, so one that begins in a page's last
+/// bytes continues in the next page's copy.)
+const PAGE_COPY: u64 = PAGE;
 /// How far from an address a dispatch names its stages are taken to reach
 /// ([`pages`]): the 4 MiB a window was, twice.
 const REACH: u64 = 2 * CELL;
@@ -114,9 +115,7 @@ const REACH: u64 = 2 * CELL;
 /// pointers stays as it was. Stores through such pointers, more than
 /// [`REACH`] from every named address, are not copied back into title
 /// memory.
-/// shortcut: a store that begins in a page's last bytes and ends in the
-/// next page lands in the first page's copy only (the builder's nodes lie
-/// on 64 bytes). Copies of pages the title maps anew are not given up, nor
+/// shortcut: copies of pages the title maps anew are not given up, nor
 /// their numbers used again.
 pub(crate) fn pages() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
