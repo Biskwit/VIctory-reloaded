@@ -149,7 +149,32 @@ const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
 
+/// The most megabytes of private memory the process may hold for another
+/// copy to be numbered past the first [`COPIES`] (`VICTORY_MEMORY_MOST_MB`;
+/// 30,000 by default). With 4,095 numbers the structure builder and the
+/// ray-tracing shaders had the process at 45 GB, 16.7 GB of it windows
+/// numbered for them, and the PC at 6 GB free (run bvh-47). Pages past the
+/// limit read zeros, as pages without a number do.
+fn most_mb() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_MEMORY_MOST_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(30_000)
+    })
+}
+
+/// The process's private memory, in megabytes.
+fn private_mb() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    c.PagefileUsage as u64 >> 20
+}
+
 struct Memory {
+    /// Whether the process holds more than [`most_mb`], as of this frame.
+    full: bool,
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
     faults: (ID3D12Resource, *mut u32, u64),
@@ -288,6 +313,7 @@ impl Memory {
             copies: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
+            full: false,
             refused: Default::default(),
             slices: HashMap::new(),
             paged: Default::default(),
@@ -382,6 +408,18 @@ impl Memory {
             }
             return;
         }
+        // Past the limit no window is made to be numbered (run bvh-48: the
+        // numbering was refused after the window was there, and the process
+        // went on to 40.5 GB). A page of a window that is there already is
+        // refused with it: only buffers are known without making a copy.
+        if self.full && self.copies.len() >= COPIES as usize && crate::shadow::extent(start).is_none() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(most_mb = most_mb(), "title memory by address: the process holds too much memory for another window; its pages read zeros")
+            });
+            why("the process holds too much memory");
+            return;
+        }
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
@@ -400,6 +438,14 @@ impl Memory {
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
+            None if self.full && self.copies.len() >= COPIES as usize => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(most_mb = most_mb(), "title memory by address: the process holds too much memory for another copy; its pages read zeros")
+                });
+                why("the process holds too much memory");
+                return;
+            }
             None if self.copies.len() < copies_most() as usize => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
@@ -585,6 +631,7 @@ pub(crate) fn ready(
     heap: &HostHeap,
     addresses: &[u64],
     constants: &[u32],
+    structures: &[u64],
     writes: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -596,6 +643,7 @@ pub(crate) fn ready(
     if m.frame != frame {
         m.frame = frame;
         m.refused.clear();
+        m.full = private_mb() > most_mb();
         m.take_faults();
     }
     m.take_remapped();
@@ -624,6 +672,26 @@ pub(crate) fn ready(
         }
     }
     m.stored = m.named.len();
+    // The structures its acceleration structure views name, as long as
+    // their headers say: the second dword is the last 64-byte node.
+    for &address in structures {
+        m.name(address);
+        m.named.push(address);
+        if address >> 40 != 0 || !crate::texture::committed(address as *const u8, 8) {
+            continue;
+        }
+        // SAFETY: just found committed; any value read is a number only.
+        let head = unsafe { (address as *const [u32; 2]).read_unaligned() };
+        if head[0] & 0xfff0_ffff != 0x8000_0006 {
+            continue;
+        }
+        let end = address + (u64::from(head[1]) + 1).min(1 << 20) * 64;
+        let mut at = (address & !(PAGE - 1)) + PAGE;
+        while at < end {
+            m.map(at);
+            at += PAGE;
+        }
+    }
     // Only where the card's addresses of title memory are (from 0x7 to
     // below 0xe in bits 32 to 39): a float or a packed colour shifted by
     // 8 bits lands in the pool's views above, which are committed, and
@@ -674,7 +742,15 @@ pub(crate) fn ready(
     for &n in &m.plain {
         let (n, shadow) = (n as usize, &m.copies[n as usize]);
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
+        // Past the first `COPIES`, only the copies the dispatch names
+        // memory in or just before, once a list each, and new ones: with
+        // 4,095 numbered, bringing every one up to date for every list
+        // was most of a second a frame (run bvh-47).
+        // shortcut: a copy reached only through pointers is then as the
+        // last list that named or drew from it left it.
+        let all = m.copies.len() <= COPIES as usize;
+        let near = || m.named.iter().any(|&a| a < start + len && a + REACH > start);
+        if n >= numbered || if all { first_read } else { near() && list.first_use(NEAR_PLAIN - 0x1_0000 - n) } {
             shadow.refresh(list, start, len);
         }
         // Not memory past the title's 40 bits (the builder's tables in the
