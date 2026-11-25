@@ -583,6 +583,18 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// there, 27.6 ms a frame of "moves" for some 160 MB in run late-30, most
 /// of them the 174 MB heap's, a view.
 pub(crate) fn copy_guarded(dst: *mut u8, src: usize, len: usize) -> bool {
+    // SAFETY: the caller's destination of `len` bytes.
+    let copied = read_guarded(src, len, |title| unsafe { std::ptr::copy_nonoverlapping(title.as_ptr(), dst, len) });
+    #[cfg(feature = "diagnostics")]
+    if copied {
+        crate::copystat::add(crate::copystat::C::InPlaceBytes, len as u64);
+    }
+    copied
+}
+
+/// [`copy_guarded`]'s reading: `read` is given the `len` bytes of title
+/// memory at `src` in place, if they may be read so. Whether it was.
+pub(crate) fn read_guarded(src: usize, len: usize, read: impl FnOnce(&[u8])) -> bool {
     if len == 0 {
         return false;
     }
@@ -597,13 +609,10 @@ pub(crate) fn copy_guarded(dst: *mut u8, src: usize, len: usize) -> bool {
         }
     }
     // SAFETY: mapped title memory (above) that stays mapped while
-    // `_reading` is held, and the caller's destination of `len` bytes. The
-    // title may write it meanwhile (a write opens the block, it does not
-    // unmap it): each byte read is one it held at some moment, as through
-    // the kernel.
-    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst, len) };
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::InPlaceBytes, len as u64);
+    // `_reading` is held. The title may write it meanwhile (a write opens
+    // the block, it does not unmap it): each byte read is one it held at
+    // some moment, as through the kernel.
+    read(unsafe { std::slice::from_raw_parts(src as *const u8, len) });
     true
 }
 

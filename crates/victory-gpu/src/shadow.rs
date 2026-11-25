@@ -99,6 +99,13 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// With [`relay`]: the pages (of title memory, `PAGE`s) that took what
+    /// shaders wrote ([`Shadow::card_merge_relay`]) and that the copy has
+    /// not refreshed since. Our write shows as the title's: each refresh
+    /// that followed copied those pages again and sent them up again (run
+    /// late-70: 84 of the 148 MB a frame sent up). Their next refresh
+    /// compares first ([`Shadow::copy_changed`]).
+    echo: Mutex<std::collections::BTreeSet<usize>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -580,6 +587,21 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     differs != 0
 }
 
+/// `held` takes `title`'s bytes from the first to the last that differ;
+/// that span (offsets, end exclusive), or `None` if they are the same.
+fn take_changed(title: &[u8], held: &mut [u8]) -> Option<(usize, usize)> {
+    // Most such pages are the same (run late-73: 57 of 80 MB a frame): one
+    // compare of the whole, much faster than the word-by-word search, which
+    // made the refreshes slower than the copies they spared.
+    if title == &*held {
+        return None;
+    }
+    let first = first_difference(title, held)?;
+    let last = last_difference(title, held).unwrap_or(first);
+    held[first..=last].copy_from_slice(&title[first..=last]);
+    Some((first, last + 1))
+}
+
 /// `[from, to)` without the ranges of `skip`, in order.
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
@@ -605,7 +627,7 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, changed_runs, merge_piece, outside, take_changed};
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -759,6 +781,34 @@ mod relay_tests {
         // A third merge finds nothing.
         let mut t = title.clone();
         assert!(!merge_piece(&copy, &mut snap, &mut t));
+    }
+
+    /// A model of a copy in the card's memory under the relay, as below: a
+    /// flight's bytes merged into title memory leave title memory, the
+    /// CPU's side and the card's side the same there, so the refresh that
+    /// our write sets off (`Card::echo`) finds nothing to copy or send up;
+    /// a byte the title writes after is found and taken.
+    #[test]
+    fn a_page_that_took_shader_bytes_is_not_sent_up_again() {
+        const N: usize = 64;
+        let base: Vec<u8> = (0..N as u32).map(|i| (i * 7) as u8).collect();
+        let (mut card, mut cpu, mut title) = (base.clone(), base.clone(), base.clone());
+        // A flight's shaders write 8..20 on the card; its landing merges
+        // what it fetched.
+        for at in 8..20 {
+            card[at] = 0xc0;
+        }
+        assert!(merge_piece(&card, &mut cpu, &mut title));
+        assert_eq!(title, cpu);
+        assert_eq!(card, cpu);
+        // The refresh: nothing differs, nothing goes up.
+        assert_eq!(take_changed(&title, &mut cpu), None);
+        // The title writes two bytes of the page afterwards: the span
+        // between them is taken, and the CPU's side is the title's again.
+        title[3] = 0x11;
+        title[40] = 0x22;
+        assert_eq!(take_changed(&title, &mut cpu), Some((3, 41)));
+        assert_eq!(title, cpu);
     }
 
     /// A model of a copy in the card's memory under the relay: `card` is
@@ -2489,12 +2539,74 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        #[cfg(feature = "diagnostics")]
+        echo_copied(self, from, to);
+        // Pages that took shaders' bytes from this copy since its last
+        // refresh of them: compared first.
+        let echoes: Vec<usize> = match &self.card {
+            Some(card) if from < to => {
+                let mut echo = card.echo.lock().unwrap_or_else(|e| e.into_inner());
+                let pages: Vec<usize> = echo.range(from / PAGE..to.div_ceil(PAGE)).copied().collect();
+                for page in &pages {
+                    echo.remove(page);
+                }
+                pages
+            }
+            _ => Vec::new(),
+        };
+        if echoes.is_empty() {
+            return self.copy_in(from, to);
+        }
+        let (mut at, mut bytes) = (from, 0);
+        for page in echoes {
+            let (a, b) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+            if a > at {
+                bytes += self.copy_in(at, a);
+            }
+            bytes += self.copy_changed(a, b);
+            at = b;
+        }
+        if at < to {
+            bytes += self.copy_in(at, to);
+        }
+        bytes
+    }
+
+    /// [`Shadow::copy`] of `[from, to)` where title memory may hold what
+    /// the copy holds already (`Card::echo`): only the bytes from the first
+    /// to the last that differ are copied, changed and sent up. Copied
+    /// whole if title memory cannot be read in place. Returns the bytes
+    /// copied.
+    fn copy_changed(&self, from: usize, to: usize) -> usize {
+        let start = self.start as usize;
+        // SAFETY: inside the mapping; refreshes write it on the submitting
+        // thread, and shaders' bytes go into ranges no refresh writes.
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
+        let mut differs = None;
+        let read = crate::watch::read_guarded(from, to - from, |title| differs = take_changed(title, held));
+        if !read {
+            return self.copy_in(from, to);
+        }
+        let n = differs.map_or(0, |(a, b)| b - a);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::EchoSame, (to - from - n) as u64);
+        if let Some((a, b)) = differs {
+            self.changed(from - start + a, from - start + b);
+            self.card_changed(from - start + a, from - start + b);
+        }
+        n
+    }
+
+    /// [`Shadow::copy`] of `[from, to)` (inside the buffer), all of it.
+    fn copy_in(&self, from: usize, to: usize) -> usize {
+        let start = self.start as usize;
+        if from >= to {
+            return 0;
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         #[cfg(feature = "diagnostics")]
         let moved = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        echo_copied(self, from, to);
         if crate::watch::copy_guarded(at, from, to - from) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
@@ -2696,6 +2808,7 @@ impl Shadow {
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         #[cfg(feature = "diagnostics")]
         echo_wrote(self, start + at, n);
+        card.echo.lock().unwrap_or_else(|e| e.into_inner()).extend((start + at) / PAGE..(start + at + n).div_ceil(PAGE));
         #[cfg(feature = "diagnostics")]
         self.audit(at, n, title);
         n
@@ -2906,6 +3019,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    echo: Mutex::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -3183,6 +3297,7 @@ fn loose_as(address: u64, end: u64, unsized_ask: bool, any: bool, exact: Option<
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                echo: Mutex::default(),
                 size: len,
             };
             (on_card, Some(card))

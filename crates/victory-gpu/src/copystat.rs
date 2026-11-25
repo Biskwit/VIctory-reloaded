@@ -174,6 +174,10 @@ pub(crate) enum C {
     /// the PC's memory, copies in the card's.
     EchoBytes,
     EchoCardBytes,
+    /// Of those in copies in the card's memory: bytes compared and found
+    /// as the copy held them, neither copied nor sent up
+    /// (`Shadow::copy_changed`).
+    EchoSame,
     /// Questions about unmapped view memory answered from an earlier one
     /// in the same submission (`watch::uncommitted_end_asked`).
     GuardQueriesSpared,
@@ -1113,7 +1117,7 @@ pub(crate) fn log(frames: f64) {
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms ({:.0} failed {:.2} ms), {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; refreshed in pages the same copy wrote back {:.1} MB ({:.1} MB of copies in \
-         the card's memory); {:.0} guard faults; textures {:.1} MB watched and \
+         the card's memory, {:.1} MB of them found the same and not copied); {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -1138,6 +1142,7 @@ pub(crate) fn log(frames: f64) {
         c[C::Fallbacks as usize],
         mb(c[C::EchoBytes as usize]),
         mb(c[C::EchoCardBytes as usize]),
+        mb(c[C::EchoSame as usize]),
         c[C::GuardFaults as usize],
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
