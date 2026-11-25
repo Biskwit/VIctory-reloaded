@@ -151,14 +151,15 @@ const PAGE: u64 = 1 << 16;
 
 /// The most megabytes of private memory the process may hold for another
 /// copy to be numbered past the first [`COPIES`] (`VICTORY_MEMORY_MOST_MB`;
-/// 30,000 by default). With 4,095 numbers the structure builder and the
+/// 34,000 by default: with the builder off the process peaks near that,
+/// run bvh-49). With 4,095 numbers the structure builder and the
 /// ray-tracing shaders had the process at 45 GB, 16.7 GB of it windows
 /// numbered for them, and the PC at 6 GB free (run bvh-47). Pages past the
 /// limit read zeros, as pages without a number do.
 fn most_mb() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_MEMORY_MOST_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(30_000)
+        std::env::var("VICTORY_MEMORY_MOST_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(34_000)
     })
 }
 
@@ -259,8 +260,15 @@ impl Memory {
             }
         };
         let stand_in = (FAR_FIRST + k as u64 * FAR_SPAN) * PAGE + (address - cell);
-        self.map(stand_in);
-        self.map(stand_in + PAGE);
+        // The megabyte from the address on, as far as the range goes: the
+        // refit stage read its table past the two pages made ready before
+        // (run bvh-40: its faults at pages 0x1f2e0e, 0x1f2e2a, 0x1f2e37).
+        let end = (FAR_FIRST + (k as u64 + 1) * FAR_SPAN) * PAGE;
+        let mut at = stand_in;
+        while at < (stand_in + 16 * PAGE).min(end) {
+            self.map(at);
+            at += PAGE;
+        }
         stand_in
     }
 }
@@ -375,6 +383,10 @@ impl Memory {
         {
             let n = match self.slices.get(&slice) {
                 Some(&n) => n,
+                None if self.full && self.copies.len() >= COPIES as usize => {
+                    why("the process holds too much memory");
+                    return;
+                }
                 None if self.copies.len() < copies_most() as usize => {
                     let Some(shadow) = crate::shadow::window_at(start, PAGE_COPY) else {
                         why("no copy could be made");
