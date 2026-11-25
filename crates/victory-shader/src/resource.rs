@@ -413,6 +413,10 @@ struct Tracer<'a> {
     rpo: Vec<usize>,
     /// The block of the access being traced ([`Self::live`]).
     at: std::cell::Cell<Option<usize>>,
+    /// What lane masks joined at a block's entry tell of a lane: in the
+    /// mask (an atom and its [`Bool`]), it is in the other [`Bool`]
+    /// ([`mask_phi_facts`]).
+    phi_facts: Vec<(Atom, Bool, Bool)>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -423,6 +427,62 @@ const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
 /// VGPR values followed for one dword of a descriptor kept per lane.
 const MAX_COPIES: usize = 64;
+/// Atoms a condition is over for [`Tracer::meet_few_first`] to try it
+/// first.
+const MAX_FEW: usize = 8;
+
+/// What lane masks joined at a block's entry (each one atom, a phi) tell
+/// of a lane: (atom, mask, other) where a lane in the mask is in the other.
+/// A loop's mask that loses lanes round the loop and never gains any (a
+/// waterfall loop's EXEC: each back edge brings a subset of it) is within
+/// the mask of the one edge into the loop. Two masks of one block joined
+/// from the same masks on every edge (EXEC and the copy a waterfall loop
+/// keeps of it) are the same.
+fn mask_phi_facts(p: &Program, lanes: &Structured, rpo: &[usize]) -> Vec<(Atom, Bool, Bool)> {
+    let mut out = Vec::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        let mut joined: Vec<(Atom, Bool, Vec<Option<Bool>>)> = Vec::new();
+        for phi in &block.phis {
+            let Some(&mask) = lanes.masks.get(&phi.value) else {
+                continue;
+            };
+            let Some((atom @ Atom::Phi(_), Bool::FALSE, Bool::TRUE)) = lanes.bools.node(mask)
+            else {
+                continue;
+            };
+            let args: Vec<Option<Bool>> = phi
+                .args
+                .iter()
+                .map(|a| lanes.masks.get(a).copied())
+                .collect();
+            if args.iter().any(Option::is_none) {
+                continue;
+            }
+            let (mut entry, mut back) = (Vec::new(), Vec::new());
+            for (&q, &m) in block.preds.iter().zip(&args) {
+                if rpo[q] >= rpo[b] {
+                    back.push(m);
+                } else {
+                    entry.push(m);
+                }
+            }
+            let shrinks =
+                |m: Option<Bool>| m.is_some_and(|m| !lanes.bools.meet(&[(m, true), (mask, false)]));
+            if let [Some(into)] = entry[..]
+                && !back.is_empty()
+                && back.into_iter().all(shrinks)
+            {
+                out.push((atom, mask, into));
+            }
+            for (other, mask2, _) in joined.iter().filter(|j| j.2 == args) {
+                out.push((atom, mask, *mask2));
+                out.push((*other, *mask2, mask));
+            }
+            joined.push((atom, mask, args));
+        }
+    }
+    out
+}
 
 impl<'a> Tracer<'a> {
     fn new(
@@ -478,6 +538,7 @@ impl<'a> Tracer<'a> {
             lanes,
             read_first_lane: Default::default(),
             meets: Default::default(),
+            phi_facts: lanes.map_or_else(Vec::new, |l| mask_phi_facts(p, l, &rpo)),
             rpo,
             at: Default::default(),
         };
@@ -538,6 +599,67 @@ impl<'a> Tracer<'a> {
             offset: 0,
             what: "copies that do not settle",
         })
+    }
+
+    /// [`Self::meet`], knowing [`Self::phi_facts`]: for each mask the
+    /// conditions over few atoms name, the lane is out of it, or in it and
+    /// in the other. `used` are the facts split on so far; past a few,
+    /// [`Self::meet_few_first`].
+    fn meet_knowing(&self, lanes: &Structured, all: &mut Known, used: &mut Vec<usize>) -> bool {
+        const MAX_SPLITS: usize = 4;
+        // The masks named by the conditions over fewest atoms first (a
+        // block's reach names every loop before it).
+        let atoms: Vec<Vec<Atom>> = all.iter().map(|c| lanes.bools.support(c.0)).collect();
+        let named = |k: usize| {
+            let atom = self.phi_facts[k].0;
+            atoms
+                .iter()
+                .filter(|a| a.len() <= MAX_FEW && a.contains(&atom))
+                .map(Vec::len)
+                .min()
+        };
+        let Some((_, k)) = (0..self.phi_facts.len())
+            .filter(|k| !used.contains(k))
+            .filter_map(|k| Some((named(k)?, k)))
+            .min()
+        else {
+            return self.meet_few_first(lanes, all);
+        };
+        if used.len() == MAX_SPLITS {
+            return self.meet_few_first(lanes, all);
+        }
+        let (_, mask, entry) = self.phi_facts[k];
+        let n = all.len();
+        used.push(k);
+        let mut possible = false;
+        for split in [vec![(mask, false)], vec![(mask, true), (entry, true)]] {
+            // (the entry mask is often a condition's negation, which the
+            // search may not get down to within its budget)
+            let against = |c: &(Bool, bool)| all.iter().any(|a| a.0 == c.0 && a.1 != c.1);
+            if split.iter().any(against) {
+                continue;
+            }
+            all.extend(split);
+            possible = self.meet_knowing(lanes, all, used);
+            all.truncate(n);
+            if possible {
+                break;
+            }
+        }
+        used.pop();
+        possible
+    }
+
+    /// [`Self::meet`], first without the conditions over many atoms (a
+    /// block's reach), which the search may give up on: no lane meeting the
+    /// rest, none meets them all.
+    fn meet_few_first(&self, lanes: &Structured, all: &[(Bool, bool)]) -> bool {
+        let few: Known = all
+            .iter()
+            .copied()
+            .filter(|c| lanes.bools.support(c.0).len() <= MAX_FEW)
+            .collect();
+        (few.len() == all.len() || self.meet(lanes, &few)) && self.meet(lanes, all)
     }
 
     /// Whether some lane can satisfy all of `conditions` ([`Bools::meet`]).
@@ -1669,7 +1791,7 @@ impl<'a> Tracer<'a> {
         };
         let mut skips = known.clone();
         skips.extend([(lanes.reach[site.0], true), (guard, false)]);
-        if self.meet(lanes, &skips) {
+        if self.meet_knowing(lanes, &mut skips, &mut Vec::new()) {
             return Err("a per-lane descriptor written where some lanes may keep the old one");
         }
         Ok(())
@@ -2033,7 +2155,9 @@ impl<'a> Tracer<'a> {
             return Err(SELECT);
         }
         let reach = (lanes.reach[b], true);
-        let meet = |conditions: &[(Bool, bool)]| self.meet(lanes, conditions);
+        let meet = |conditions: &[(Bool, bool)]| {
+            self.meet_knowing(lanes, &mut conditions.to_vec(), &mut Vec::new())
+        };
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
         for (i, inst) in block.insts[..access].iter().enumerate() {
@@ -3159,6 +3283,138 @@ pub(crate) mod tests {
         0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
     ];
+
+    /// [`WATERFALL_INDEXED_WAVE32`] for the lanes below 16 (EXEC narrowed
+    /// without a branch): the loop's EXEC and its copy in s21 join a lane
+    /// condition with the retry, two masks of their own.
+    pub(crate) const WATERFALL_INDEXED_NARROWED_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE96_3C6A, // s_and_saveexec_b32 s22, vcc_lo
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        0x7E28_0507, // 0x48: v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0xF40C_0302,
+        0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF6, // s_cbranch_execnz -> 0x48
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xBEFE_0316, // s_mov_b32 exec_lo, s22
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn a_waterfall_whose_exec_and_its_copy_join_alike_keeps_the_lanes_waiting() {
+        // The retry keeps s21 minus the lanes served; s21 and EXEC are the
+        // same mask on every edge into the loop, so the lanes left are the
+        // ones still waiting.
+        let r = waterfall(WATERFALL_INDEXED_NARROWED_WAVE32, false).unwrap();
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.loads.len(), 1);
+    }
+
+    /// A waterfall loop over a descriptor the code keeps per lane, copied
+    /// to v[4:11] from one of two loads (by s2) where EXEC is narrowed to
+    /// the lanes below 16 without a branch: lanes outside it reach the
+    /// copies but do not run them.
+    pub(crate) const WATERFALL_COPIED_NARROWED_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF85_0003, // s_cbranch_scc1 -> 0x34
+        0xF40C_0602,
+        0xFA00_0000, // s_load_dwordx8 s[24:31], s[4:5], 0x0
+        0xBF82_0002, // s_branch -> 0x3c
+        0xF40C_0602,
+        0xFA00_0020, // 0x34: s_load_dwordx8 s[24:31], s[4:5], 0x20
+        0x7E04_0D00, // 0x3c: v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE96_3C6A, // s_and_saveexec_b32 s22, vcc_lo
+        0x7E08_0218, // v_mov_b32 v4, s24
+        0x7E0A_0219, // v_mov_b32 v5, s25
+        0x7E0C_021A, // v_mov_b32 v6, s26
+        0x7E0E_021B, // v_mov_b32 v7, s27
+        0x7E10_021C, // v_mov_b32 v8, s28
+        0x7E12_021D, // v_mov_b32 v9, s29
+        0x7E14_021E, // v_mov_b32 v10, s30
+        0x7E16_021F, // v_mov_b32 v11, s31
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0x7E18_0504, // 0x78: v_readfirstlane_b32 s12, v4
+        0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+        0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+        0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+        0x7E20_0508, // v_readfirstlane_b32 s16, v8
+        0x7E22_0509, // v_readfirstlane_b32 s17, v9
+        0x7E24_050A, // v_readfirstlane_b32 s18, v10
+        0x7E26_050B, // v_readfirstlane_b32 s19, v11
+        0x7DC4_080C, // v_cmp_eq_u64 vcc_lo, s[12:13], v[4:5]
+        0xD4E2_0000,
+        0x0002_0C0E, // v_cmp_eq_u64 s0, s[14:15], v[6:7]
+        0xD4E2_0002,
+        0x0002_1010, // v_cmp_eq_u64 s2, s[16:17], v[8:9]
+        0xD4E2_0001,
+        0x0002_1412, // v_cmp_eq_u64 s1, s[18:19], v[10:11]
+        0x8700_006A, // s_and_b32 s0, vcc_lo, s0
+        0x8700_0200, // s_and_b32 s0, s0, s2
+        0x8700_0100, // s_and_b32 s0, s0, s1
+        0xBE80_3C00, // s_and_saveexec_b32 s0, s0
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0x897E_007E, // s_xor_b32 exec_lo, exec_lo, s0
+        0xBF89_FFE9, // s_cbranch_execnz -> 0x78
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xBEFE_0316, // s_mov_b32 exec_lo, s22
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn a_waterfall_over_copies_made_under_a_narrowed_exec_is_one() {
+        // The loop's EXEC only loses lanes round it, so the lanes that
+        // sample are among those that made the copies.
+        let r = waterfall(WATERFALL_COPIED_NARROWED_WAVE32, false).unwrap();
+        assert_eq!(r.waterfall.compares.len(), 4);
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        assert!(
+            matches!(image.source, Source::Phi { .. }),
+            "{:?}",
+            image.source
+        );
+    }
 
     #[test]
     fn the_console_waterfall_over_a_first_lane_offset_is_one() {
