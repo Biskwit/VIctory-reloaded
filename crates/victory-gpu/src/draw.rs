@@ -141,6 +141,14 @@ const WINDOW_MOST: u64 = 64;
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
+/// Whether a texture picked by index that is copied from the texture the
+/// host writes in its memory is copied every frame (`State::heap_textures`;
+/// `VICTORY_ALIAS_ONCE=1`: once, as before).
+fn alias_every_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_ONCE").is_none_or(|v| v != "1"))
+}
+
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
@@ -1628,6 +1636,14 @@ impl State {
             // title mapped: again in 120 frames, as before).
             let again = match partly {
                 Some(mapped) => Some((frame + 1, mapped)),
+                // A view placed in the memory of a texture the host writes
+                // (`resource::alias_of`): copied from that texture by
+                // `readable` above, so looked at again next frame. Once
+                // only, its copy kept the texture's first frame for good:
+                // in one run 21 full-screen lighting buffers, the screen
+                // probes' light atlas and the sky light cache (`late-04`).
+                // `VICTORY_ALIAS_ONCE=1` copies once, as before.
+                None if alias_every_frame() && crate::resource::alias_of(resource).is_some() => Some((frame + 1, 0)),
                 None => (!whole).then_some((frame + 120, 0)),
             };
             if again.is_some() {
