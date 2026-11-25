@@ -6536,6 +6536,10 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// What the overlay and views draw with (`crate::overlay`), once one
+    /// was asked for (`None` inside: none could be made).
+    #[cfg(feature = "diagnostics")]
+    overlay: Option<Option<crate::overlay::Overlay>>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -6549,6 +6553,12 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// Dispatches run so far at the last count, and the last second's
+    /// figures, for the overlay.
+    #[cfg(feature = "diagnostics")]
+    dispatched: u64,
+    #[cfg(feature = "diagnostics")]
+    line: crate::overlay::FrameLine,
 }
 
 impl Meter {
@@ -6562,6 +6572,10 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            #[cfg(feature = "diagnostics")]
+            dispatched: crate::draw::dispatched(),
+            #[cfg(feature = "diagnostics")]
+            line: Default::default(),
         }
     }
 
@@ -6599,6 +6613,20 @@ impl Meter {
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        #[cfg(feature = "diagnostics")]
+        {
+            let dispatched = crate::draw::dispatched();
+            self.line = crate::overlay::FrameLine {
+                fps,
+                ms,
+                cpu,
+                gpu,
+                back: back_ms,
+                draws,
+                dispatches: (dispatched - std::mem::replace(&mut self.dispatched, dispatched)) as f64 / frames,
+                dropped,
+            };
+        }
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
@@ -6844,11 +6872,17 @@ impl Host {
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
             };
+            // What the control file asks of this present (`crate::control`).
+            #[cfg(feature = "diagnostics")]
+            let live = crate::control::at_present(frame);
             // Sent ahead ([`late_free_present`]) unless the frame is to be
-            // read back at once (a saved or listed frame): then a list of
+            // read back at once (a saved or listed frame, a shot) or drawn
+            // with views of ours (a view, `crate::overlay`): then a list of
             // its own, one whose last flight has finished or a new one.
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now = crate::capture::wanted(frame)
+                || crate::capture::listed(frame)
+                || live.as_ref().is_some_and(|l| l.view.is_some() || l.shot.is_some());
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
             let slot = if late_free_present() && !read_now {
@@ -6883,6 +6917,8 @@ impl Host {
                 .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            #[cfg(feature = "diagnostics")]
+            let after = live.and_then(|live| crate::overlay::record(&mut p.overlay, self, copy, &back, frame, &p.meter.line, live));
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&[
@@ -6904,6 +6940,11 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
+            }
+            // A view or shot ran its list at once (`read_now`).
+            #[cfg(feature = "diagnostics")]
+            if let Some(after) = after {
+                crate::overlay::finish(&mut p.overlay, after);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
@@ -6955,6 +6996,8 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                #[cfg(feature = "diagnostics")]
+                overlay: None,
             })
         }
     }

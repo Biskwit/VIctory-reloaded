@@ -170,12 +170,29 @@ fn mirror(handle: u64) {
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    use std::sync::atomic::Ordering::Relaxed;
     static ON: crate::live::Switch =
         crate::live::Switch::new("VICTORY_HEAP_SYNC", |v| u32::from(v.is_none_or(|v| v != "0")));
-    if ON.value() == 0 {
-        return;
+    if ON.value() != 0 {
+        sync(false);
     }
+}
+
+/// Diagnostics (`repair heaps` in the control file): [`sync_heaps`] over
+/// every page of every placed shader-visible heap, as if all of it were
+/// written, with the records last seen forgotten: every slot whose record
+/// is not what the host slot was made from is made again. Returns the
+/// records compared (every one that is not all zeros).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn repair_heaps() -> u64 {
+    let before = SYNCED[2].load(std::sync::atomic::Ordering::Relaxed);
+    sync(true);
+    SYNCED[2].load(std::sync::atomic::Ordering::Relaxed).saturating_sub(before)
+}
+
+/// [`sync_heaps`]; with `all`, over the heaps' whole ranges ([`repair_heaps`]).
+#[cfg(windows)]
+fn sync(all: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     // Nanoseconds: asking which pages changed, reading them, looking at
@@ -196,7 +213,13 @@ pub(crate) fn sync_heaps() {
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
         let took = std::time::Instant::now();
-        let changed = written.take(start as usize, end as usize);
+        let changed = if all {
+            #[cfg(feature = "diagnostics")]
+            host.forget_copied();
+            vec![(start as usize, end as usize)]
+        } else {
+            written.take(start as usize, end as usize)
+        };
         taking += took.elapsed().as_nanos() as u64;
         for (range_from, range_end) in changed {
             let mut page = range_from & !(crate::watch::PAGE - 1);

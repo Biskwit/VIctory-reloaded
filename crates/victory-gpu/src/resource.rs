@@ -1629,6 +1629,18 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Diagnostics (`view <address>` in the control file): the host copy of
+/// the title texture at `at`, if a texture alive is there. Under the
+/// table's lock, which a texture leaves before it is freed.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn texture_alive(at: usize) -> Option<std::sync::Arc<HostTexture>> {
+    let all = textures();
+    if !all.contains(&at) {
+        return None;
+    }
+    host_copy(at as This)
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]

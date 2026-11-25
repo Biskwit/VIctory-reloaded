@@ -2,6 +2,8 @@
 //! with the Windows SDK's `dxc` into the build's output: the repository holds
 //! only the source (docs/asset-policy.md). Without a compiler the output is
 //! empty, no mesh pipeline gets the stage, and mesh draws go the plain way.
+//! With the diagnostics feature, likewise the overlay's shaders
+//! (`src/overlay.hlsl`); without them there is no overlay or view.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,21 +13,48 @@ fn main() {
     let source = "src/amplify.hlsl";
     println!("cargo:rerun-if-changed={source}");
     println!("cargo:rerun-if-env-changed=VICTORY_PC_DXC");
-    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR")).join("amplify.dxil");
-    let built = dxc().is_some_and(|dxc| {
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
+    let dxc = dxc();
+    if !compile(dxc.as_deref(), source, "as_6_5", "main", &out_dir.join("amplify.dxil")) {
+        println!(
+            "cargo:warning=no Windows SDK dxc.exe (or VICTORY_PC_DXC): mesh pipelines are built without the amplification stage"
+        );
+    }
+    let overlay = "src/overlay.hlsl";
+    println!("cargo:rerun-if-changed={overlay}");
+    if std::env::var_os("CARGO_FEATURE_DIAGNOSTICS").is_some() {
+        let entries = [
+            ("vs_6_0", "corners"),
+            ("ps_6_0", "text"),
+            ("ps_6_0", "view"),
+            ("cs_6_0", "reset"),
+            ("cs_6_0", "reduce"),
+        ];
+        let mut built = true;
+        for (target, entry) in entries {
+            built &= compile(dxc.as_deref(), overlay, target, entry, &out_dir.join(format!("overlay-{entry}.dxil")));
+        }
+        if !built {
+            println!("cargo:warning=the overlay's shaders did not compile: no overlay or view");
+        }
+    }
+}
+
+/// Compiles `entry` of `source` for `target` into `out`; on failure `out`
+/// is empty.
+fn compile(dxc: Option<&Path>, source: &str, target: &str, entry: &str, out: &Path) -> bool {
+    let built = dxc.is_some_and(|dxc| {
         Command::new(dxc)
-            .args(["-T", "as_6_5", "-E", "main", "-Fo"])
-            .arg(&out)
+            .args(["-T", target, "-E", entry, "-Fo"])
+            .arg(out)
             .arg(source)
             .status()
             .is_ok_and(|s| s.success())
     });
     if !built {
-        println!(
-            "cargo:warning=no Windows SDK dxc.exe (or VICTORY_PC_DXC): mesh pipelines are built without the amplification stage"
-        );
-        std::fs::write(&out, []).expect("the build's output is writable");
+        std::fs::write(out, []).expect("the build's output is writable");
     }
+    built
 }
 
 /// What a translated shader depends on, for the shader cache's key

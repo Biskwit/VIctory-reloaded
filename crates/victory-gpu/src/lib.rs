@@ -19,6 +19,8 @@
 mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod control;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
 pub mod device;
@@ -37,6 +39,8 @@ pub mod list;
 #[cfg(windows)]
 mod live;
 pub mod object;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod overlay;
 pub mod pipeline;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod pix;

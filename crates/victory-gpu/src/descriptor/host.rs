@@ -291,6 +291,22 @@ fn stale_rule() -> Rule {
     }
 }
 
+/// Diagnostics (`repair textures` in the control file): every slot that
+/// shows a placed texture is due again from the next frame, as if the
+/// runtime had remapped all their memory ([`remapped`]): the pass over the
+/// heap's texture slots uploads each again from title memory, within its
+/// budget per frame. False if no slot shows one.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn repair_textures() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (start, end) = (SPANNED[0].load(Relaxed), SPANNED[1].load(Relaxed));
+    if start >= end {
+        return false;
+    }
+    REMAPPED.lock().unwrap_or_else(|e| e.into_inner()).push((start, end));
+    true
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`, or is
 /// about to write it through the kernel (`crate::watch`): the placed
 /// textures there may have arrived, gone, or changed with no descriptor
@@ -1444,6 +1460,13 @@ impl HostHeap {
         self.mirror(index, handle, false);
         COPIED_MIRROR_NS.fetch_add(mirroring.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    /// Diagnostics (`crate::descriptor::repair_heaps`): forgets the records
+    /// [`HostHeap::mirror_copied`] last saw, so that it looks at every one.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn forget_copied(&self) {
+        self.copied.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Makes host slot `index` from the record the title has at `handle`

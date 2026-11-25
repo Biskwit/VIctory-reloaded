@@ -96,6 +96,14 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// Host pipelines loaded from the library and made since the start (for
+/// the overlay, `crate::overlay`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn library_pipelines() -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [library::LOADED.load(Relaxed), library::MADE.load(Relaxed)]
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);

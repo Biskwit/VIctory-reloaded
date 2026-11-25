@@ -229,6 +229,24 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         return true;
     }
     crate::list::ensure_state(list, placed, COPY_DEST);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
+    copy_through(&list.list, &through, from, to);
+    list.keep(&through.buffer);
+    // A draw that also writes the source (a view of it handled before
+    // this one) needs it in that state again; the next read of the alias
+    // then copies once more, as it must after a write.
+    if let Some(before) = before
+        && before & TARGET_OR_UNORDERED != 0
+    {
+        crate::list::ensure_state(list, source, before);
+    }
+    true
+}
+
+/// Records the copy of `from` into `to` through `through` ([`alias`]):
+/// `from` in the copy source state, `to` in the copy destination state.
+fn copy_through(list: &ID3D12GraphicsCommandList, through: &Through, from: &ID3D12Resource, to: &ID3D12Resource) {
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the location never releases.
         pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -250,36 +268,95 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         D3D12_RESOURCE_STATE_COPY_SOURCE,
         D3D12_RESOURCE_STATE_COPY_DEST,
     );
-    #[cfg(feature = "diagnostics")]
-    list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
     // SAFETY: an open list and live resources; the buffer is as big as
     // the footprints and rests in the common state between copies.
     unsafe {
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+        list.ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
-            list.list
-                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+            list.CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
         }
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
+        list.ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
         for (index, (_, of_read)) in through.parts.iter().enumerate() {
-            list.list
-                .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+            list.CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
         }
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
+        list.ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
-    list.keep(&through.buffer);
-    // A draw that also writes the source (a view of it handled before
-    // this one) needs it in that state again; the next read of the alias
-    // then copies once more, as it must after a write.
-    if let Some(before) = before
-        && before & TARGET_OR_UNORDERED != 0
-    {
-        crate::list::ensure_state(list, source, before);
+}
+
+/// Diagnostics (`repair aliases` in the control file): every alias copy
+/// made so far ([`alias`]) is made again now, in a list of its own run at
+/// once, from the textures' states as last recorded. Returns how many.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn repair_aliases() -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    let all: Vec<(usize, Arc<Through>)> = {
+        let map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
+        map.iter().flatten().map(|(&placed, through)| (placed, through.clone())).collect()
+    };
+    let Some(host) = host() else { return 0 };
+    let Ok(list) = host.new_list() else { return 0 };
+    let mut done = 0;
+    for (placed, through) in all {
+        let Some(source) = crate::resource::alias_of(placed as This) else {
+            continue;
+        };
+        let (Some(to), Some(from)) = (
+            crate::resource::host_copy(placed as This),
+            crate::resource::host_copy(source),
+        ) else {
+            continue;
+        };
+        // Each texture from the state it was last left in to its copy
+        // state, and back after.
+        let moves: Vec<(&ID3D12Resource, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES)> = [
+            (&from.texture, from.state.load(Relaxed), D3D12_RESOURCE_STATE_COPY_SOURCE),
+            (&to.texture, to.state.load(Relaxed), D3D12_RESOURCE_STATE_COPY_DEST),
+        ]
+        .into_iter()
+        .map(|(texture, state, copy)| {
+            let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
+            (texture, state, copy)
+        })
+        .filter(|(_, state, copy)| state != copy)
+        .collect();
+        let there: Vec<_> = moves.iter().map(|&(t, state, copy)| crate::host::transition(t, state, copy)).collect();
+        let back: Vec<_> = moves.iter().map(|&(t, state, copy)| crate::host::transition(t, copy, state)).collect();
+        // SAFETY: an open list of ours and live textures.
+        unsafe {
+            if !there.is_empty() {
+                list.list.ResourceBarrier(&there);
+            }
+            copy_through(&list.list, &through, &from.texture, &to.texture);
+            if !back.is_empty() {
+                list.list.ResourceBarrier(&back);
+            }
+        }
+        done += 1;
     }
-    true
+    list.close();
+    host.execute(&[&list]);
+    done
+}
+
+/// Diagnostics (`repair textures` in the control file): every title texture
+/// with a staging buffer is read from title memory, detiled and uploaded
+/// again, changed or not, by the next list that samples it: what was known
+/// of its memory is forgotten. Returns how many.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn repair() -> usize {
+    let all: Vec<Arc<Staging>> = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.iter().flat_map(HashMap::values).cloned().collect()
+    };
+    for s in &all {
+        let mut last = s.last.lock().unwrap_or_else(|e| e.into_inner());
+        *last = Last {
+            blind: last.blind,
+            ..Last::default()
+        };
+        s.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    all.len()
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory

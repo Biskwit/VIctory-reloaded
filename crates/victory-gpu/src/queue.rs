@@ -820,12 +820,16 @@ extern "system" fn present(
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
+        crate::control::presented(frame);
         crate::capture::frame_drew(frame, crate::draw::drawn());
         crate::pix::presented(frame);
         crate::capture::records_landed(frame);
-        if crate::capture::listed(frame) {
-            crate::capture::dump_targets(frame);
+        let targets = crate::capture::take_targets();
+        if crate::capture::dumped(frame) || crate::control::dumps(frame) {
+            crate::capture::dump_targets(frame, &targets);
         }
+        // For a view of one of them, at this present (`crate::overlay`).
+        crate::control::frame_targets(frame, targets);
     }
     #[cfg(windows)]
     if planes > 0
