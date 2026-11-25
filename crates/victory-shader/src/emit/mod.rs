@@ -334,22 +334,60 @@ pub fn emit(
                 }
             }
         }
-        // Every lane branch decided by the console wave (`ir::uniform_branches`), for a
-        // thread group that is one console wave: then every block is one the whole group
-        // runs, and the two host waves meet wherever they exchange. Exact, at the price of
-        // an exchange at each such branch; tried after the forms that need none.
-        let one_wave = matches!(&native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() <= 64);
-        // (Where that does not track, loops keep their branch on lanes: a waterfall
+        // Every lane branch decided by the console wave (`ir::uniform_branches`): then every
+        // block is one both halves of a console wave run, and they meet wherever they
+        // exchange. A thread group that is one console wave meets at group barriers. In one of
+        // several whole console waves, which may go different ways, each console wave's halves
+        // meet alone (`lower::with_pair_meetings`): first in the form as it is (where its
+        // exchanges are all where every lane runs, no meeting at each branch), then with the
+        // branches made uniform. Exact, at the price of an exchange at each such branch; tried
+        // after the forms that need none.
+        let group = match &native.io {
+            crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+            _ => 0,
+        };
+        let (one_wave, whole_waves) = (group <= 64, group > 64 && group.is_multiple_of(64));
+        // (From the form without skips, else, where that does not track, the program itself.
+        // Where uniform branches do not track, loops keep their branch on lanes: a waterfall
         // loop's descriptors are per lane.)
         let uniform = || {
-            let base = ir::without_skips(p).unwrap_or_else(|| p.clone());
-            let (p, st, io, res) = form(ir::uniform_branches(&base, true))
-                .or_else(|| form(ir::uniform_branches(&base, false)))?;
-            let again = emit_program(c, native, &p, &st, &io, &res);
-            report("uniform branches", &again);
-            done(&again).then(|| again.map(|(shader, _)| shader))
+            for base in [ir::without_skips(p), Some(p.clone())]
+                .into_iter()
+                .flatten()
+            {
+                let branches = || {
+                    form(ir::uniform_branches(&base, true))
+                        .or_else(|| form(ir::uniform_branches(&base, false)))
+                };
+                if one_wave {
+                    let Some((p, st, io, res)) = branches() else {
+                        continue;
+                    };
+                    let again = emit_program(c, native, &p, &st, &io, &res);
+                    report("uniform branches", &again);
+                    if done(&again) {
+                        return Some(again.map(|(shader, _)| shader));
+                    }
+                    continue;
+                }
+                let meetings = [
+                    ("halves meeting alone", form(Some(base.clone()))),
+                    ("uniform branches, halves meeting alone", branches()),
+                ];
+                for (name, f) in meetings {
+                    let Some((p, st, io, res)) = f else { continue };
+                    let again =
+                        lower::with_pair_meetings(|| emit_program(c, native, &p, &st, &io, &res));
+                    report(name, &again);
+                    if done(&again) {
+                        return Some(again.map(|(shader, _)| shader));
+                    }
+                }
+            }
+            None
         };
-        if one_wave
+        let meets = one_wave || whole_waves;
+        if meets
             && !local_on
             && let Some(r) = uniform()
         {
@@ -359,7 +397,7 @@ pub fn emit(
             // exact first (every form), then approximate
             for exact in [true, false] {
                 if !exact
-                    && one_wave
+                    && meets
                     && let Some(r) = uniform()
                 {
                     return r;

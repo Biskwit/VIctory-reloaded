@@ -1606,3 +1606,53 @@ fn a_loop_over_the_lanes_of_a_64_lane_wave_runs_whole_on_32_lane_waves() {
     // Each lane: the 16 lanes of its key, and the 4 passes.
     assert_eq!(run_lanes(&shader, 64), vec![16 | 4 << 8; 64]);
 }
+
+#[test]
+fn two_console_waves_of_a_group_loop_apart_with_their_halves_meeting_alone() {
+    // A group of 128 threads is two console waves of 64, four host waves of 32. The loop over
+    // the lanes' keys takes 4 passes in the first console wave (keys v0 & 3) and 2 in the
+    // second (v0 & 1): the group's barriers would not be met alike, so each console wave's
+    // two halves meet each other alone (`lower::with_pair_meetings`).
+    let Some(_) = hardware_wave().filter(|&lanes| lanes >= 32) else {
+        eprintln!("no hardware adapter with waves of 32 lanes; skipped");
+        return;
+    };
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(&[
+        vop2(0x1A, 7, 0x82, 0),           // v_lshlrev_b32 v7, 2, v0
+        vop2(0x1B, 1, 0x83, 0),           // v_and_b32 v1, 3, v0
+        vop2(0x1B, 8, 0x81, 0),           // v_and_b32 v8, 1, v0
+        vopc(0xC3, 0xC0, 0),              // v_cmp_le_u32 vcc, 64, v0
+        vop2(0x01, 1, vgpr(1), 8),        // v_cndmask_b32 v1, v1, v8, vcc
+        vop1(0x001, 2, 0x80),             // v_mov_b32 v2, 0
+        s_mov_b32(24, 0x80),              // s24 = 0 (passes)
+        sop1(0x04, 30, EXEC_LO),          // s_mov_b64 s[30:31], exec
+        vop1(0x002, 20, vgpr(1)),         // loop: v_readfirstlane_b32 s20, v1
+        vopc(0xC2, sgpr(20), 1),          // v_cmp_eq_u32 vcc, s20, v1
+        sop1(0x24, 22, VCC_LO),           // s_and_saveexec_b64 s[22:23], vcc
+        sop1(0x10, 21, EXEC_LO),          // s_bcnt1_i32_b64 s21, exec
+        vop1(0x001, 2, sgpr(21)),         // v_mov_b32 v2, s21
+        sop2(0x00, 24, 24, 0x81),         // s_add_u32 s24, s24, 1
+        sop2(0x13, EXEC_LO, 22, EXEC_LO), // s_xor_b64 exec, s[22:23], exec
+        0xBF89_FFF8,                      // s_cbranch_execnz loop
+        sop1(0x04, EXEC_LO, 30),          // s_mov_b64 exec, s[30:31]
+        vop1(0x001, 3, sgpr(24)),         // v_mov_b32 v3, s24
+        vop2(0x1A, 3, 0x88, 3),           // v_lshlrev_b32 v3, 8, v3
+        vop2(0x1C, 0, vgpr(2), 3),        // v_or_b32 v0, v2, v3
+    ]);
+    // buffer_store_dword v0, v7, s[8:11], 0 offen
+    words.extend_from_slice(&[0xE070_1000, 0x80 << 24 | 2 << 16 | 7]);
+    words.push(S_ENDPGM);
+    let native = cs_native(&words, 128, 0, 16, true);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let uniform = ir::uniform_branches(&p, true).expect("the loop's branch changes");
+    lower::TEST_HOST_WAVE.set(Some(32));
+    let shader = lower::with_pair_meetings(|| lower_program(&native, &uniform));
+    lower::TEST_HOST_WAVE.set(None);
+    // The first console wave: 16 lanes a key, 4 passes; the second: 32 lanes, 2 passes.
+    let want: Vec<u32> = (0..128)
+        .map(|l| if l < 64 { 16 | 4 << 8 } else { 32 | 2 << 8 })
+        .collect();
+    assert_eq!(run_lanes(&shader, 128), want);
+}
