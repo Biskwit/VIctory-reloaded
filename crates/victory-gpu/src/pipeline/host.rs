@@ -580,6 +580,9 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // Made every launch, never stored or loaded, with a comparison
+        // sampler (`library::kept_out`).
+        let _out = super::library::keep_out(super::library::kept_out(&samplers));
         // The amplification stage's parameters, after the title's.
         let amplified_params = (mesh.is_some() && amplify()).then(|| {
             let at = params.len() as u32;
