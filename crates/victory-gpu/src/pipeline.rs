@@ -137,6 +137,17 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
+                // For the report of pages found without a copy (`memory.rs`).
+                #[cfg(feature = "diagnostics")]
+                if done.as_ref().is_ok_and(|t| t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY)) {
+                    use victory_shader::{Container, FourCC};
+                    let programs = Container::parse(&self.container)
+                        .ok()
+                        .and_then(|c| c.part(FourCC::DXIL).and_then(|p| victory_shader::native_programs(p.data).ok()));
+                    for p in programs.into_iter().flatten() {
+                        crate::memory::fault_program(&p.code, &self.hash);
+                    }
+                }
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {

@@ -51,6 +51,14 @@ pub const SLOT_FAULTS: u8 = 253;
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// What a program leaves in the [`SLOT_FAULTS`] buffer above a page's
+/// number (bits 21 up): a number made from its code, by which the host
+/// says which program touched the page.
+pub fn fault_tag(code: &[u8]) -> u32 {
+    let sum = code.iter().fold(0x811c_9dc5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    (sum ^ sum >> 11 ^ sum >> 22) & 0x7ff
+}
+
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

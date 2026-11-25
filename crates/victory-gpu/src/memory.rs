@@ -83,6 +83,21 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// Diagnostics: the programs that read title memory by address, by the tag
+/// they leave with a page they find empty (`victory_shader::emit::fault_tag`).
+#[cfg(feature = "diagnostics")]
+static FAULT_TAGS: Mutex<std::collections::BTreeMap<u32, Vec<String>>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Notes the program `hash` with code `code` for the faults' report.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn fault_program(code: &[u8], hash: &str) {
+    let mut tags = FAULT_TAGS.lock().unwrap_or_else(|e| e.into_inner());
+    let named = tags.entry(victory_shader::emit::fault_tag(code)).or_default();
+    if !named.iter().any(|n| n == hash) {
+        named.push(hash.to_owned());
+    }
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -197,6 +212,8 @@ impl Memory {
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
         let mut pages = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let mut tagged: Vec<(u32, u32)> = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
@@ -204,6 +221,9 @@ impl Memory {
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
             if page != 0 {
+                #[cfg(feature = "diagnostics")]
+                tagged.push((page >> 21, page & (MEMORY_PAGES - 1)));
+                let page = page & (MEMORY_PAGES - 1);
                 pages.push(page);
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
@@ -220,8 +240,22 @@ impl Memory {
                 );
             }
         }
+        // Which programs touched them (their tags, `fault_tag`), most pages first.
         #[cfg(feature = "diagnostics")]
-        crate::pipeline::audit(|| format!("faults {pages:x?}"));
+        crate::pipeline::audit(|| {
+            let mut by: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+            for &(tag, page) in &tagged {
+                by.entry(tag).or_default().push(page);
+            }
+            let mut by: Vec<_> = by.into_iter().collect();
+            by.sort_by_key(|(_, pages)| std::cmp::Reverse(pages.len()));
+            let names = FAULT_TAGS.lock().unwrap_or_else(|e| e.into_inner());
+            let said: Vec<String> = by
+                .iter()
+                .map(|(tag, pages)| format!("{tag:x} {:?} {} {:x?}", names.get(tag), pages.len(), &pages[..pages.len().min(12)]))
+                .collect();
+            format!("faults {} | {}", tagged.len(), said.join(" | "))
+        });
         for page in pages {
             self.map(u64::from(page) * PAGE);
         }

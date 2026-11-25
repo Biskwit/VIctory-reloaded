@@ -182,6 +182,8 @@ struct Lower<'a> {
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
+    /// The offset of the instruction whose memory access is being lowered (`memory`).
+    fault_at: u32,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
     /// DXIL block per IR block (unreachable: none).
@@ -1429,6 +1431,7 @@ impl<'a> Lower<'a> {
             x,
             bad,
             lane_fail: HashMap::new(),
+            fault_at: 0,
             vals: HashMap::new(),
             floats: HashMap::new(),
             block: vec![None; p.blocks.len()],
@@ -2571,6 +2574,18 @@ impl<'a> Lower<'a> {
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
         let place = self.s.m.select(c, missing, place, zero);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
+        // With the program's tag above the page number (`shader::fault_tag`).
+        // `VICTORY_FAULT_SITE=<tag, hex>` (diagnostics; with a cache folder
+        // of its own): that program leaves a quarter of the instruction's
+        // offset instead, to say which of its accesses it was.
+        let mut tag = super::shader::fault_tag(&self.x.native.code);
+        if cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_FAULT_SITE").ok().and_then(|v| u32::from_str_radix(&v, 16).ok()) == Some(tag)
+        {
+            tag = self.fault_at >> 2 & 0x7ff;
+        }
+        let tag = k(self, tag << 21);
+        let noted = self.s.m.bin(c, Bin::Or, page, tag);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
         self.s.op(
@@ -2579,7 +2594,7 @@ impl<'a> Lower<'a> {
             Attr::NoUnwind,
             void,
             140,
-            &[faults, place, iu, page, iu, iu, iu, mask, align],
+            &[faults, place, iu, noted, iu, iu, iu, mask, align],
         );
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
@@ -2609,6 +2624,7 @@ impl<'a> Lower<'a> {
         if *lds || !matches!(saddr, None | Some(Operand::Scalar { code: NULL, .. })) {
             return Err("a global address with a scalar base");
         }
+        self.fault_at = inst.machine.offset as u32;
         let Some(Operand::Vector { reg: areg, .. }) = *addr else {
             return Err("a global address not in VGPRs");
         };

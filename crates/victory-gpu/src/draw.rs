@@ -1815,6 +1815,24 @@ impl State {
         if crate::pipeline::is_builder(self.pipeline as This) {
             crate::pipeline::audit(|| self.op_text(format!("list {:#x} thread {:?} dispatch {x}x{y}x{z}", std::ptr::from_ref(list) as usize, std::thread::current().id()), true));
         }
+        // The tables the builder's own code keeps outside title memory
+        // (root views above 40 bits), as they are when the dispatch is
+        // recorded.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            for root in self.roots_ref(true) {
+                if let Root::View(address) = *root
+                    && (address >> 40 != 0 || std::env::var_os("VICTORY_BVH_AUDIT_ROOTS").is_some())
+                    && crate::texture::committed(address as *const u8, 0x180)
+                {
+                    crate::pipeline::audit(|| {
+                        // SAFETY: just found committed.
+                        let bytes = unsafe { std::slice::from_raw_parts(address as *const u32, 0x60) };
+                        format!("table {address:#x} {bytes:08x?}")
+                    });
+                }
+            }
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
