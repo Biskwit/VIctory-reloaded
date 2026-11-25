@@ -101,6 +101,12 @@ pub(crate) struct Types {
     pub res_ret: Ty,
 }
 
+/// The payload a mesh shader declares and does not read: the bytes an
+/// amplification stage hands it (the host's, which launches the title's
+/// mesh groups: `victory-gpu`'s `amplify.hlsl`), whose size must match;
+/// one with a payload runs without an amplification stage as well.
+pub const MESH_PAYLOAD: u32 = 4;
+
 /// What a mesh shader declares beyond its thread-group size.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Mesh {
@@ -694,7 +700,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        MESH_PAYLOAD,
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];

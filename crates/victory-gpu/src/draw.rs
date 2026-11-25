@@ -66,6 +66,9 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a mesh draw through the pipeline's amplified twin is prepared
+    /// (`State::amplified`): `State::bind` sets the twin.
+    static AMPLIFIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether a buffer range a shader names through an unordered access view
@@ -901,10 +904,18 @@ impl State {
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        // A mesh draw through the twin with an amplification stage
+        // (`State::amplified`) sets that twin; the two share the root
+        // signature, so the bindings below serve either.
+        let pso = match &p.amplified {
+            Some(a) if AMPLIFIED.get() => &a.pso,
+            _ => &p.pso,
+        };
+        if self.host_pipeline != pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
-            unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = p.pso.as_raw() as usize;
+            unsafe { l.SetPipelineState(pso) };
+            self.host_pipeline = pso.as_raw() as usize;
+            list.keep(pso);
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
             list.keep(&p.pso);
@@ -1889,12 +1900,65 @@ impl State {
         }
     }
 
+    /// A mesh draw through the pipeline's twin with an amplification stage
+    /// (`crate::pipeline::host::Amplified`): the title's record at `record`
+    /// (a host copy and its offset), bounded and charged to the list's
+    /// budget by the stage, or `direct` groups. False if it cannot run so
+    /// (no twin, an unaligned record, no budget): the caller goes the
+    /// plain way.
+    fn amplified(&mut self, list: &HostList, record: Option<(&ID3D12Resource, u64)>, direct: u32) -> bool {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        let Some(a) = &p.amplified else {
+            return false;
+        };
+        if record.is_some_and(|(_, offset)| !offset.is_multiple_of(4)) {
+            return false;
+        }
+        let (Some(budget), Ok(l6)) = (list.budget(), list.list.cast::<ID3D12GraphicsCommandList6>()) else {
+            return false;
+        };
+        AMPLIFIED.set(true);
+        let prepared = self.prepare_for(list, false, true);
+        AMPLIFIED.set(false);
+        if !prepared {
+            return false;
+        }
+        // SAFETY: a live buffer.
+        let at = record.map_or(budget, |(buffer, offset)| unsafe { buffer.GetGPUVirtualAddress() } + offset);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| self.op_text(format!("mesh {direct} amplified"), false));
+        self.mesh_scissor(list, true);
+        // SAFETY: an open list with everything else set; the twin's root
+        // signature has these parameters; the host copy and the budget are
+        // kept alive by the list.
+        unsafe {
+            list.list.SetGraphicsRootShaderResourceView(a.record, at);
+            list.list.SetGraphicsRootUnorderedAccessView(a.budget, budget);
+            list.list.SetGraphicsRoot32BitConstant(a.direct, direct, 0);
+            l6.DispatchMesh(1, 1, 1);
+        }
+        self.mesh_scissor(list, false);
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        // (0 groups go the plain way: to the stage, 0 means a record.)
+        if x != 0
+            && crate::pipeline::host::amplify_takes().0
+            && mesh_test() != 1
+            && mesh_kept(self.pipeline)
+            && self.amplified(list, None, x)
+        {
+            return;
+        }
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
@@ -2439,6 +2503,16 @@ impl State {
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
+        }
+        // A mesh draw of one record through the pipeline's amplified twin:
+        // the record is read, bounded and charged where the title keeps it,
+        // with no clamp pass of ours ahead of the draw.
+        if kind == MESH && max == 1 && count.is_none() && crate::pipeline::host::amplify_takes().1 {
+            args.refresh(list, arguments, len);
+            if self.amplified(list, Some((&args.buffer, args.offset(arguments))), 0) {
+                self.window = None;
+                return true;
+            }
         }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no

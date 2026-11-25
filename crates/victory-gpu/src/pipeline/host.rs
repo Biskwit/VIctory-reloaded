@@ -307,6 +307,82 @@ pub(crate) struct HostPipeline {
     /// Its depth, stencil, cull and blend state in short, for the frame
     /// listing (empty for compute).
     pub(crate) state: String,
+    /// A mesh pipeline's twin with an amplification stage ([`amplify`]).
+    pub(crate) amplified: Option<Amplified>,
+}
+
+/// The twin of a mesh pipeline whose amplification stage launches the
+/// title's mesh groups (`amplify.hlsl`): the root signature (which the
+/// pipeline shares) has the stage's three parameters.
+pub(crate) struct Amplified {
+    pub(crate) pso: ID3D12PipelineState,
+    /// Root parameters: the record (a shader resource view of its three
+    /// group counts), the list's budget (an unordered access view), and a
+    /// direct dispatch's group count (one constant; 0 for a record).
+    pub(crate) record: u32,
+    pub(crate) budget: u32,
+    pub(crate) direct: u32,
+}
+
+/// Whether mesh pipelines get a twin with an amplification stage, through
+/// which a title's indirect mesh draw of one record runs without the
+/// argument clamp's pass before it (on by default; `VICTORY_MESH_AMPLIFY=0`
+/// makes none, [`amplify_takes`]).
+///
+/// Each such draw had a compute pass of ours ahead of it (the clamp,
+/// `crate::indirect`), with its scratch buffer's state changes: some 5,000
+/// a frame in the opening gameplay, and the card's time on them about 45 ms
+/// of 104 on an RTX 4090 (run with the clamp left out: 59 ms). The stage
+/// reads the record where the title keeps it, bounds and charges it as the
+/// clamp does, and launches the groups; the draw is `DispatchMesh(1, 1, 1)`.
+pub(crate) fn amplify() -> bool {
+    amplify_takes() != (false, false)
+}
+
+/// Which mesh draws go through the amplified twin: (direct dispatches,
+/// indirect draws of one record). Both by default; `VICTORY_MESH_AMPLIFY=0`
+/// neither (no twins are made), `=direct` or `=indirect` one kind.
+pub(crate) fn amplify_takes() -> (bool, bool) {
+    static TAKES: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *TAKES.get_or_init(|| match std::env::var("VICTORY_MESH_AMPLIFY").as_deref() {
+        Ok("0") => (false, false),
+        Ok("direct") => (true, false),
+        Ok("indirect") => (false, true),
+        _ => (true, true),
+    })
+}
+
+/// The amplification stage's code (`amplify.hlsl`, compiled and signed).
+const AMPLIFY_DXIL: &[u8] = include_bytes!("../amplify.dxil");
+
+/// The register space of the amplification stage's parameters.
+const AMPLIFY_SPACE: u32 = 900;
+
+/// The amplification stage's root parameters, in [`Amplified`]'s order:
+/// the record, the budget, the direct group count.
+fn amplify_params() -> [D3D12_ROOT_PARAMETER1; 3] {
+    let descriptor = |kind| D3D12_ROOT_PARAMETER1 {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: 0,
+                RegisterSpace: AMPLIFY_SPACE,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_AMPLIFICATION,
+    };
+    [
+        descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV),
+        descriptor(D3D12_ROOT_PARAMETER_TYPE_UAV),
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: AMPLIFY_SPACE, Num32BitValues: 1 },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_AMPLIFICATION,
+        },
+    ]
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -487,6 +563,12 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // The amplification stage's parameters, after the title's.
+        let amplified_params = (mesh.is_some() && amplify()).then(|| {
+            let at = params.len() as u32;
+            params.extend(amplify_params());
+            (at, at + 1, at + 2)
+        });
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -539,6 +621,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                amplified: None,
             });
         }
         let Some(g) = g else {
@@ -556,7 +639,7 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let pso = match mesh_pipeline(&host.device, &root, None, code(0), code(1), g, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -566,6 +649,23 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
+            // Its twin with the amplification stage; without one its draws
+            // go the plain way.
+            let amplified = amplified_params.and_then(|(record, budget, direct)| {
+                let amplify = D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: AMPLIFY_DXIL.as_ptr().cast(),
+                    BytecodeLength: AMPLIFY_DXIL.len(),
+                };
+                let name = format!("{name} amplified");
+                match mesh_pipeline(&host.device, &root, Some(amplify), code(0), code(1), g, &name) {
+                    Ok(pso) => Some(Amplified { pso, record, budget, direct }),
+                    Err(e) => {
+                        tracing::warn!(error = %e, ?shaders, "host mesh pipeline with an amplification stage refused");
+                        host.log_messages();
+                        None
+                    }
+                }
+            });
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
@@ -577,6 +677,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                amplified,
             });
         }
 
@@ -688,6 +789,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             rects: rect_gs.is_some(),
+            amplified: None,
             state: {
                 let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
@@ -730,9 +832,13 @@ impl HostPipeline {
 /// "already exists"). The translation makes triangle mesh shaders only
 /// (`mesh_prologue` refuses others), and the debug layer wants the two to
 /// agree (1323).
+///
+/// `amplify`: the amplification stage of a mesh pipeline's twin
+/// ([`Amplified`]), a subobject ahead of the others.
 fn mesh_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
+    amplify: Option<D3D12_SHADER_BYTECODE>,
     ms: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
@@ -772,9 +878,24 @@ fn mesh_pipeline(
             D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
         ),
     };
-    let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
-        SizeInBytes: size_of::<Stream>(),
-        pPipelineStateSubobjectStream: (&raw mut stream).cast(),
+    #[repr(C)]
+    struct Amplified {
+        amplify: Sub<D3D12_SHADER_BYTECODE>,
+        rest: Stream,
+    }
+    let mut amplified;
+    let desc = match amplify {
+        Some(code) => {
+            amplified = Amplified { amplify: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, code), rest: stream };
+            D3D12_PIPELINE_STATE_STREAM_DESC {
+                SizeInBytes: size_of::<Amplified>(),
+                pPipelineStateSubobjectStream: (&raw mut amplified).cast(),
+            }
+        }
+        None => D3D12_PIPELINE_STATE_STREAM_DESC {
+            SizeInBytes: size_of::<Stream>(),
+            pPipelineStateSubobjectStream: (&raw mut stream).cast(),
+        },
     };
     let device = device.cast::<ID3D12Device2>()?;
     super::library::pipeline(
@@ -860,6 +981,17 @@ mod tests {
             t[0] = uint3(0, 1, 2);
         }";
     const PS: &str = "float4 main() : SV_Target { return 1; }";
+    /// `MS` with the 4-byte payload it is handed (and does not read).
+    const MS_PAYLOAD: &str = "struct V { float4 p : SV_Position; };
+        struct P { uint unused; };
+        [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
+        void main(in payload P pl, out vertices V v[3], out indices uint3 t[1]) {
+            SetMeshOutputCounts(3, 1);
+            v[0].p = float4(0, 0, 0, 1);
+            v[1].p = float4(1, 0, 0, 1);
+            v[2].p = float4(0, 1, 0, 1);
+            t[0] = uint3(0, 1, 2);
+        }";
 
     /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
     fn dxc() -> Option<PathBuf> {
@@ -913,12 +1045,41 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+        mesh_pipeline(&host.device, &root, None, code(&ms), code(&ps), &g, &name).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
+        mesh_pipeline(&host.device, &root, None, code(&ms), code(&ps), &g, &name).expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
+    }
+
+    /// A mesh shader that takes no payload (as the translation makes them)
+    /// takes the amplification stage ahead of it, on a root signature with
+    /// the stage's parameters; the plain pipeline shares that signature.
+    #[test]
+    fn a_mesh_pipeline_has_an_amplified_twin() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
+        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
+        let (root, root_blob) = root_signature(&host.device, &amplify_params(), &[], false).unwrap();
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
+        mesh_pipeline(&host.device, &root, None, code(&ms), code(&ps), &g, &name).expect("plain");
+        let with_payload = compile(&dxc, dir.path(), MS_PAYLOAD, "ms_6_5");
+        let plain = mesh_pipeline(&host.device, &root, None, code(&with_payload), code(&ps), &g, &format!("{name} payload"));
+        eprintln!("PAYLOAD-WITHOUT-AS: {:?}", plain.as_ref().map(|_| ()));
+        let name = format!("{name} amplified");
+        mesh_pipeline(&host.device, &root, Some(code(AMPLIFY_DXIL)), code(&with_payload), code(&ps), &g, &name)
+            .expect("amplified");
     }
 }
