@@ -648,6 +648,22 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn refreshed_ranges_become_whole_pages_joined_where_they_touch() {
+        const P: usize = 0x1_0000;
+        let runs = |ranges: &[(usize, usize)]| super::page_runs(0x10_0000 + 0x800, 0x20_0000 - 0x800, P, ranges.to_vec());
+        // Rounded out to pages, within the copy at both ends.
+        assert_eq!(runs(&[(0x10_0900, 0x10_0a00)]), [(0x10_0800, 0x11_0000)]);
+        assert_eq!(runs(&[(0x1f_f000, 0x1f_f700)]), [(0x1f_0000, 0x1f_f800)]);
+        // In one page, overlapping or touching once rounded, they join.
+        assert_eq!(
+            runs(&[(0x14_0010, 0x14_0020), (0x12_0000, 0x12_0040), (0x12_f000, 0x13_0004), (0x14_8000, 0x14_9000)]),
+            [(0x12_0000, 0x15_0000)]
+        );
+        // A page apart they stay apart, in order.
+        assert_eq!(runs(&[(0x16_0000, 0x16_0040), (0x12_0000, 0x12_0040)]), [(0x12_0000, 0x13_0000), (0x16_0000, 0x17_0000)]);
+    }
+
+    #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
@@ -1876,6 +1892,31 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// copies' pieces, microseconds of landing in all.
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Of the thread that lands flights (diagnostics): the microseconds it has
+/// landed so far, of them those of landings begun with the card done with
+/// every flight in the air, and the landing under way (its start, and
+/// whether the card was done then). Read around a wait for it
+/// ([`relay_wait`]): which part of the wait the card was still running
+/// and which part only landings were left.
+#[cfg(feature = "diagnostics")]
+static RELAY_CLOCK: Mutex<(u64, u64, Option<(std::time::Instant, bool)>)> = Mutex::new((0, 0, None));
+
+/// [`RELAY_CLOCK`]'s landed and landed-with-the-card-done microseconds
+/// until now.
+#[cfg(feature = "diagnostics")]
+fn relay_clock() -> [u64; 2] {
+    let clock = RELAY_CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (now, idle) = clock.2.map_or((0, false), |(since, idle)| (since.elapsed().as_micros() as u64, idle));
+    [clock.0 + now, clock.1 + if idle { now } else { 0 }]
+}
+
+/// Since the last frame-rate line, of the submitting thread's waits for
+/// the thread that lands flights ([`relay_wait`]): microseconds waited,
+/// of them while that thread landed, and of those with the card done with
+/// every flight in the air.
+#[cfg(feature = "diagnostics")]
+static RELAY_WAITS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Of the line's things in order (a flight: the value signalled on the
 /// host's fence behind it; a write or a signal behind a flight: `None`):
 /// how many, from the front, can be landed when the card has reached
@@ -2588,21 +2629,28 @@ fn read_back_ranges(runs: &[&HostList]) -> Vec<(usize, usize)> {
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> bool {
     use std::sync::Arc;
-    // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    // Per copy, what is refreshed, as the flushes bring it up to date
+    // ([`refresh_runs`]).
+    let mut asked: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+                let range = (*address, *address + *len);
+                match asked.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
+                    Some(s) => s.1.push(range),
+                    None => asked.push((shadow.clone(), vec![range])),
                 }
             }
         }
     }
+    let spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = asked
+        .into_iter()
+        .flat_map(|(shadow, ranges)| {
+            refresh_runs(&shadow, ranges).into_iter().map(move |(from, to)| (shadow.clone(), from, to))
+        })
+        .collect();
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -2804,6 +2852,8 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
     let waiting = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let clock = relay_clock();
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
@@ -2811,6 +2861,13 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     stood(waiting);
     working(was_working);
     let us = waiting.elapsed().as_micros() as u64;
+    #[cfg(feature = "diagnostics")]
+    {
+        let now = relay_clock();
+        RELAY_WAITS[0].fetch_add(us, Ordering::Relaxed);
+        RELAY_WAITS[1].fetch_add(now[0].saturating_sub(clock[0]).min(us), Ordering::Relaxed);
+        RELAY_WAITS[2].fetch_add(now[1].saturating_sub(clock[1]).min(us), Ordering::Relaxed);
+    }
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
@@ -2868,6 +2925,8 @@ fn relay_worker() {
                     break Err(fences[0].unwrap_or(0));
                 }
                 line.settling = true;
+                // The card is done with every flight in the air.
+                let idle = n == line.line.len();
                 let items: Vec<Late> = line.line.drain(..n).collect();
                 line.in_hand = items
                     .iter()
@@ -2876,11 +2935,27 @@ fn relay_worker() {
                         _ => None,
                     })
                     .collect();
-                break Ok(items);
+                break Ok((items, idle));
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
+            Ok((items, idle)) => {
+                #[cfg(feature = "diagnostics")]
+                {
+                    RELAY_CLOCK.lock().unwrap_or_else(|e| e.into_inner()).2 = Some((std::time::Instant::now(), idle));
+                }
+                let _ = idle;
+                host.relay_land(items, &mut fetch);
+                #[cfg(feature = "diagnostics")]
+                {
+                    let mut clock = RELAY_CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some((since, idle)) = clock.2.take() {
+                        let us = since.elapsed().as_micros() as u64;
+                        clock.0 += us;
+                        clock.1 += if idle { us } else { 0 };
+                    }
+                }
+            }
             Err(target) => {
                 let waiting = std::time::Instant::now();
                 // SAFETY: the host's fence and this thread's event.
@@ -3030,6 +3105,17 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[4] / 1000.0,
         );
+        #[cfg(feature = "diagnostics")]
+        {
+            let w = RELAY_WAITS.each_ref().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            tracing::info!(
+                "the submitting thread's waits for the relay per frame: {:.1} ms, of it {:.1} ms while the relay landed \
+                 ({:.1} ms of landings begun with the card done with every flight in the air), the rest while the card ran",
+                w[0],
+                w[1],
+                w[2]
+            );
+        }
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
@@ -4551,24 +4637,39 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        // Diagnostics: preparing by part, settles left out.
+        #[cfg(feature = "diagnostics")]
+        let mut part = (std::time::Instant::now(), settled);
+        #[cfg(feature = "diagnostics")]
+        let mut part_done = |c: crate::copystat::C, settled: std::time::Duration| {
+            let now = std::time::Instant::now();
+            let took = (now - part.0).saturating_sub(settled - part.1);
+            crate::copystat::add(c, took.as_nanos() as u64);
+            part = (now, settled);
+        };
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            let mut asked: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
+                std::collections::HashMap::new();
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
                         && !shadow.unwatched()
                     {
-                        let span = spans
+                        asked
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                            .or_insert_with(|| (shadow.clone(), Vec::new()))
+                            .1
+                            .push((*address, *address + *len));
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let ranges: Vec<(usize, usize)> =
+                asked.into_values().flat_map(|(shadow, ranges)| refresh_runs(&shadow, ranges)).collect();
             crate::watch::ask_once(&ranges);
+            #[cfg(feature = "diagnostics")]
+            part_done(crate::copystat::C::PrepAskNs, settled);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -4584,6 +4685,8 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        #[cfg(feature = "diagnostics")]
+        part_done(crate::copystat::C::PrepStaleNs, settled);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -4592,8 +4695,12 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        #[cfg(feature = "diagnostics")]
+        part_done(crate::copystat::C::PrepStepsNs, settled);
         batch.flush();
         crate::watch::ask_once_end();
+        #[cfg(feature = "diagnostics")]
+        part_done(crate::copystat::C::PrepFlushNs, settled);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -4604,6 +4711,8 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
+        #[cfg(feature = "diagnostics")]
+        part_done(crate::copystat::C::PrepSnapNs, settled);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -4617,6 +4726,8 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        #[cfg(feature = "diagnostics")]
+        part_done(crate::copystat::C::PrepCardNs, settled);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -4629,6 +4740,8 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            #[cfg(feature = "diagnostics")]
+            part_done(crate::copystat::C::PrepSendNs, settled);
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             let (reads, lands) = (card_reads(runs), read_back_ranges(runs));
@@ -5828,9 +5941,9 @@ fn wide_refresh() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// A submission's refreshes not done yet, per buffer copy ([`refresh_runs`]):
+/// done before a step that writes title memory or gives a range to shaders,
+/// and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -5838,7 +5951,7 @@ fn wide_refresh() -> bool {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -5853,13 +5966,10 @@ impl Batch {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
-            Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
-            }
+            Some(&at) => self.refreshes[at].1.push((address, end)),
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), vec![(address, end)]));
             }
         }
     }
@@ -5870,12 +5980,14 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, ranges) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        for (from, to) in refresh_runs(&shadow, ranges) {
+            Self::update(&shadow, from, to);
+        }
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -5884,7 +5996,10 @@ impl Batch {
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
-        crate::copystat::range(from, to - from, us, 0);
+        {
+            let (start, len) = shadow.span();
+            crate::copystat::range(start as usize, len as usize, to - from, copied, us, 0);
+        }
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
@@ -5904,43 +6019,96 @@ impl Batch {
 
     fn flush(&mut self) {
         self.index.clear();
+        let refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = self
+            .refreshes
+            .drain(..)
+            .map(|(shadow, ranges)| {
+                let runs = refresh_runs(&shadow, ranges);
+                (shadow, runs)
+            })
+            .collect();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = refreshes.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = self
-                .refreshes
+            let ranges: Vec<(usize, usize)> = refreshes
                 .iter()
                 .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| r.1.iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        if wide_refresh() && refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = refreshes
+                .into_iter()
+                .map(|(shadow, runs)| {
+                    Box::new(move || {
+                        for (from, to) in runs {
+                            Self::update(&shadow, from, to);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, runs) in refreshes {
+                for (from, to) in runs {
+                    Self::update(&shadow, from, to);
+                }
             }
         }
         if ahead {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+/// A copy's ranges refreshed in a submission as the runs brought up to date
+/// at once: each rounded out to whole pages of the write journal
+/// ([`crate::watch::PAGE`], the grain of what it knows was written) within
+/// the copy, joined where they touch, in order.
+///
+/// They were one range from the lowest to the highest address asked for,
+/// which brought up to date every page written between them that the
+/// submission does not read: the refreshes of the title's 174 MB heap ask
+/// for scattered constants and views, 5.3 GB a frame in 81 spans (run
+/// late-42). `VICTORY_REFRESH_SPANS=1` takes the one range again.
+fn refresh_runs(shadow: &crate::shadow::Shadow, ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    use crate::watch::PAGE;
+    static SPANS: OnceLock<bool> = OnceLock::new();
+    if *SPANS.get_or_init(|| std::env::var_os("VICTORY_REFRESH_SPANS").is_some_and(|v| v == "1")) {
+        let from = ranges.iter().map(|r| r.0).min().unwrap_or(0);
+        let to = ranges.iter().map(|r| r.1).max().unwrap_or(0);
+        return vec![(from, to)];
+    }
+    let (start, len) = shadow.span();
+    page_runs(start as usize, (start + len) as usize, PAGE, ranges)
+}
+
+/// `ranges` rounded out to whole `page`s within `[start, end)`, joined
+/// where they touch or overlap, in order ([`refresh_runs`]).
+fn page_runs(start: usize, end: usize, page: usize, mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    for r in &mut ranges {
+        *r = ((r.0 / page * page).max(start), r.1.div_ceil(page).saturating_mul(page).min(end));
+    }
+    ranges.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges {
+        match runs.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => runs.push((from, to)),
+        }
+    }
+    runs
 }
 
 /// Copies title memory at submission. The ranges were checked against their

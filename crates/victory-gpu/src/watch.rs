@@ -320,6 +320,12 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         )
     } != 0;
     if failed {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::WatchFailed, 1);
+            add(C::WatchFailedNs, started.elapsed().as_nanos() as u64);
+        }
         return false;
     }
     #[cfg(feature = "diagnostics")]
@@ -330,11 +336,27 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
+    note_written(j, count, std::iter::empty(), now);
+    true
+}
+
+/// Notes in the journal, under asking `now`, the pages of the first `count`
+/// kernel pages in `j.found` (in order, as the kernel gives them) and
+/// `more`: each of our pages once, not once for each of its sixteen kernel
+/// pages (some 50,000 map insertions a frame for the 160-200 MB the title
+/// writes in a frame, runs late-64 to late-66).
+fn note_written(j: &mut Journal, count: usize, more: impl IntoIterator<Item = usize>, now: u64) {
+    let mut last = usize::MAX;
     for k in 0..count {
         let page = j.found[k] / PAGE;
+        if page != last {
+            j.written.insert(page, now);
+            last = page;
+        }
+    }
+    for page in more {
         j.written.insert(page, now);
     }
-    true
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -402,7 +424,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
-        let written = guard(first * PAGE, last * PAGE);
+        let written = guard(first * PAGE, last * PAGE, Some(crate::frame::current()));
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardNs, guarding.elapsed().as_nanos() as u64);
         written?
@@ -418,10 +440,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
-    }
+    note_written(j, count, guarded, now);
     Some((
         now,
         j.written
@@ -449,6 +468,10 @@ struct Guards {
     /// Block ranges the kernel is writing ([`writing`]): not made
     /// read-only until it is done.
     held: Vec<(usize, usize)>,
+    /// For the frame it is kept for (`crate::frame::current`): the
+    /// uncommitted regions found, as (first block, end)
+    /// ([`uncommitted_end_asked`]).
+    asked_absent: (u64, BTreeMap<usize, usize>),
 }
 
 impl Guards {
@@ -544,6 +567,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: Runs::new(),
     mirrored: BTreeMap::new(),
     held: Vec::new(),
+    asked_absent: (0, BTreeMap::new()),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -597,7 +621,9 @@ fn known_view(start: usize) -> bool {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
-fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+/// `asking`: the frame the answers about unmapped memory hold for
+/// ([`uncommitted_end_asked`]).
+fn guard(start: usize, end: usize, asking: Option<u64>) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -612,13 +638,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         g.protected.contains(&first) || g.absent.holding(first).is_some()
     };
     #[cfg(feature = "diagnostics")]
-    let asking = std::time::Instant::now();
+    let viewing = std::time::Instant::now();
     let view = known || is_view(start, end);
     #[cfg(feature = "diagnostics")]
     if !known {
         use crate::copystat::{C, add};
         add(C::GuardViewAsks, 1);
-        add(C::GuardViewAskNs, asking.elapsed().as_nanos() as u64);
+        add(C::GuardViewAskNs, viewing.elapsed().as_nanos() as u64);
     }
     if !view {
         return None;
@@ -654,7 +680,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 // Reuse this asking's query for the following blocks in the
                 // same region.
                 if block >= uncommitted_until {
-                    uncommitted_until = uncommitted_end(block);
+                    uncommitted_until = uncommitted_end_asked(&mut g, block, asking);
                 }
                 // Still unmapped up to there: skipped together, and they
                 // close the run of blocks to guard.
@@ -870,6 +896,37 @@ pub fn title_pages_written(section: usize, offset: u64, len: usize) {
     }
 }
 
+/// [`uncommitted_end`], from what an earlier question found in the same
+/// frame (`asking`: the frame number, `crate::frame::current`): the ~40
+/// submissions refresh the same unmapped parts of view memory, each part
+/// once a submission, and each asked Windows again (run fx46-head: 11,409
+/// questions a frame, 7.2 ms; kept for one submission only, 1 of 11,559
+/// was spared, run late-66). A remap forgets the answers
+/// ([`title_memory_remapped`]), as the next frame does.
+/// shortcut: view memory becomes committed only through the runtime's
+/// mappings, which it tells of; memory the title frees with the system's
+/// own call and allocates again in the same frame is seen at the next.
+fn uncommitted_end_asked(g: &mut Guards, block: usize, asking: Option<u64>) -> usize {
+    let Some(n) = asking else {
+        return uncommitted_end(block);
+    };
+    if g.asked_absent.0 != n {
+        g.asked_absent = (n, BTreeMap::new());
+    }
+    if let Some((_, &end)) = g.asked_absent.1.range(..=block).next_back()
+        && end > block
+    {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardQueriesSpared, 1);
+        return end;
+    }
+    let end = uncommitted_end(block);
+    if end > block {
+        g.asked_absent.1.insert(block, end);
+    }
+    end
+}
+
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
@@ -1026,6 +1083,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     g.absent.remove(range.start, range.end);
+    g.asked_absent.1.clear();
     let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
@@ -1191,35 +1249,35 @@ mod tests {
         crate::inplace::title_memory_view(card, 2 * BLOCK, section, 0);
         crate::inplace::title_memory_view(own, 2 * BLOCK, section, 0);
         let second = Some((card / PAGE + 1..card / PAGE + 2).collect::<Vec<_>>());
-        assert!(guard(card, card + 2 * BLOCK).is_some());
-        assert_eq!(guard(card, card + 2 * BLOCK), Some(Vec::new()));
+        assert!(guard(card, card + 2 * BLOCK, None).is_some());
+        assert_eq!(guard(card, card + 2 * BLOCK, None), Some(Vec::new()));
         for round in 0..2u8 {
             // SAFETY: our view; the handler opens it.
             unsafe { ((own + BLOCK + 8) as *mut u8).write(round) };
-            assert_eq!(guard(card, card + 2 * BLOCK), second, "round {round}");
-            assert_eq!(guard(card, card + 2 * BLOCK), Some(Vec::new()));
+            assert_eq!(guard(card, card + 2 * BLOCK, None), second, "round {round}");
+            assert_eq!(guard(card, card + 2 * BLOCK, None), Some(Vec::new()));
         }
         // Written at its own address, the block is guarded again without
         // making the other view read-only again: it still is, and a write
         // there is still reported.
         // SAFETY: our view; the handler opens it.
         unsafe { ((card + BLOCK + 8) as *mut u8).write(9) };
-        assert_eq!(guard(card, card + 2 * BLOCK), second);
+        assert_eq!(guard(card, card + 2 * BLOCK, None), second);
         // SAFETY: as above.
         unsafe { ((own + BLOCK + 8) as *mut u8).write(10) };
-        assert_eq!(guard(card, card + 2 * BLOCK), second);
-        assert_eq!(guard(card, card + 2 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(card, card + 2 * BLOCK, None), second);
+        assert_eq!(guard(card, card + 2 * BLOCK, None), Some(Vec::new()));
         title_pages_written(section, BLOCK as u64 + 100, 4);
-        assert_eq!(guard(card, card + 2 * BLOCK), second);
+        assert_eq!(guard(card, card + 2 * BLOCK, None), second);
         // A view mapped after the block was guarded mirrors it as well.
         // SAFETY: as above.
         let late = unsafe { MapViewOfFile(section as _, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize };
         assert_ne!(late, 0);
-        assert_eq!(guard(card, card + 2 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(card, card + 2 * BLOCK, None), Some(Vec::new()));
         crate::inplace::title_memory_view(late, 2 * BLOCK, section, 0);
         // SAFETY: our view; the handler opens it.
         unsafe { ((late + BLOCK) as *mut u8).write(7) };
-        assert_eq!(guard(card, card + 2 * BLOCK), second);
+        assert_eq!(guard(card, card + 2 * BLOCK, None), second);
         for view in [card, own, late] {
             // SAFETY: our views.
             unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
@@ -1249,7 +1307,7 @@ mod tests {
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
         };
         assert_ne!(view, 0);
-        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        assert!(guard(view, view + 2 * BLOCK, None).is_some()); // now read-only
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
         // `ReadFile` inside: the kernel writes the view.
@@ -1267,7 +1325,7 @@ mod tests {
         // A copy that asks meanwhile does not close the block under the
         // kernel's write, and is told again once the write is over.
         assert_eq!(
-            guard(view, view + 2 * BLOCK),
+            guard(view, view + 2 * BLOCK, None),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
         assert!(read(&mut file));
@@ -1276,7 +1334,7 @@ mod tests {
         let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
         assert_eq!(landed, b"from the disk");
         assert_eq!(
-            guard(view, view + 2 * BLOCK),
+            guard(view, view + 2 * BLOCK, None),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
         // SAFETY: our view.
@@ -1334,7 +1392,7 @@ mod tests {
         let late = start + 2 * BLOCK + 3 * KERNEL_PAGE;
         commit(start, BLOCK);
         commit(early, KERNEL_PAGE);
-        let refresh = || guard(start, start + SIZE).unwrap();
+        let refresh = || guard(start, start + SIZE, None).unwrap();
         assert_eq!(refresh(), [start / PAGE, early / PAGE, late / PAGE]);
         // The last block is still entirely reserved.
         assert!(!refresh().contains(&(late / PAGE)));
@@ -1415,15 +1473,15 @@ mod tests {
         title_memory_remapped(p + BLOCK, BLOCK);
         // The range begins in the placeholder, its middle block is a view.
         assert!(is_view(p, p + 3 * BLOCK));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(all));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()), "nothing written since");
+        assert_eq!(guard(p, p + 3 * BLOCK, None), Some(all));
+        assert_eq!(guard(p, p + 3 * BLOCK, None), Some(Vec::new()), "nothing written since");
         // SAFETY: inside the mapped middle block.
         unsafe { ((p + BLOCK + 8) as *mut u8).write_volatile(1) };
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
+        assert_eq!(guard(p, p + 3 * BLOCK, None), Some(pages(1).collect()));
         let first = map(0);
         title_memory_remapped(p, BLOCK);
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(0).collect()));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(p, p + 3 * BLOCK, None), Some(pages(0).collect()));
+        assert_eq!(guard(p, p + 3 * BLOCK, None), Some(Vec::new()));
         // Memory of ours that is no view stays none.
         let mut local = [0u8; 16];
         let at = local.as_mut_ptr() as usize;
@@ -1442,6 +1500,36 @@ mod tests {
 
     /// Blocks of a placeholder between views are reported once, then not
     /// again (they cannot be guarded) until the runtime maps them.
+    /// Within one frame, where an unmapped region ends is asked of Windows
+    /// once; the next frame, or a remap, asks again.
+    #[test]
+    fn unmapped_regions_are_asked_once_per_asking() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, PAGE_NOACCESS, VirtualAlloc, VirtualFree};
+        // SAFETY: a fresh reservation of four blocks, nothing committed.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(p, 0);
+        let first = p / BLOCK;
+        let mut g = Guards {
+            protected: BTreeSet::new(),
+            clean: Runs::new(),
+            absent: Runs::new(),
+            mirrored: BTreeMap::new(),
+            held: Vec::new(),
+            asked_absent: (0, BTreeMap::new()),
+        };
+        assert_eq!(uncommitted_end_asked(&mut g, first, Some(7)), first + 4);
+        // SAFETY: a block of our reservation.
+        assert_ne!(unsafe { VirtualAlloc((p + BLOCK) as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE) }, std::ptr::null_mut());
+        // The same frame keeps its answer, also for a block inside it.
+        assert_eq!(uncommitted_end_asked(&mut g, first + 1, Some(7)), first + 4);
+        // Another frame asks again, as does a question with no frame.
+        assert_eq!(uncommitted_end_asked(&mut g, first, Some(8)), first + 1);
+        assert_eq!(uncommitted_end_asked(&mut g, first + 1, Some(8)), first + 1);
+        assert_eq!(uncommitted_end_asked(&mut g, first + 2, None), first + 4);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
     #[test]
     fn unmapped_blocks_are_reported_once_until_mapped() {
         use windows_sys::Win32::System::Memory::{
@@ -1502,16 +1590,16 @@ mod tests {
         let first = map(0);
         let pages = |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE;
         let all: Vec<usize> = (0..3).flat_map(pages).collect();
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(all));
+        assert_eq!(guard(p, p + 3 * BLOCK, None), Some(all));
         assert_eq!(
-            guard(p, p + 3 * BLOCK),
+            guard(p, p + 3 * BLOCK, None),
             Some(Vec::new()),
             "nothing written since"
         );
         let second = map(1);
         title_memory_remapped(p + BLOCK, BLOCK);
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(p, p + 3 * BLOCK, None), Some(pages(1).collect()));
+        assert_eq!(guard(p, p + 3 * BLOCK, None), Some(Vec::new()));
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);

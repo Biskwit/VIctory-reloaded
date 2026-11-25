@@ -1971,6 +1971,8 @@ impl Shadow {
                     let _open = crate::watch::writing(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     #[cfg(feature = "diagnostics")]
+                    echo_wrote(self, start + at, n);
+                    #[cfg(feature = "diagnostics")]
                     self.audit(at, n, title);
                     written += n;
                 }
@@ -2072,6 +2074,8 @@ impl Shadow {
         }
         let _open = crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        #[cfg(feature = "diagnostics")]
+        echo_wrote(self, start + at, n);
         #[cfg(feature = "diagnostics")]
         self.audit(at, n, title);
         n
@@ -2489,6 +2493,8 @@ impl Shadow {
         let at = unsafe { self.data.add(from - start) };
         #[cfg(feature = "diagnostics")]
         let moved = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        echo_copied(self, from, to);
         if crate::watch::copy_guarded(at, from, to - from) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
@@ -2610,6 +2616,8 @@ impl Shadow {
                 let _open = crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 #[cfg(feature = "diagnostics")]
+                echo_wrote(self, start + at, n);
+                #[cfg(feature = "diagnostics")]
                 self.audit(at, n, title);
                 written = n;
             }
@@ -2687,8 +2695,49 @@ impl Shadow {
         let _open = crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         #[cfg(feature = "diagnostics")]
+        echo_wrote(self, start + at, n);
+        #[cfg(feature = "diagnostics")]
         self.audit(at, n, title);
         n
+    }
+}
+
+/// Diagnostics: pages of title memory (by copy) we wrote back from that
+/// copy and it has not refreshed since ([`echo_copied`]).
+#[cfg(feature = "diagnostics")]
+static ECHO: Mutex<Option<std::collections::HashSet<(usize, usize)>>> = Mutex::new(None);
+
+/// We wrote title memory `[at, at + n)` from `shadow`'s bytes.
+#[cfg(feature = "diagnostics")]
+fn echo_wrote(shadow: &Shadow, at: usize, n: usize) {
+    let key = shadow as *const Shadow as usize;
+    let mut echo = ECHO.lock().unwrap_or_else(|e| e.into_inner());
+    let set = echo.get_or_insert_with(Default::default);
+    if set.len() > 1 << 22 {
+        set.clear();
+    }
+    set.extend((at / PAGE..(at + n).div_ceil(PAGE)).map(|page| (key, page)));
+}
+
+/// A refresh copies `[from, to)` of title memory into `shadow`: the bytes
+/// of pages it wrote back itself since are counted (the refresh brings
+/// back what the copy held already, unless the title wrote them too).
+#[cfg(feature = "diagnostics")]
+fn echo_copied(shadow: &Shadow, from: usize, to: usize) {
+    let key = shadow as *const Shadow as usize;
+    let mut echo = ECHO.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(set) = echo.as_mut().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let mut bytes = 0;
+    for page in from / PAGE..to.div_ceil(PAGE) {
+        if set.remove(&(key, page)) {
+            bytes += ((page + 1) * PAGE).min(to) - (page * PAGE).max(from);
+        }
+    }
+    if bytes > 0 {
+        use crate::copystat::{C, add};
+        add(if shadow.carded() { C::EchoCardBytes } else { C::EchoBytes }, bytes as u64);
     }
 }
 

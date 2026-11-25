@@ -152,6 +152,31 @@ pub(crate) enum C {
     GuardLookupNs,
     GuardViewAsks,
     GuardViewAskNs,
+    /// A submission's preparing by part (`Host::submit`), settles left
+    /// out: the one write-watch asking with the check for title bytes
+    /// under flights' writes; the lists' steps and preludes; the last flush
+    /// of refreshes; the snapshots; the copies in the card's memory; the
+    /// sending.
+    PrepAskNs,
+    PrepStaleNs,
+    PrepStepsNs,
+    PrepFlushNs,
+    PrepSnapNs,
+    PrepCardNs,
+    PrepSendNs,
+    /// Kernel write-watch askings that failed (a range across two
+    /// reservations, or not write-watched; `watch::ask_kernel`), and their
+    /// time.
+    WatchFailed,
+    WatchFailedNs,
+    /// Refreshed bytes in pages we had written back from the same copy
+    /// since its last refresh of them (`shadow::echo_copied`): copies in
+    /// the PC's memory, copies in the card's.
+    EchoBytes,
+    EchoCardBytes,
+    /// Questions about unmapped view memory answered from an earlier one
+    /// in the same submission (`watch::uncommitted_end_asked`).
+    GuardQueriesSpared,
 }
 const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -170,8 +195,9 @@ pub(crate) fn mode() -> u8 {
     })
 }
 
-/// Per source range (start, length): copies, bytes, microseconds, memory type.
-type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
+/// Per host copy (its title memory: start, length): refreshes, bytes asked
+/// for, bytes copied, microseconds, memory type.
+type Ranges = HashMap<(usize, usize), (u64, u64, u64, u64, u32)>;
 static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
 
 /// Per range copied whole because its memory is not watched (start,
@@ -280,16 +306,18 @@ pub(crate) fn compared(src: usize, len: usize, written: usize) {
     e.1 += written as u64;
 }
 
-/// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
-pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
+/// A refresh of `asked` bytes of the host copy of `[src, src + len)`
+/// (memory type `kind`) copied `copied` of them and took `us`.
+pub(crate) fn range(src: usize, len: usize, asked: usize, copied: usize, us: u64, kind: u32) {
     let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let e = map
         .get_or_insert_with(HashMap::new)
         .entry((src, len))
-        .or_insert((0, 0, 0, kind));
+        .or_insert((0, 0, 0, 0, kind));
     e.0 += 1;
-    e.1 += len as u64;
-    e.2 += us;
+    e.1 += asked as u64;
+    e.2 += copied as u64;
+    e.3 += us;
 }
 
 /// Our own allocations alive now, by size of block (under 4 KiB, to 64 KiB,
@@ -1083,8 +1111,9 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
-         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
+         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms ({:.0} failed {:.2} ms), {:.1} MB checked, {:.1} MB \
+         unchanged; {:.1} fallbacks; refreshed in pages the same copy wrote back {:.1} MB ({:.1} MB of copies in \
+         the card's memory); {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -1102,9 +1131,13 @@ pub(crate) fn log(frames: f64) {
         faults as f64 / frames,
         c[C::Watches as usize],
         ms(c[C::WatchUs as usize]),
+        c[C::WatchFailed as usize],
+        c[C::WatchFailedNs as usize] / 1e6,
         mb(c[C::Checked as usize]),
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],
+        mb(c[C::EchoBytes as usize]),
+        mb(c[C::EchoCardBytes as usize]),
         c[C::GuardFaults as usize],
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
@@ -1116,7 +1149,7 @@ pub(crate) fn log(frames: f64) {
          refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
          guards {:.1} ms ({:.0} blocks outside clean runs; {:.0} runs guarded again {:.1} ms, \
-         {:.0} other views {:.1} ms; {:.0} questions about unmapped memory {:.1} ms; {:.0} lookups of other \
+         {:.0} other views {:.1} ms; {:.0} questions about unmapped memory {:.1} ms ({:.0} spared); {:.0} lookups of other \
          views {:.1} ms; {:.0} questions whether memory is a view {:.1} ms; waiting for \
          the guards' lock {:.1} ms; {:.1} MB copied in place); {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
@@ -1141,6 +1174,7 @@ pub(crate) fn log(frames: f64) {
         c[C::GuardMirrorNs as usize] / 1e6,
         c[C::GuardQueries as usize],
         c[C::GuardQueryNs as usize] / 1e6,
+        c[C::GuardQueriesSpared as usize],
         c[C::GuardLookups as usize],
         c[C::GuardLookupNs as usize] / 1e6,
         c[C::GuardViewAsks as usize],
@@ -1172,7 +1206,9 @@ pub(crate) fn log(frames: f64) {
          putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
          submissions run at the present with their waits not met; waits for memory values: \
          {:.0} looks {:.1} ms; {:.0} host lists made {:.1} ms; {:.0} parts of held submissions \
-         ran alone that the next part could have run with",
+         ran alone that the next part could have run with; preparing by part: the one asking \
+         {:.1} ms, title bytes under flights' writes {:.1} ms, the lists' steps {:.1} ms, the last flush {:.1} ms, snapshots {:.1} ms, copies \
+         in the card's memory {:.1} ms, sending {:.1} ms",
         ms(c[C::UntilRecordUs as usize]),
         ms(c[C::UntilSubmitUs as usize]),
         ms(c[C::TailUs as usize]),
@@ -1188,6 +1224,13 @@ pub(crate) fn log(frames: f64) {
         c[C::HostLists as usize],
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
+        c[C::PrepAskNs as usize] / 1e6,
+        c[C::PrepStaleNs as usize] / 1e6,
+        c[C::PrepStepsNs as usize] / 1e6,
+        c[C::PrepFlushNs as usize] / 1e6,
+        c[C::PrepSnapNs as usize] / 1e6,
+        c[C::PrepCardNs as usize] / 1e6,
+        c[C::PrepSendNs as usize] / 1e6,
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -1326,8 +1369,11 @@ pub(crate) fn log(frames: f64) {
     log_memory();
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
-    ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
-    for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
+    // By the bytes they copied (the frame line's "copies" MB), not the
+    // bytes asked for: the 174 MB heap is asked for 3 GB a frame and
+    // copies a fraction of it.
+    ranges.sort_by_key(|&(_, (_, _, copied, _, _))| std::cmp::Reverse(copied));
+    for ((src, len), (n, bytes, copied, us, _)) in ranges.into_iter().take(16) {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -1335,8 +1381,9 @@ pub(crate) fn log(frames: f64) {
         unsafe { VirtualQuery(src as *const _, &mut info, size_of_val(&info)) };
         let kind = info.Type;
         tracing::info!(
-            "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame",
+            "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame copied of {:.2} MB asked for, {:.2} ms/frame",
             n as f64 / frames,
+            copied as f64 / 1e6 / frames,
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
         );
