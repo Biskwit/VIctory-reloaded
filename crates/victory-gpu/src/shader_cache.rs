@@ -165,7 +165,7 @@ fn root_type(code: u32) -> RootType {
 }
 
 /// Little-endian words and length-prefixed lists.
-fn encode(s: &HostShader) -> Vec<u8> {
+pub(crate) fn encode(s: &HostShader) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u32;
@@ -222,7 +222,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     out
 }
 
-fn decode(bytes: &[u8]) -> Option<HostShader> {
+pub(crate) fn decode(bytes: &[u8]) -> Option<HostShader> {
     struct Reader<'a>(&'a [u8]);
     impl<'a> Reader<'a> {
         fn take(&mut self, n: usize) -> Option<&'a [u8]> {

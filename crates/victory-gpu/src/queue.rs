@@ -823,6 +823,7 @@ extern "system" fn present(
         crate::capture::frame_drew(frame, crate::draw::drawn());
         crate::pix::presented(frame);
         crate::capture::records_landed(frame);
+        crate::dispatch::presented(frame);
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);
         }

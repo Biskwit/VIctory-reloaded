@@ -85,6 +85,32 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Run a compute dispatch captured from a run
+    /// (`VICTORY_DISPATCH_CAPTURE=<shader hash prefix>:<frame>:<folder>`,
+    /// diagnostics builds) again on this GPU, and compare what it writes
+    /// with what it wrote in the run.
+    ReplayDispatch {
+        /// The capture's folder (its `manifest.json`).
+        dir: PathBuf,
+        /// Programs to run: the captured code, then translations of the
+        /// captured shader with salts 1, 2, ... (each compiled anew by the
+        /// driver); outputs that differ between them show code whose results
+        /// depend on its compilation.
+        #[arg(long, default_value_t = 1)]
+        variants: u32,
+        /// Runs of each program.
+        #[arg(long, default_value_t = 2)]
+        runs: u32,
+        /// Run this DXIL container instead of the captured code.
+        #[arg(long, conflicts_with = "retranslate")]
+        dxil: Option<PathBuf>,
+        /// Run the captured shader as this build translates it.
+        #[arg(long)]
+        retranslate: bool,
+        /// Differing places listed per resource.
+        #[arg(long, default_value_t = 4)]
+        show: usize,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -167,6 +193,14 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::ReplayDispatch {
+            dir,
+            variants,
+            runs,
+            dxil,
+            retranslate,
+            show,
+        } => replay_dispatch(&dir, variants, runs, dxil, retranslate, show),
         Command::Run {
             exe,
             unimplemented,
@@ -177,6 +211,30 @@ fn main() -> Result<()> {
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
     }
+}
+
+#[cfg(windows)]
+fn replay_dispatch(dir: &std::path::Path, variants: u32, runs: u32, dxil: Option<PathBuf>, retranslate: bool, show: usize) -> Result<()> {
+    let options = victory_gpu::replay::Options {
+        variants,
+        runs,
+        dxil,
+        retranslate,
+        show,
+    };
+    // On a thread with room for the translator's recursion (the main
+    // thread's stack is the linker's 1 MiB).
+    let dir = dir.to_owned();
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || victory_gpu::replay::replay_dispatch(&dir, &options).map(|_| ()))?
+        .join()
+        .map_err(|_| anyhow::anyhow!("the replay panicked"))?
+}
+
+#[cfg(not(windows))]
+fn replay_dispatch(_: &std::path::Path, _: u32, _: u32, _: Option<PathBuf>, _: bool, _: usize) -> Result<()> {
+    anyhow::bail!("replay-dispatch needs D3D12 (Windows)")
 }
 
 fn show_config() -> Result<()> {
