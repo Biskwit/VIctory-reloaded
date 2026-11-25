@@ -2279,7 +2279,17 @@ fn blocked_by(air: &Air, runs: &[&HostList], count: bool) -> Option<usize> {
         found[kind] = true;
         if on & (1 << kind) != 0 && why.is_none() {
             why = Some(settles);
+            if count {
+                // In `BLOCKED_KIND`'s order.
+                BLOCKED_KIND.store([3, 4, 5, 6][kind], Ordering::Relaxed);
+            }
         }
+    };
+    let blocked = |kind: usize, why: usize| {
+        if count {
+            BLOCKED_KIND.store(kind, Ordering::Relaxed);
+        }
+        Some(why)
     };
     let landed = |from: usize, to: usize| (touches(air.landing, from, to), touches(air.told, from, to));
     for list in runs {
@@ -2290,7 +2300,7 @@ fn blocked_by(air: &Air, runs: &[&HostList], count: bool) -> Option<usize> {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                         }
-                        return Some(WHY_READ);
+                        return blocked(0, WHY_READ);
                     }
                     if touches(air.read, dst, dst + len) {
                         static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2319,8 +2329,9 @@ fn blocked_by(air: &Air, runs: &[&HostList], count: bool) -> Option<usize> {
                     if touches(air.written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            fill_seen(src, len, air.copies);
                         }
-                        return Some(WHY_READ);
+                        return blocked(1, WHY_READ);
                     }
                     (src, src + len)
                 }
@@ -2330,7 +2341,7 @@ fn blocked_by(air: &Air, runs: &[&HostList], count: bool) -> Option<usize> {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
                         }
-                        return Some(WHY_READ);
+                        return blocked(2, WHY_READ);
                     }
                     (at, at + len)
                 }
@@ -2345,7 +2356,7 @@ fn blocked_by(air: &Air, runs: &[&HostList], count: bool) -> Option<usize> {
                     }
                     (from, to)
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::Run(_) => return blocked(7, WHY_RUN),
                 Step::GpuWrite(..) | Step::Host(_) => continue,
             };
             let (a, b) = landed(from, to);
@@ -2358,6 +2369,56 @@ fn blocked_by(air: &Air, runs: &[&HostList], count: bool) -> Option<usize> {
         }
     }
     why
+}
+
+/// What [`blocked_by`] last found that holds a submission back (counted
+/// calls only): 0 a title buffer copy, 1 a fill of upload memory, 2 a
+/// texture, of memory flights' shaders write; 3 a refresh of another copy
+/// of such memory; 4 a read of a read-back's memory, 5 of a bottom-of-pipe
+/// write's; 6 a title copy into memory flights read; 7 a step of ours.
+static BLOCKED_KIND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Since the last frame-rate line: the microseconds submissions were held
+/// back before preparing, by [`BLOCKED_KIND`].
+static KIND_WAITED: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Adds the microseconds since its start to its counter when dropped.
+struct Charge<'a>(&'a std::sync::atomic::AtomicU64, std::time::Instant);
+
+impl Drop for Charge<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Logs (the first 16 times, then every 1024th) a fill of upload memory
+/// from `[src, src + len)`, which flights' shaders write: through which
+/// copies, and where.
+fn fill_seen(src: usize, len: usize, copies: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)]) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    if n >= 16 && n % 1024 != 0 {
+        return;
+    }
+    let writers: Vec<String> = copies
+        .iter()
+        .filter_map(|(s, ranges)| {
+            let hit: Vec<String> = ranges
+                .iter()
+                .filter(|r| r.0 < src + len && r.1 > src)
+                .map(|r| format!("{:#x}..{:#x}", r.0, r.1))
+                .collect();
+            let (start, bytes) = s.span();
+            (!hit.is_empty()).then(|| {
+                format!("{} {start:#x}+{bytes:#x} writes {}", if s.is_window() { "window" } else { "buffer" }, hit.join(", "))
+            })
+        })
+        .collect();
+    tracing::info!(
+        found = n + 1,
+        "a fill of upload memory from {src:#x}+{len:#x} reads what flights' shaders write: {}",
+        writers.join("; ")
+    );
 }
 
 /// Logs (the first 16 times, then every 1024th) a refresh of `[from, to)`
@@ -2876,6 +2937,21 @@ fn late_line(frames: f64) {
             w[WHY_MOST],
             w[WHY_WRITES],
             w[WHY_FENCE],
+        );
+        let k: Vec<f64> = KIND_WAITED.iter().map(|k| k.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
+        tracing::info!(
+            "held back before preparing, per frame, by what was read: memory flights' shaders write by a title copy \
+             {:.1} ms, a fill of upload memory {:.1}, a texture {:.1}, a refresh of another copy of it {:.1}; a \
+             read-back's memory {:.1}; a bottom-of-pipe write's {:.1}; a title copy into memory flights read {:.1}; \
+             a step of ours {:.1}",
+            k[0],
+            k[1],
+            k[2],
+            k[3],
+            k[4],
+            k[5],
+            k[6],
+            k[7],
         );
     }
     if relay() {
@@ -4299,6 +4375,9 @@ impl Host {
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
+            let holding = std::time::Instant::now();
+            let kind = BLOCKED_KIND.load(Ordering::Relaxed).min(7);
+            let _charged = Charge(&KIND_WAITED[kind], holding);
             if relay_exact() && (why == WHY_READ || why == WHY_OVER) {
                 // Only until the flights that may write what is read (or
                 // read what a title copy writes) have landed: their
