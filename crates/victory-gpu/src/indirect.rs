@@ -49,8 +49,8 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-// A dispatch record written as two (`bound_wide`): the first group in x and
-// the groups of each, for up to twice the host's 65,535 groups in x.
+// A dispatch record written as two (`bound_wide`): the first 65,535 groups
+// in x at `12 * i`, the rest at `12 * (records + i)`.
 static const uint WIDE = 4u;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
@@ -64,8 +64,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         // The host runs every slot of two-dispatch records: past the count
         // they are written empty.
         if (kind == WIDE && id.x < records) {
-            dst_args.Store4(id.x * 32u, uint4(0u, 0u, 0u, 0u));
-            dst_args.Store4(id.x * 32u + 16u, uint4(0u, 0u, 0u, 0u));
+            dst_args.Store3(id.x * 12u, uint3(0u, 0u, 0u));
+            dst_args.Store3((records + id.x) * 12u, uint3(0u, 0u, 0u));
         }
         return;
     }
@@ -150,8 +150,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             groups = uint3(0, 0, 0);
         }
         uint first = min(groups.x, 65535u);
-        dst_args.Store4(id.x * 32u, uint4(0u, first, groups.y, groups.z));
-        dst_args.Store4(id.x * 32u + 16u, uint4(65535u, groups.x - first, groups.y, groups.z));
+        dst_args.Store3(id.x * 12u, uint3(first, groups.y, groups.z));
+        dst_args.Store3((records + id.x) * 12u, uint3(groups.x - first, groups.y, groups.z));
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
@@ -292,11 +292,13 @@ pub(crate) const WIDE: u32 = 4;
 /// [`bound`] for dispatch records (`stride` bytes apart, up to `records`)
 /// of a program that adds the first group of its dispatch to its group
 /// number in x (`victory_shader::emit::USER_GROUP_BASE`): each record is
-/// written as two, `[first group in x, groups in x, y, z]`, 16 bytes each,
-/// the first from group 0 with up to 65,535 groups, the second from group
-/// 65,535 with the rest (none if there is none), so a record of up to
-/// 131,070 groups in x runs whole. Every slot is written, past the count
-/// too (empty): the caller runs `2 * records` commands, with no count.
+/// written as two plain dispatch records of 12 bytes, the first 65,535
+/// groups in x at `12 * i` and the rest (none if there is none) at
+/// `12 * (records + i)`, so a record of up to 131,070 groups in x runs
+/// whole, in two indirect executions: the second from group 65,535. (One
+/// execution of two commands, with a command signature that set the first
+/// group as a root constant, cost the card some 23 microseconds a command
+/// more, 14 ms a frame in run late-62.)
 pub(crate) fn bound_wide(
     list: &HostList,
     src: (&ID3D12Resource, u64),
@@ -304,7 +306,7 @@ pub(crate) fn bound_wide(
     (stride, records): (u32, u32),
 ) -> Option<ID3D12Resource> {
     let spec = (WIDE, stride, records);
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?.max(32 * u64::from(records));
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?.max(24 * u64::from(records));
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
 }
@@ -880,11 +882,10 @@ void main() {
             )]);
         }
         warp.submit_and_wait();
-        // SAFETY: the copy finished; 8 words a record.
-        let words = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>(), 8 * MAX as usize).to_vec() };
-        assert_eq!(words[0..8], [0, 65_535, 1, 1, 65_535, 4_465, 1, 1]);
-        assert_eq!(words[8..16], [0, 3, 2, 1, 65_535, 0, 2, 1]);
-        assert_eq!(words[16..24], [0; 8], "a slot past the count is empty");
+        // SAFETY: the copy finished: the first parts, then the second.
+        let words = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>(), 6 * MAX as usize).to_vec() };
+        assert_eq!(words[0..9], [65_535, 1, 1, 3, 2, 1, 0, 0, 0], "first parts; a slot past the count is empty");
+        assert_eq!(words[9..18], [4_465, 1, 1, 0, 2, 1, 0, 0, 0], "second parts");
     }
 
     #[test]
