@@ -3136,6 +3136,16 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
+    // Memory past the title's 40 bits is this process's own (the structure
+    // builder keeps its tables in the host's heap, and a copy of one is a
+    // window of 4 MiB of that heap): never guarded. Such a window that began
+    // in a hole before a mapped file was taken for a view and made
+    // read-only, heap and all, and the next thread to free a node of a map
+    // under the guards' lock faulted into the handler, which waits for that
+    // lock (run bvh-28).
+    if start >> 40 != 0 {
+        *shadow.watched.get_mut() = NOT_WATCHED;
+    }
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
