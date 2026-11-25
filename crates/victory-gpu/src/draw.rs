@@ -186,6 +186,7 @@ pub(crate) struct State {
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
+    depth_bounds: Option<[f32; 2]>,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
@@ -347,6 +348,33 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// Frames after a whole upload of a texture picked by index at which its
+/// memory is looked at again, each counted from the look before.
+const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// Looks at uploaded textures picked by index that found the memory as it
+/// was, and that found it changed (uploaded again), since the start.
+pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Uploads of textures already on the card made while it had no room for
+/// new ones, since the start.
+pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a texture that has its host copy is still brought up to date
+/// while the card has no room for new ones (`VICTORY_REUPLOAD_WHEN_FULL=0`:
+/// no).
+fn reupload_when_full() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REUPLOAD_WHEN_FULL").is_none_or(|v| v != "0"))
+}
+
+/// Whether textures picked by index are looked at again after their upload
+/// (`VICTORY_HEAP_RECHECK=0`: no).
+fn heap_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
+}
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
@@ -615,6 +643,11 @@ impl State {
         crate::draw::stencil_ref(list, reference);
     }
 
+    pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        self.depth_bounds = Some([min, max]);
+        crate::draw::depth_bounds(list, min, max);
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -650,6 +683,9 @@ impl State {
         }
         if let Some(reference) = self.stencil {
             crate::draw::stencil_ref(list, reference);
+        }
+        if let Some([min, max]) = self.depth_bounds {
+            crate::draw::depth_bounds(list, min, max);
         }
     }
 
@@ -1569,6 +1605,38 @@ impl State {
             // every 120 frames, changed or not; and asked by its first
             // page alone, one whose first page is the one missing counted
             // as not there.)
+            // A slot uploaded whole is looked at again a few times
+            // (`RECHECK_FRAMES`): the title writes a texture's view, and
+            // may fill the texture's memory itself only afterwards, with
+            // no descriptor write and nothing from the runtime to tell of
+            // it. The host copy then kept what the memory held at the
+            // first look for the rest of the run. The look reads 48 KiB;
+            // only a changed texture is uploaded again.
+            // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
+            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+                if crate::texture::fingerprint(at, len) == print {
+                    HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                        Some(wait) => {
+                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                        }
+                        None => host.texture_slot_done(index, write, None),
+                    }
+                    continue;
+                }
+                let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+                if n < 200 || n.is_multiple_of(1000) {
+                    tracing::warn!(
+                        slot = index,
+                        address = format_args!("{at:#x}"),
+                        bytes = len,
+                        frames_after_upload = frame.saturating_sub(uploaded),
+                        looks,
+                        changed = n + 1,
+                        "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
+                    );
+                }
+            }
             let mut partly = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
@@ -1606,12 +1674,34 @@ impl State {
             }
             // From here on a host texture is made: not without room. The
             // slot stays due.
+            // Not so a slot already made from this very view: its host
+            // texture exists, and uploading it again takes none of the
+            // card's memory. It was refused all the same, so a texture the
+            // title filled after its first upload kept its empty host copy
+            // from the moment the card reached the line, which the fork's
+            // author found to be the first world frame in eight launches of
+            // nine: the same slots were found changed again at every pass
+            // and never uploaded, and the main character's face had its
+            // colour only in the launches that entered the world under the
+            // line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as before.
             if !room {
-                refused += 1;
-                if refused > 256 {
-                    break;
+                let has_its_texture = reupload_when_full()
+                    && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
+                if !has_its_texture {
+                    refused += 1;
+                    if refused > 256 {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
+                let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n.is_multiple_of(500) {
+                    tracing::info!(
+                        so_far = n,
+                        slot = index,
+                        "a texture already on the card is brought up to date although the card has no room for new ones"
+                    );
+                }
             }
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
@@ -1702,11 +1792,23 @@ impl State {
             // yet, makes it anew. (Kept for those until now: every partly
             // streamed texture of the heap held a staging buffer of its full
             // size for good.)
+            let memory = if again.is_none() && heap_recheck() {
+                crate::texture::staged_memory(resource)
+            } else {
+                None
+            };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
-            host.texture_slot_done(index, write, again);
+            match memory {
+                // Whole and uploaded: looked at again (see above).
+                Some((at, len)) => {
+                    let print = crate::texture::fingerprint(at, len);
+                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                }
+                None => host.texture_slot_done(index, write, again),
+            }
         }
     }
 
@@ -2929,4 +3031,17 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+/// The title's depth bounds, on a host that has the test (pipelines that
+/// enable it are made with it, `pipeline::host`).
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    #[cfg(feature = "diagnostics")]
+    crate::capture::op(std::ptr::from_ref(list) as usize, || format!("DEPTH BOUNDS {min}..{max}"));
+    if crate::host::host().is_some_and(|h| h.depth_bounds())
+        && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
+    {
+        // SAFETY: an open list on a device that supports depth bounds.
+        unsafe { l1.OMSetDepthBounds(min, max) };
+    }
 }
