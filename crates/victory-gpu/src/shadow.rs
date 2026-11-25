@@ -2813,6 +2813,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         return loose(address, end, len <= 1, any);
     };
     let entry = map.get_mut(&key)?;
+    if entry.shadow.is_none()
+        && let Some(window) = window_over(key.0, entry.end)
+    {
+        entry.shadow = Some(window);
+        return entry.shadow.clone();
+    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -2874,6 +2880,53 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         entry.shadow = Some(shadow);
     }
     entry.shadow.clone()
+}
+
+/// Whether a title buffer whose copy is made while a window outside
+/// buffers already holds all of it takes that window as its copy
+/// ([`window_over`]); `VICTORY_SHARED_WINDOWS=0` gives it a copy of its
+/// own, as before.
+fn shared_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHARED_WINDOWS").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: title buffers that took a window as their copy.
+static SHARED: AtomicU64 = AtomicU64::new(0);
+
+/// The window outside buffers that holds all of title buffer `[start,
+/// end)`, if one does ([`shared_windows`]): the longest, as [`holder`]
+/// picks for an ask. Grand Theft Auto VI binds root views into memory of
+/// its own allocator, where it also places small buffers (some bytes to a
+/// few KiB) that compute shaders write; each had a copy of its own beside
+/// the window of the root view, and the two copies of the same bytes
+/// agreed only once the shaders' writes were back in title memory. With
+/// submissions sent ahead that is late: a later submission's refresh of
+/// the window found nothing written there and kept older bytes, and was
+/// held back until the writing flights had landed (`crate::host`'s
+/// `blocked_by`, 1.7 times a frame in run fx43-defaults; every case such a
+/// window over such buffers). One copy has no such gap, also within a
+/// submission without late waits.
+/// shortcut: only for a window made before the buffer's copy; a window made
+/// later over buffers with copies of their own stays beside them.
+fn window_over(start: u64, end: u64) -> Option<Arc<Shadow>> {
+    if !shared_windows() {
+        return None;
+    }
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let there = map.range(..=(start, u64::MAX)).rev().take(16).map(|(key, _)| *key);
+    let key = holder(there, start, end)?;
+    let window = map.get(&key)?.clone();
+    let n = SHARED.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n.is_power_of_two() {
+        tracing::info!(
+            buffer = format_args!("{start:#x}+{:#x}", end - start),
+            window = format_args!("{:#x}+{:#x}", key.0, key.1),
+            shared = n + 1,
+            "a title buffer takes the window outside buffers that holds it as its copy"
+        );
+    }
+    Some(window)
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
