@@ -114,6 +114,20 @@ enum Command {
         /// first run's into this folder.
         #[arg(long)]
         diffs: Option<PathBuf>,
+        /// Change a static sampler of the root signature the programs are
+        /// made with: `s<register>.<field>=<value>`, fields filter, u, v, w,
+        /// func, border, aniso, bias, minlod, maxlod (repeatable).
+        #[arg(long = "sampler")]
+        samplers: Vec<String>,
+        /// Compare with another replay's outputs instead of the capture's:
+        /// the prefix of its `--diffs` files, e.g. `<dir>/program-0`.
+        #[arg(long)]
+        expect: Option<PathBuf>,
+        /// Load each program from this pipeline library of a run
+        /// (`host-pipelines.bin`) when it is there under its name: the
+        /// driver's binary that run used. Compiled otherwise.
+        #[arg(long)]
+        library: Option<PathBuf>,
         /// Dispatch the groups this many at a time in x, each part from its
         /// first group (other co-scheduling of groups and waves; the same
         /// results for code without races).
@@ -220,6 +234,9 @@ fn main() -> Result<()> {
             retranslate,
             show,
             diffs,
+            samplers,
+            expect,
+            library,
             split,
             sensitivity,
             background,
@@ -231,6 +248,9 @@ fn main() -> Result<()> {
                 retranslate,
                 show,
                 diffs,
+                samplers,
+                expect,
+                library,
                 split,
                 sensitivity,
                 background,
@@ -260,6 +280,9 @@ struct Options {
     retranslate: bool,
     show: usize,
     diffs: Option<PathBuf>,
+    samplers: Vec<String>,
+    expect: Option<PathBuf>,
+    library: Option<PathBuf>,
     split: u32,
     sensitivity: bool,
     background: bool,

@@ -459,9 +459,21 @@ pub struct Options {
     /// Differing positions shown per resource.
     pub show: usize,
     /// Where to write a picture of the texels of each texture output that
-    /// differ from the first run's (white), and each program's first
-    /// outputs (packed rows), if anywhere.
+    /// differ from the first run's (white), each program's first outputs
+    /// (packed rows) and its driver blob (`program-<n>.pso`), if anywhere.
     pub diffs: Option<PathBuf>,
+    /// Static sampler changes, `s<register>.<field>=<value>` (fields:
+    /// filter, u, v, w, func, border, aniso, bias, minlod, maxlod): the
+    /// programs are made with the root signature so changed.
+    pub samplers: Vec<String>,
+    /// Compare with these outputs instead of the capture's: the prefix of
+    /// another replay's `program-<n>-r<id>.bin` files (`diffs`), such as
+    /// `<dir>/program-0`.
+    pub expect: Option<PathBuf>,
+    /// A run's pipeline library (`host-pipelines.bin`): each program is
+    /// loaded from it if it is there under its name, so it runs the driver's
+    /// binary that run ran, else compiled.
+    pub library: Option<PathBuf>,
     /// Dispatches the groups this many at a time in x (0: as captured), each
     /// part from its first group: other co-scheduling of groups and waves,
     /// the same results for code without races.
@@ -891,9 +903,32 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
 
     let mut gpu = Gpu::new()?;
     let device = gpu.device.clone();
+    let root_blob = read("root-signature.bin")?;
+    // The root signature the programs are made with: the captured one, or
+    // with static samplers changed (`samplers`; the library name stays the
+    // captured one's, so a library that serves its entry anyway shows).
+    let made_root = if o.samplers.is_empty() {
+        root_blob.clone()
+    } else {
+        let patched = patch_samplers(&root_blob, &o.samplers)?;
+        println!("static samplers changed: {}", o.samplers.join(", "));
+        patched
+    };
+    // `library`: a run's pipeline library, kept with its bytes.
+    let library: Option<(ID3D12PipelineLibrary, Vec<u8>)> = match &o.library {
+        Some(path) => {
+            let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            let device1: ID3D12Device1 = device.cast()?;
+            // SAFETY: the bytes are kept beside the library.
+            let library = unsafe { device1.CreatePipelineLibrary::<ID3D12PipelineLibrary>(&bytes) }
+                .context("the pipeline library is refused (another driver or adapter?)")?;
+            Some((library, bytes))
+        }
+        None => None,
+    };
     // SAFETY: the blob a root signature was serialized to.
     let root: ID3D12RootSignature =
-        unsafe { device.CreateRootSignature(0, &read("root-signature.bin")?) }
+        unsafe { device.CreateRootSignature(0, &made_root) }
             .context("root signature")?;
 
     // The resources, with what they held before the dispatch.
@@ -989,7 +1024,16 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
         } else {
             None
         };
-        let after = file("after")?;
+        // What to compare with: the capture's, or `expect`'s outputs of
+        // another replay (`program-<n>-r<id>.bin`, `--diffs`).
+        let after = match &o.expect {
+            Some(path) => std::fs::read(path.with_file_name(format!(
+                "{}-r{id}.bin",
+                path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())
+            )))
+            .ok(),
+            None => file("after")?,
+        };
         let what = if texture {
             format!(
                 "r{id} texture {}x{}x{} f{}",
@@ -1224,7 +1268,7 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
     let mut cached: Option<Vec<u8>> = None;
     let mut first_pso: Option<ID3D12PipelineState> = None;
     let mut summary = Summary::default();
-    for (name, dxil) in &programs {
+    for (number, (name, dxil)) in programs.iter().enumerate() {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -1234,9 +1278,32 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
             },
             ..Default::default()
         };
-        // SAFETY: the description points at live data.
-        let pso: ID3D12PipelineState = unsafe { device.CreateComputePipelineState(&desc) }
-            .with_context(|| format!("pipeline of {name}"))?;
+        // From a run's pipeline library if asked and there (the driver's
+        // binary that run used), else compiled.
+        let stored = library.as_ref().and_then(|library| {
+            let named = crate::pipeline::library::name("compute", &root_blob, &[dxil], "");
+            let wide = windows::core::HSTRING::from(named.as_str());
+            // SAFETY: the description points at live data; the library's
+            // bytes outlive it.
+            let loaded: windows::core::Result<ID3D12PipelineState> =
+                unsafe { library.0.LoadComputePipeline(windows::core::PCWSTR(wide.as_ptr()), &desc) };
+            match loaded {
+                Ok(pso) => {
+                    println!("program {name}: the library's pipeline {named}");
+                    Some(pso)
+                }
+                Err(e) => {
+                    println!("program {name}: not in the library as {named} ({e}): compiled");
+                    None
+                }
+            }
+        });
+        let pso: ID3D12PipelineState = match stored {
+            Some(pso) => pso,
+            // SAFETY: the description points at live data.
+            None => unsafe { device.CreateComputePipelineState(&desc) }
+                .with_context(|| format!("pipeline of {name}"))?,
+        };
         first_pso.get_or_insert_with(|| pso.clone());
         // What the driver made of it: its cached blob, against the first's.
         // SAFETY: a live pipeline; the blob is read in full before release.
@@ -1259,6 +1326,10 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
                 )
             }
         };
+        // The driver's blob beside the pictures, to compare binaries.
+        if let Some(dir) = &o.diffs {
+            std::fs::write(dir.join(format!("program-{number}.pso")), &blob)?;
+        }
         if cached.is_none() {
             cached = Some(blob);
         }
@@ -1283,7 +1354,7 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
             // The first run's outputs beside the pictures, as packed rows.
             if let Some(dir) = o.diffs.as_ref().filter(|_| run == 0) {
                 for (m, out) in made.iter().filter(|m| m.written).zip(&outputs) {
-                    let name = format!("{label} r{}.bin", m.id).replace(' ', "-");
+                    let name = format!("program-{number}-r{}.bin", m.id);
                     std::fs::write(dir.join(name), out)?;
                 }
             }
@@ -1311,8 +1382,7 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
                         .filter(|(_, (a, b))| a != b)
                         .map(|(m, (a, b))| {
                             let mask = o.diffs.as_ref().map(|dir| {
-                                let name = format!("{label} vs {first} r{}.png", m.id);
-                                dir.join(name.replace(' ', "-"))
+                                dir.join(format!("program-{number}-run-{}-r{}.png", run % o.runs.max(1), m.id))
                             });
                             compare(m, a, b, o.show, mask.as_deref())
                         })
@@ -1346,6 +1416,66 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
         summary.unlike_capture
     );
     Ok(summary)
+}
+
+/// The root signature `blob` with its static samplers changed as `patches`
+/// say ([`Options::samplers`]), serialized again.
+fn patch_samplers(blob: &[u8], patches: &[String]) -> Result<Vec<u8>> {
+    // SAFETY: the deserializer reads the blob and owns the description it
+    // returns, alive while it is; the serialized blob is read in full.
+    unsafe {
+        let mut raw = std::ptr::null_mut();
+        D3D12CreateVersionedRootSignatureDeserializer(
+            blob.as_ptr().cast(),
+            blob.len(),
+            &ID3D12VersionedRootSignatureDeserializer::IID,
+            &mut raw,
+        )?;
+        let deserializer = ID3D12VersionedRootSignatureDeserializer::from_raw(raw);
+        let desc = &*deserializer.GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1)?;
+        let d = desc.Anonymous.Desc_1_1;
+        let mut samplers =
+            std::slice::from_raw_parts(d.pStaticSamplers, d.NumStaticSamplers as usize).to_vec();
+        for patch in patches {
+            let parsed = (|| {
+                let (which, value) = patch.split_once('=')?;
+                let (register, field) = which.strip_prefix('s')?.split_once('.')?;
+                let register: u32 = register.parse().ok()?;
+                let number = |v: &str| match v.strip_prefix("0x") {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => v.parse().ok(),
+                };
+                let s = samplers.iter_mut().find(|s| s.ShaderRegister == register)?;
+                match field {
+                    "filter" => s.Filter = D3D12_FILTER(number(value)? as i32),
+                    "u" => s.AddressU = D3D12_TEXTURE_ADDRESS_MODE(number(value)? as i32),
+                    "v" => s.AddressV = D3D12_TEXTURE_ADDRESS_MODE(number(value)? as i32),
+                    "w" => s.AddressW = D3D12_TEXTURE_ADDRESS_MODE(number(value)? as i32),
+                    "func" => s.ComparisonFunc = D3D12_COMPARISON_FUNC(number(value)? as i32),
+                    "border" => s.BorderColor = D3D12_STATIC_BORDER_COLOR(number(value)? as i32),
+                    "aniso" => s.MaxAnisotropy = number(value)?,
+                    "bias" => s.MipLODBias = value.parse().ok()?,
+                    "minlod" => s.MinLOD = value.parse().ok()?,
+                    "maxlod" => s.MaxLOD = value.parse().ok()?,
+                    _ => return None,
+                }
+                Some(())
+            })();
+            if parsed.is_none() {
+                bail!("--sampler {patch}: not s<register>.<filter|u|v|w|func|border|aniso|bias|minlod|maxlod>=<value> of a static sampler");
+            }
+        }
+        let changed = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 { pStaticSamplers: samplers.as_ptr(), ..d },
+            },
+        };
+        let mut out: Option<ID3DBlob> = None;
+        D3D12SerializeVersionedRootSignature(&changed, &mut out, None)?;
+        let out = out.context("no serialized root signature")?;
+        Ok(std::slice::from_raw_parts(out.GetBufferPointer().cast::<u8>(), out.GetBufferSize()).to_vec())
+    }
 }
 
 /// [`Options::sensitivity`]: each input zeroed in turn, and what changes
@@ -1864,6 +1994,9 @@ mod tests {
             retranslate: false,
             show: 2,
             diffs: None,
+            samplers: Vec::new(),
+            expect: None,
+            library: None,
             split: 0,
             sensitivity: false,
             background: false,
