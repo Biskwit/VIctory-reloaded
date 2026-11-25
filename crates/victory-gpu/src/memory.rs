@@ -896,8 +896,13 @@ pub(crate) fn ready(
     let batched = pages() && BATCH.with(|b| b.borrow().is_some());
     for &address in addresses {
         if pages() && address / PAGE >= FAR_FIRST {
-            // Reached through its stand-in range (`root_address`).
+            // Reached through its stand-in range (`root_address`). Named, as
+            // without `pages`: the windows there are the builder's tables,
+            // which it writes anew for every call, and only what a dispatch
+            // names is brought up to date once a list (with more than
+            // `COPIES` numbered); they were brought up to date only when made.
             m.stand_in(address);
+            m.named.push(address);
         } else if batched {
             m.map(address);
         } else {
