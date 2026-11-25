@@ -56,6 +56,8 @@ fn build() -> &'static [u8; 32] {
         bytes.extend_from_slice(&limit.to_le_bytes());
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
+        // So is how fused multiply-adds are made.
+        bytes.push(u8::from(victory_shader::emit::mad_split()));
         // So is how the builder's programs reach their root views.
         bytes.push(u8::from(crate::memory::pages()));
         // And the diagnostics switches a diagnostics build may emit with.

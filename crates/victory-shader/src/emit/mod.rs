@@ -171,6 +171,18 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// Whether the console's fused multiply-adds (`v_fma_f32`, `v_fmac_f32` and
+/// the others lowered to DXIL's FMad, which a driver may fuse or not, so
+/// one compile of a program may round otherwise than another) are
+/// translated as a product rounded and then the sum, which no compile
+/// fuses (`VICTORY_SHADER_FMAD=split`; FMad otherwise). An experiment on
+/// results that depend on the compile; part of the translation, so the
+/// shader cache keys on it (`victory-gpu`'s does).
+pub fn mad_split() -> bool {
+    static SPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SPLIT.get_or_init(|| std::env::var("VICTORY_SHADER_FMAD").is_ok_and(|v| v.trim() == "split"))
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
