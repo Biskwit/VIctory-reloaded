@@ -118,10 +118,23 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
 /// Lowers (and validates, with `dxil.dll`) the wave32 compute program `words`
 /// with the root constants and UAV table of [`build_cs`].
 fn lower_cs(words: &[u32], threads: u32, lds_bytes: u32, vgprs: u16) -> HostShader {
+    let native = cs_native(words, threads, lds_bytes, vgprs, false);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lower_program(&native, &p)
+}
+
+/// The compute program `words` with the root constants and UAV table of [`build_cs`].
+fn cs_native(
+    words: &[u32],
+    threads: u32,
+    lds_bytes: u32,
+    vgprs: u16,
+    wave64: bool,
+) -> NativeProgram {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs,
         layout: vec![
             RootParam {
@@ -156,10 +169,7 @@ fn lower_cs(words: &[u32], threads: u32, lds_bytes: u32, vgprs: u16) -> HostShad
             threads: [threads, 1, 1],
         }),
         code,
-    };
-
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    lower_program(&native, &p)
+    }
 }
 
 /// Lowers the compute program `native`, built as `p`, and validates it.
@@ -1446,10 +1456,11 @@ fn build_lanes_cs(body: &[u32]) -> HostShader {
     lower_cs(&words, 32, 0, 16)
 }
 
-/// Runs a [`build_lanes_cs`] program once on the hardware GPU: the 32 lanes'
-/// dwords (0 where a lane stored nothing). Programs that read lane masks
-/// as numbers declare `WaveSize(32)`, which WARP's pipeline creation refuses.
-fn run_lanes(shader: &HostShader) -> Vec<u32> {
+/// Runs a [`build_lanes_cs`] program (one group of `lanes` threads) once on the
+/// hardware GPU: the lanes' dwords (0 where a lane stored nothing). Programs
+/// that read lane masks as numbers declare `WaveSize(32)`, which WARP's
+/// pipeline creation refuses.
+fn run_lanes(shader: &HostShader, lanes: u32) -> Vec<u32> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let host = Host::new(false).expect("no SM 6.6 hardware device");
     let (root, pso) = host
@@ -1462,7 +1473,7 @@ fn run_lanes(shader: &HostShader) -> Vec<u32> {
             &pso,
             &Dispatch {
                 roots: vec![(0, Root::Constants(ud))],
-                views: &[View::RawUav(32)],
+                views: &[View::RawUav(lanes)],
                 samplers: &[],
                 groups: [1, 1, 1],
             },
@@ -1501,7 +1512,7 @@ fn a_lane_mask_carried_round_a_loop_with_numbers_is_its_number() {
     let shader = build_lanes_cs(&body);
     // Lanes 8k..8k+7 have their bit in iteration k.
     let want: Vec<u32> = (0..32).map(|l| l / 8 + 1).collect();
-    assert_eq!(run_lanes(&shader), want);
+    assert_eq!(run_lanes(&shader, 32), want);
 }
 
 #[test]
@@ -1523,6 +1534,75 @@ fn a_lane_mask_holding_lanes_not_running_is_its_operation() {
         let shader = build_lanes_cs(&body);
         // Lanes out of EXEC store nothing.
         let want: Vec<u32> = (0..32).map(|l| if l < 16 { want } else { 0 }).collect();
-        assert_eq!(run_lanes(&shader), want, "{name}");
+        assert_eq!(run_lanes(&shader, 32), want, "{name}");
     }
+}
+
+// ---- lane branches decided by the console wave ----
+
+#[test]
+fn a_loop_over_the_lanes_of_a_64_lane_wave_runs_whole_on_32_lane_waves() {
+    // The console's wave of 64 lanes is two host waves of 32. A loop over the lanes' keys
+    // (v0 & 3) reads the first lane's key and counts the lanes holding it, across both
+    // halves, in passes that fewer and fewer lanes run on: per lane, the halves cannot meet
+    // there. With every branch decided by the wave (`ir::uniform_branches`) both halves run
+    // every pass, as the console's wave does, and its pass count is the console's too.
+    let Some(_) = hardware_wave().filter(|&lanes| lanes >= 32) else {
+        eprintln!("no hardware adapter with waves of 32 lanes; skipped");
+        return;
+    };
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(&[
+        vop2(0x1A, 7, 0x82, 0),           // v_lshlrev_b32 v7, 2, v0
+        vop2(0x1B, 1, 0x83, 0),           // v_and_b32 v1, 3, v0
+        vop1(0x001, 2, 0x80),             // v_mov_b32 v2, 0
+        s_mov_b32(24, 0x80),              // s24 = 0 (passes)
+        sop1(0x04, 30, EXEC_LO),          // s_mov_b64 s[30:31], exec
+        vop1(0x002, 20, vgpr(1)),         // loop: v_readfirstlane_b32 s20, v1
+        vopc(0xC2, sgpr(20), 1),          // v_cmp_eq_u32 vcc, s20, v1
+        sop1(0x24, 22, VCC_LO),           // s_and_saveexec_b64 s[22:23], vcc
+        sop1(0x10, 21, EXEC_LO),          // s_bcnt1_i32_b64 s21, exec
+        vop1(0x001, 2, sgpr(21)),         // v_mov_b32 v2, s21
+        sop2(0x00, 24, 24, 0x81),         // s_add_u32 s24, s24, 1
+        sop2(0x13, EXEC_LO, 22, EXEC_LO), // s_xor_b64 exec, s[22:23], exec
+        0xBF89_FFF8,                      // s_cbranch_execnz loop
+        sop1(0x04, EXEC_LO, 30),          // s_mov_b64 exec, s[30:31]
+        vop1(0x001, 3, sgpr(24)),         // v_mov_b32 v3, s24
+        vop2(0x1A, 3, 0x88, 3),           // v_lshlrev_b32 v3, 8, v3
+        vop2(0x1C, 0, vgpr(2), 3),        // v_or_b32 v0, v2, v3
+    ]);
+    // buffer_store_dword v0, v7, s[8:11], 0 offen
+    words.extend_from_slice(&[0xE070_1000, 0x80 << 24 | 2 << 16 | 7]);
+    words.push(S_ENDPGM);
+    let native = cs_native(&words, 64, 0, 16, true);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lower::TEST_HOST_WAVE.set(Some(32));
+    // per lane, the loop's exchanges are where not every lane runs
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let per_lane = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .err();
+    let uniform = ir::uniform_branches(&p, true).expect("the loop's branch changes");
+    let shader = lower_program(&native, &uniform);
+    lower::TEST_HOST_WAVE.set(None);
+    assert!(
+        per_lane
+            .as_ref()
+            .is_some_and(|e| e.to_string().contains("where not every lane runs")),
+        "{per_lane:?}"
+    );
+    // Each lane: the 16 lanes of its key, and the 4 passes.
+    assert_eq!(run_lanes(&shader, 64), vec![16 | 4 << 8; 64]);
 }

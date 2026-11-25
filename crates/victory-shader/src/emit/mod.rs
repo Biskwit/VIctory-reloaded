@@ -334,9 +334,36 @@ pub fn emit(
                 }
             }
         }
+        // Every lane branch decided by the console wave (`ir::uniform_branches`), for a
+        // thread group that is one console wave: then every block is one the whole group
+        // runs, and the two host waves meet wherever they exchange. Exact, at the price of
+        // an exchange at each such branch; tried after the forms that need none.
+        let one_wave = matches!(&native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() <= 64);
+        // (Where that does not track, loops keep their branch on lanes: a waterfall
+        // loop's descriptors are per lane.)
+        let uniform = || {
+            let base = ir::without_skips(p).unwrap_or_else(|| p.clone());
+            let (p, st, io, res) = form(ir::uniform_branches(&base, true))
+                .or_else(|| form(ir::uniform_branches(&base, false)))?;
+            let again = emit_program(c, native, &p, &st, &io, &res);
+            report("uniform branches", &again);
+            done(&again).then(|| again.map(|(shader, _)| shader))
+        };
+        if one_wave
+            && !local_on
+            && let Some(r) = uniform()
+        {
+            return r;
+        }
         if local_on {
             // exact first (every form), then approximate
             for exact in [true, false] {
+                if !exact
+                    && one_wave
+                    && let Some(r) = uniform()
+                {
+                    return r;
+                }
                 if !exact && strict {
                     break;
                 }
