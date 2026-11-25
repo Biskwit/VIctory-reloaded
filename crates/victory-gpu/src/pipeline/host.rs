@@ -336,7 +336,7 @@ pub(crate) struct Amplified {
 /// reads the record where the title keeps it, bounds and charges it as the
 /// clamp does, and launches the groups; the draw is `DispatchMesh(1, 1, 1)`.
 pub(crate) fn amplify() -> bool {
-    amplify_takes() != (false, false)
+    !AMPLIFY_DXIL.is_empty() && amplify_takes() != (false, false)
 }
 
 /// Which mesh draws go through the amplified twin: (direct dispatches,
@@ -352,8 +352,9 @@ pub(crate) fn amplify_takes() -> (bool, bool) {
     })
 }
 
-/// The amplification stage's code (`amplify.hlsl`, compiled and signed).
-const AMPLIFY_DXIL: &[u8] = include_bytes!("../amplify.dxil");
+/// The amplification stage's code: `amplify.hlsl`, compiled and signed by
+/// the build script (empty without a compiler, and then no twin is made).
+const AMPLIFY_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/amplify.dxil"));
 
 /// The register space of the amplification stage's parameters.
 const AMPLIFY_SPACE: u32 = 900;
@@ -1066,6 +1067,7 @@ mod tests {
             eprintln!("no PC dxc.exe; skipped");
             return;
         };
+        assert!(!AMPLIFY_DXIL.is_empty(), "the build script compiles the stage where dxc is");
         let dir = tempfile::tempdir().unwrap();
         let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");

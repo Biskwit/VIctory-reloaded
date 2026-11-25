@@ -1,8 +1,8 @@
 // The amplification stage of a title mesh pipeline (`crate::pipeline`):
 // launches the title's mesh groups for a draw, so that an indirect draw of
 // one record needs no pass of ours before it. Compiled with the Windows
-// SDK's compiler into amplify.dxil, which the crate embeds:
-//   dxc -T as_6_5 -E main -Fo amplify.dxil amplify.hlsl
+// SDK's compiler by the crate's build script (build.rs), which embeds the
+// result; nothing compiled is kept in the repository.
 //
 // `direct` nonzero: a direct mesh dispatch of that many groups. Else the
 // record (three group counts) where the title keeps it is bounded as the
