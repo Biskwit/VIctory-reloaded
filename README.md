@@ -203,6 +203,26 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+| `VICTORY_PIX=1` | loads PIX's capturer at the start, for `pix` below |
+| `VICTORY_OVERLAY=1` | starts with the overlay on (see below) |
+| `VICTORY_CONTROL=<file>` | the control file (default `D:\victory-control.txt`) |
+
+### Steering a running game
+
+A diagnostics build looks at the control file at every present; when it
+changes, its commands run once (one a line, `#` for comments) and the file
+is deleted:
+
+| Command | Effect |
+|---------|--------|
+| `overlay on` / `overlay off` | frame times, draws, dispatches, drops, shader cache, pipelines, VRAM and live switches drawn over the frame |
+| `view <n> [r\|g\|b\|a\|rgb]` / `view <0xaddress> [...]` / `view off` | presents the frame's `n`-th target (first-use order, as `dump` numbers them) or a texture by address instead of the frame; floats and depth normalized as dumps are |
+| `targets` | logs the next frame's targets: number, address, size, format |
+| `shot [name]` | saves what the window shows (without the overlay) as `<name>.png` in `VICTORY_CAPTURE`, else beside the control file |
+| `dump` | saves the next frame's targets, as `VICTORY_DUMP_TARGETS` does |
+| `pix <file.wpix>` | PIX captures the next frame (needs `VICTORY_PIX=1`) |
+| `set NAME=VALUE` / `unset NAME` | changes a live switch: `VICTORY_WIDE_DISPATCH`, `VICTORY_ALIAS_ONCE`, `VICTORY_HEAP_RECHECK`, `VICTORY_HEAP_SYNC`, `VICTORY_STALE_TEXTURES`, `VICTORY_TEXTURE_GUARD`, `VICTORY_SCISSOR_TEST`, `VICTORY_SKIP_PIPELINES`; other switches are read at the start |
+| `repair textures` / `repair aliases` / `repair heaps` | uploads every title-filled texture again / redoes every alias copy / re-syncs every descriptor heap slot |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
