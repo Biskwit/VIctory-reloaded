@@ -458,6 +458,22 @@ pub struct Options {
     pub retranslate: bool,
     /// Differing positions shown per resource.
     pub show: usize,
+    /// Where to write a picture of the texels of each texture output that
+    /// differ from the first run's (white), and each program's first
+    /// outputs (packed rows), if anywhere.
+    pub diffs: Option<PathBuf>,
+    /// Dispatches the groups this many at a time in x (0: as captured), each
+    /// part from its first group: other co-scheduling of groups and waves,
+    /// the same results for code without races.
+    pub split: u32,
+    /// Zeroes each input in turn and runs the first program once more: which
+    /// outputs change, and how many of their bytes where the first run
+    /// differs from the capture (the inputs that difference comes from).
+    pub sensitivity: bool,
+    /// After the runs of each program, has the driver commit its background
+    /// work (it compiles shaders again after their first use) and runs it
+    /// as many times again.
+    pub background: bool,
 }
 
 /// A resource made again on the replay's device.
@@ -1005,7 +1021,9 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
         .filter_map(|s| s.get("slot").and_then(Json::int))
         .max()
         .unwrap_or(0) as u32;
-    let count = heap_slots.max(highest + 1);
+    // Past the null slot a capped heap keeps at its end, which the shader
+    // reads for any index from there on.
+    let count = heap_slots.max(highest + 1).max(setting("view_heap_limit") as u32 + 1);
     // SAFETY: plain heap creation and descriptor writes into it.
     let heap: ID3D12DescriptorHeap = unsafe {
         device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -1106,6 +1124,16 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
             ]
         })
         .collect();
+    // `split`: the groups in x a few at a time, each part from its first
+    // group (the program adds it to its group number).
+    let groups: Vec<[u32; 4]> = match (o.split, group_base) {
+        (0, _) => groups,
+        (_, None) => bail!("--split needs a program that takes its first group (USER_GROUP_BASE)"),
+        (n, Some(_)) => groups
+            .iter()
+            .flat_map(|g| (0..g[0]).step_by(n as usize).map(move |i| [n.min(g[0] - i), g[1], g[2], g[3] + i]))
+            .collect(),
+    };
     let zeros = gpu.buffer(
         D3D12_HEAP_TYPE_DEFAULT,
         1 << 16,
@@ -1194,6 +1222,7 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
     // Each program, each run.
     let mut reference: Option<(String, Vec<Vec<u8>>)> = None;
     let mut cached: Option<Vec<u8>> = None;
+    let mut first_pso: Option<ID3D12PipelineState> = None;
     let mut summary = Summary::default();
     for (name, dxil) in &programs {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -1208,6 +1237,7 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
         // SAFETY: the description points at live data.
         let pso: ID3D12PipelineState = unsafe { device.CreateComputePipelineState(&desc) }
             .with_context(|| format!("pipeline of {name}"))?;
+        first_pso.get_or_insert_with(|| pso.clone());
         // What the driver made of it: its cached blob, against the first's.
         // SAFETY: a live pipeline; the blob is read in full before release.
         let blob = unsafe { pso.GetCachedBlob() }
@@ -1233,12 +1263,30 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
             cached = Some(blob);
         }
         println!("program {name}: {} bytes of DXIL, {compiled}", dxil.len());
-        for run in 0..o.runs.max(1) {
+        // With `background`, the runs once more after the driver did its
+        // background work on the pipeline (it compiles shaders again later).
+        let passes = if o.background { 2 } else { 1 };
+        for run in 0..o.runs.max(1) * passes {
+            let after = run >= o.runs.max(1);
+            if after && run == o.runs.max(1) {
+                println!("  the driver's background work: {}", background_work(&device));
+            }
             let outputs = run_once(
                 &mut gpu, &made, &heap, &root, &pso, &bind, &groups, group_base,
             )?;
-            let label = format!("{name} run {run}");
+            let label = if after {
+                format!("{name} after the background work run {}", run - o.runs.max(1))
+            } else {
+                format!("{name} run {run}")
+            };
             summary.runs += 1;
+            // The first run's outputs beside the pictures, as packed rows.
+            if let Some(dir) = o.diffs.as_ref().filter(|_| run == 0) {
+                for (m, out) in made.iter().filter(|m| m.written).zip(&outputs) {
+                    let name = format!("{label} r{}.bin", m.id).replace(' ', "-");
+                    std::fs::write(dir.join(name), out)?;
+                }
+            }
             // Against what the run wrote.
             let mut line = Vec::new();
             let mut unlike = false;
@@ -1246,7 +1294,7 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
                 match &m.after {
                     Some(after) => {
                         unlike |= after != out;
-                        line.push(compare(m, after, out, o.show));
+                        line.push(compare(m, after, out, o.show, None));
                     }
                     None => line.push(format!("{}: no capture to compare", m.what)),
                 }
@@ -1261,7 +1309,13 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
                         .filter(|m| m.written)
                         .zip(theirs.iter().zip(&outputs))
                         .filter(|(_, (a, b))| a != b)
-                        .map(|(m, (a, b))| compare(m, a, b, o.show))
+                        .map(|(m, (a, b))| {
+                            let mask = o.diffs.as_ref().map(|dir| {
+                                let name = format!("{label} vs {first} r{}.png", m.id);
+                                dir.join(name.replace(' ', "-"))
+                            });
+                            compare(m, a, b, o.show, mask.as_deref())
+                        })
                         .collect();
                     if diffs.is_empty() {
                         println!("  {label} vs {first}: the same");
@@ -1272,6 +1326,9 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
                 }
             }
         }
+    }
+    if o.sensitivity {
+        sensitivity(&mut gpu, &made, &heap, &root, first_pso.as_ref(), &bind, &groups, group_base, reference.as_ref().map(|r| &r.1))?;
     }
     let total = summary.runs;
     if total > 1 {
@@ -1289,6 +1346,100 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
         summary.unlike_capture
     );
     Ok(summary)
+}
+
+/// [`Options::sensitivity`]: each input zeroed in turn, and what changes
+/// against `reference` (the first run's outputs).
+#[allow(clippy::too_many_arguments)]
+fn sensitivity(
+    gpu: &mut Gpu,
+    made: &[Made],
+    heap: &ID3D12DescriptorHeap,
+    root: &ID3D12RootSignature,
+    pso: Option<&ID3D12PipelineState>,
+    bind: &dyn Fn(&ID3D12GraphicsCommandList) -> Result<()>,
+    groups: &[[u32; 4]],
+    group_base: Option<(u32, u32)>,
+    reference: Option<&Vec<Vec<u8>>>,
+) -> Result<()> {
+    let (Some(pso), Some(reference)) = (pso, reference) else {
+        return Ok(());
+    };
+    let written: Vec<&Made> = made.iter().filter(|m| m.written).collect();
+    println!("inputs zeroed one at a time (bytes of each output that change; of them, where the first run differs from the capture):");
+    for m in made.iter().filter(|m| !m.written) {
+        let Some(upload) = &m.upload else { continue };
+        let len = m.layout.total as usize;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: an upload buffer of `len` bytes; its bytes are put back
+        // after the run.
+        let kept = unsafe {
+            upload.Map(0, None, Some(&mut data))?;
+            let bytes = std::slice::from_raw_parts_mut(data.cast::<u8>(), len);
+            let kept = bytes.to_vec();
+            bytes.fill(0);
+            upload.Unmap(0, None);
+            kept
+        };
+        let outputs = run_once(gpu, made, heap, root, pso, bind, groups, group_base);
+        // SAFETY: as above.
+        unsafe {
+            upload.Map(0, None, Some(&mut data))?;
+            std::slice::from_raw_parts_mut(data.cast::<u8>(), len).copy_from_slice(&kept);
+            upload.Unmap(0, None);
+        }
+        let outputs = outputs?;
+        let mut line = Vec::new();
+        for ((w, out), first) in written.iter().zip(&outputs).zip(reference) {
+            let n = out.len().min(first.len());
+            let changed: Vec<usize> = (0..n).filter(|&i| out[i] != first[i]).collect();
+            if changed.is_empty() {
+                continue;
+            }
+            let unlike = w.after.as_ref().map_or(0, |after| {
+                changed.iter().filter(|&&i| after.get(i).is_some_and(|a| *a != first[i])).count()
+            });
+            line.push(format!("r{} {} ({unlike})", w.id, changed.len()));
+        }
+        if !line.is_empty() {
+            println!("  {}: {}", m.what, line.join(", "));
+        }
+    }
+    Ok(())
+}
+
+/// Asks the driver to commit its background work now (the shaders it
+/// compiles again from what it measured) and waits for it: what it says.
+fn background_work(device: &ID3D12Device) -> String {
+    let Ok(device) = device.cast::<ID3D12Device6>() else {
+        return "no ID3D12Device6".into();
+    };
+    // SAFETY: an event of ours, waited for and closed; a live device.
+    unsafe {
+        let Ok(event) = windows::Win32::System::Threading::CreateEventW(None, false, false, None) else {
+            return "no event".into();
+        };
+        let mut further = windows::core::BOOL::default();
+        let asked = device.SetBackgroundProcessingMode(
+            D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+            D3D12_MEASUREMENTS_ACTION_COMMIT_RESULTS_HIGH_PRIORITY,
+            Some(event),
+            Some(&mut further),
+        );
+        let text = match asked {
+            Ok(()) => {
+                let waited = windows::Win32::System::Threading::WaitForSingleObject(event, 60_000);
+                format!(
+                    "committed ({}; further measurements wanted: {})",
+                    if waited.0 == 0 { "done" } else { "not done in 60 s" },
+                    further.as_bool()
+                )
+            }
+            Err(e) => format!("refused: {e}"),
+        };
+        let _ = windows::Win32::Foundation::CloseHandle(event);
+        text
+    }
 }
 
 /// One run: the inputs as captured, the dispatch, the outputs read back
@@ -1468,7 +1619,7 @@ fn fill_null(device: &ID3D12Device, cpu: usize, step: u64, count: u32) -> Result
 
 /// How `b` differs from `a` (packed rows of `m`): bytes, and for a texture
 /// texels, with the first `show` places.
-fn compare(m: &Made, a: &[u8], b: &[u8], show: usize) -> String {
+fn compare(m: &Made, a: &[u8], b: &[u8], show: usize, mask: Option<&Path>) -> String {
     if a == b {
         return format!("{}: the same", m.what);
     }
@@ -1480,6 +1631,13 @@ fn compare(m: &Made, a: &[u8], b: &[u8], show: usize) -> String {
         let mut texels = 0;
         let mut last = None;
         let mut places = Vec::new();
+        // The first subresource's differing texels: where in 16x16 tiles
+        // (a group of the tiled passes) they lie, and the picture.
+        let first = m.layout.footprints.first().map(|f| f.Footprint);
+        let (w, h) = first.map_or((0, 0), |f| (f.Width as usize, m.layout.rows[0] as usize));
+        let mut picture = vec![0u8; w * h];
+        let (mut rows, mut columns) = ([0u32; 16], [0u32; 16]);
+        let mut tiles = std::collections::BTreeSet::new();
         for i in (0..n).filter(|&i| a[i] != b[i]) {
             let (sub, x, y, z) = m.layout.place(i);
             if last == Some((sub, x, y, z)) {
@@ -1487,6 +1645,12 @@ fn compare(m: &Made, a: &[u8], b: &[u8], show: usize) -> String {
             }
             last = Some((sub, x, y, z));
             texels += 1;
+            if sub == 0 && z == 0 && (x as usize) < w && (y as usize) < h {
+                picture[y as usize * w + x as usize] = 255;
+                rows[y as usize % 16] += 1;
+                columns[x as usize % 16] += 1;
+                tiles.insert((x / 16, y / 16));
+            }
             if places.len() < show {
                 let fp = m.layout.footprints.get(sub).map(|f| f.Footprint);
                 let size = fp.map_or(4, |f| {
@@ -1502,6 +1666,18 @@ fn compare(m: &Made, a: &[u8], b: &[u8], show: usize) -> String {
             }
         }
         text.push_str(&format!(" ({texels} texels; {})", places.join(", ")));
+        if !tiles.is_empty() {
+            text.push_str(&format!(
+                "; in {} 16x16 tiles, by row in the tile {rows:?}, by column {columns:?}",
+                tiles.len()
+            ));
+        }
+        if let Some(path) = mask {
+            match save_grey(path, w as u32, h as u32, &picture) {
+                Ok(()) => text.push_str(&format!("; picture {}", path.display())),
+                Err(e) => text.push_str(&format!("; picture not written: {e}")),
+            }
+        }
     } else {
         let places: Vec<String> = (0..n)
             .step_by(4)
@@ -1518,6 +1694,42 @@ fn compare(m: &Made, a: &[u8], b: &[u8], show: usize) -> String {
         text.push_str(&format!(" ({})", places.join(", ")));
     }
     text
+}
+
+/// Writes `pixels` (8-bit grey, `w` x `h`) as a PNG file.
+fn save_grey(path: &Path, w: u32, h: u32, pixels: &[u8]) -> std::io::Result<()> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+            }
+        }
+        !crc
+    }
+    let chunk = |png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]| {
+        png.extend((data.len() as u32).to_be_bytes());
+        let start = png.len();
+        png.extend(kind);
+        png.extend(data);
+        let crc = crc32(&png[start..]);
+        png.extend(crc.to_be_bytes());
+    };
+    let mut raw = Vec::with_capacity((w as usize + 1) * h as usize);
+    for row in pixels.chunks(w.max(1) as usize).take(h as usize) {
+        raw.push(0);
+        raw.extend_from_slice(row);
+    }
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut header = Vec::new();
+    header.extend(w.to_be_bytes());
+    header.extend(h.to_be_bytes());
+    header.extend([8, 0, 0, 0, 0]); // 8-bit grey
+    chunk(&mut png, b"IHDR", &header);
+    chunk(&mut png, b"IDAT", &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3));
+    chunk(&mut png, b"IEND", &[]);
+    std::fs::write(path, png)
 }
 
 #[cfg(test)]
@@ -1651,6 +1863,10 @@ mod tests {
             dxil: None,
             retranslate: false,
             show: 2,
+            diffs: None,
+            split: 0,
+            sensitivity: false,
+            background: false,
         };
         std::fs::write(path("r1-after.bin"), &wrote).unwrap();
         match replay_dispatch(dir.path(), &options) {

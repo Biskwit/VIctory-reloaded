@@ -110,6 +110,25 @@ enum Command {
         /// Differing places listed per resource.
         #[arg(long, default_value_t = 4)]
         show: usize,
+        /// Write a picture of where each texture output differs from the
+        /// first run's into this folder.
+        #[arg(long)]
+        diffs: Option<PathBuf>,
+        /// Dispatch the groups this many at a time in x, each part from its
+        /// first group (other co-scheduling of groups and waves; the same
+        /// results for code without races).
+        #[arg(long, default_value_t = 0)]
+        split: u32,
+        /// Zero each input in turn and run the first program again: which
+        /// outputs change, and how much of that where the replay differs
+        /// from the capture.
+        #[arg(long)]
+        sensitivity: bool,
+        /// After each program's runs, have the driver commit its background
+        /// work (it compiles shaders again after their first use) and run
+        /// the program as many times again.
+        #[arg(long)]
+        background: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -200,7 +219,24 @@ fn main() -> Result<()> {
             dxil,
             retranslate,
             show,
-        } => replay_dispatch(&dir, variants, runs, dxil, retranslate, show),
+            diffs,
+            split,
+            sensitivity,
+            background,
+        } => {
+            let options = Options {
+                variants,
+                runs,
+                dxil,
+                retranslate,
+                show,
+                diffs,
+                split,
+                sensitivity,
+                background,
+            };
+            replay_dispatch(&dir, options)
+        }
         Command::Run {
             exe,
             unimplemented,
@@ -213,15 +249,27 @@ fn main() -> Result<()> {
     }
 }
 
+/// What `replay-dispatch` runs (`victory_gpu::replay::Options` on Windows).
 #[cfg(windows)]
-fn replay_dispatch(dir: &std::path::Path, variants: u32, runs: u32, dxil: Option<PathBuf>, retranslate: bool, show: usize) -> Result<()> {
-    let options = victory_gpu::replay::Options {
-        variants,
-        runs,
-        dxil,
-        retranslate,
-        show,
-    };
+use victory_gpu::replay::Options;
+#[cfg(not(windows))]
+struct Options {
+    variants: u32,
+    runs: u32,
+    dxil: Option<PathBuf>,
+    retranslate: bool,
+    show: usize,
+    diffs: Option<PathBuf>,
+    split: u32,
+    sensitivity: bool,
+    background: bool,
+}
+
+#[cfg(windows)]
+fn replay_dispatch(dir: &std::path::Path, options: Options) -> Result<()> {
+    if let Some(diffs) = &options.diffs {
+        std::fs::create_dir_all(diffs)?;
+    }
     // On a thread with room for the translator's recursion (the main
     // thread's stack is the linker's 1 MiB).
     let dir = dir.to_owned();
@@ -233,7 +281,7 @@ fn replay_dispatch(dir: &std::path::Path, variants: u32, runs: u32, dxil: Option
 }
 
 #[cfg(not(windows))]
-fn replay_dispatch(_: &std::path::Path, _: u32, _: u32, _: Option<PathBuf>, _: bool, _: usize) -> Result<()> {
+fn replay_dispatch(_: &std::path::Path, _: Options) -> Result<()> {
     anyhow::bail!("replay-dispatch needs D3D12 (Windows)")
 }
 
