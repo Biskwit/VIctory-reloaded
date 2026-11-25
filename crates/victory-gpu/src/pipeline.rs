@@ -125,6 +125,8 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// A compute program's threads a group along x (0: not one).
+    pub(crate) group: u32,
 }
 
 #[cfg(windows)]
@@ -183,6 +185,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let group = programs
+        .iter()
+        .find_map(|p| match &p.io {
+            victory_shader::native::StageIo::Cs(cs) => Some(cs.threads[0]),
+            _ => None,
+        })
+        .unwrap_or(0);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -193,7 +202,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, group })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder

@@ -154,13 +154,18 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
+    lower_cs(&native, &p)
+}
+
+/// Lowers the compute program `native`, built as `p`, and validates it.
+fn lower_cs(native: &NativeProgram, p: &ir::Program) -> HostShader {
+    let st = structure::structure(p).expect("structure");
     let res =
-        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
+        resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
+        native,
+        p,
         st: &st,
         io: &io,
         res: &res,
@@ -1188,6 +1193,151 @@ fn ds_min_max_f32_are_atomic_across_waves() {
             },
         );
     }
+}
+
+/// A program run with a count of threads (`spill::counts_threads`): groups
+/// of `group` threads along x, waves of 64 lanes or of 32, its one
+/// parameter (the table of the raw UAV) in a spilled user-data table whose
+/// address is in `s0:s1`, the group id in `s4`. Each thread stores the
+/// number of lanes its wave started with (`s_bcnt1 exec`) at four times its
+/// index in the dispatch.
+fn build_counted_cs(group: u32, wave64: bool) -> HostShader {
+    // s_and_b32 s3, s1, 0xff; s_mov_b32 s2, s0; s_load_dword s6, s[2:3], 0
+    let mut words = vec![0x8703_FF01, 0x0000_00FF, s_mov_b32(2, 0), 0xF400_0001 | 6 << 6, 0xFA00_0000];
+    words.push(s_mov_b32(7, 0x80));
+    words.extend_from_slice(&s_load_dwordx4(8, 6));
+    // s_bcnt1_i32_b64 (or _b32) s12, exec; v_mov_b32 v1, s12
+    words.push(0xBE80_0000 | 12 << 16 | if wave64 { 0x10 } else { 0x0F } << 8 | 0x7E);
+    words.push(vop1(0x001, 1, sgpr(12)));
+    // s_lshl_b32 s13, s4, log2(group); v_add_nc_u32 v2, s13, v0; v_lshlrev_b32 v2, 2, v2
+    words.push(sop2(0x1E, 13, 4, 0x80 + group.trailing_zeros() as u8));
+    words.push(vop2(0x25, 2, sgpr(13), 0));
+    words.push(vop2(0x1A, 2, 0x82, 2));
+    // buffer_store_dword v1, v2, s[8:11], 0 offen
+    words.extend_from_slice(&[0x38 << 26 | 0x1C << 18 | 1 << 12, 0x80 << 24 | 2 << 16 | 1 << 8 | 2]);
+    words.push(S_ENDPGM);
+    let param = |root, sgprs, user_data, slot| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: 8,
+        layout: vec![param(RootType::Table, 1, 16, 1)],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 16,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: (4 << 1) | 1 << 7, // 4 user SGPRs, then the group id x
+            threads: [group, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    assert!(crate::spill::counts_threads(&native));
+    let p = crate::spill::build(&native).expect("spill::build");
+    lower_cs(&native, &p)
+}
+
+/// The hardware adapter's widest wave, if there is an adapter.
+fn hardware_wave() -> Option<u32> {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+    let host = Host::new(false).ok()?;
+    let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a feature query into a structure of its size.
+    unsafe {
+        host.device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
+            .ok()?;
+    }
+    Some(o1.WaveLaneCountMax)
+}
+
+/// Dispatches `shader` ([`build_counted_cs`]) on the hardware adapter for
+/// `threads` threads in groups of `group` (`None`: `groups` whole groups)
+/// and checks what every thread of those groups stored.
+fn check_counted(shader: &HostShader, group: u32, threads: Option<u32>, groups: u32) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("a hardware adapter");
+    let (root, pso) = host.compute_pipeline(shader).expect("compute_pipeline");
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let mut asked = false;
+    for u in &shader.user_data {
+        if u.root == RootType::Other(super::USER_THREADS) {
+            ud[u.index as usize] = threads.unwrap_or(u32::MAX);
+            asked = true;
+        }
+    }
+    assert!(asked, "the program does not ask for the thread count");
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(groups * group)],
+                samplers: &[],
+                groups: [groups, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    let started = threads.unwrap_or(groups * group);
+    for (thread, &got) in out[0].iter().enumerate() {
+        let thread = thread as u32;
+        // A thread that was started stores the lanes its wave started
+        // with: the group's threads, or what is left of the count.
+        let want = if thread < started { group.min(started - thread / group * group) } else { 0 };
+        assert_eq!(got, want, "thread {thread} of {threads:?} in groups of {group}");
+    }
+}
+
+#[test]
+fn a_count_of_threads_starts_the_last_group_in_part() {
+    // The console's dispatch flag that makes the counts threads: the last
+    // wave starts with the lanes of the threads left. Waves of 32 lanes, as
+    // the hardware adapter's are or can be made (WARP's are 4).
+    if hardware_wave().is_none_or(|lanes| lanes < 32) {
+        eprintln!("no hardware adapter with waves of 32 lanes; skipped");
+        return;
+    }
+    let shader = build_counted_cs(32, false);
+    for threads in [1, 20, 32, 37, 64] {
+        check_counted(&shader, 32, Some(threads), threads.div_ceil(32));
+    }
+    // A dispatch of whole groups starts every thread.
+    check_counted(&shader, 32, None, 2);
+}
+
+#[test]
+fn a_count_of_threads_starts_part_of_a_wave_of_64_lanes() {
+    // As above for the builder's programs of 64-lane waves. Where the
+    // adapter's waves are 32 lanes the console's wave is two host waves,
+    // and its count of lanes is both halves': 20 threads are 20 lanes of
+    // the lower half and none of the upper.
+    let Some(lanes) = hardware_wave().filter(|&lanes| lanes >= 32) else {
+        eprintln!("no hardware adapter with waves of 32 lanes; skipped");
+        return;
+    };
+    lower::TEST_HOST_WAVE.set((lanes == 32).then_some(32));
+    let shader = build_counted_cs(64, true);
+    lower::TEST_HOST_WAVE.set(None);
+    for threads in [1, 20, 32, 33, 64, 70, 128] {
+        check_counted(&shader, 64, Some(threads), threads.div_ceil(64));
+    }
+    check_counted(&shader, 64, None, 2);
 }
 
 #[test]

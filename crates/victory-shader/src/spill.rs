@@ -27,9 +27,36 @@ const FIRST: u32 = 16;
 /// [`ir::build`] of `native`'s code as the hardware runs it, with the loads
 /// of a spilled user-data table rewritten ([`user_data`]).
 pub fn build(native: &NativeProgram) -> Result<Program, ShaderError> {
-    let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let mut code = native.patched_code();
+    if counts_threads(native) {
+        // `v_cmpx_gt_u32 exec, s<LAUNCHED>, v0`
+        let started = 0x7DA8_0000 | u32::from(LAUNCHED);
+        code.splice(0..0, started.to_le_bytes());
+    }
+    let mut p = ir::build(&code, native.wave64, native.vgprs)?;
     user_data(&mut p, native);
     Ok(p)
+}
+
+/// The SGPR that holds how many of the group's threads a dispatch started
+/// (`io::Input::Launched`): above every register the hardware sets.
+pub const LAUNCHED: u8 = 100;
+
+/// Whether `native` is run with a count of threads: the structure builder
+/// dispatches its programs with `DispatchX`, whose flags can make the
+/// counts threads, not thread groups (a level of 20 nodes is 20 threads of
+/// a program of 64 a group). The hardware then starts the last wave with
+/// only the lanes of the threads left in EXEC, and the programs count on
+/// it: they place a wave's data after `s_bcnt1_i32_b64 exec` entries. On
+/// the host every thread of a group starts, so the code gets one compare in
+/// front that leaves EXEC to the threads the dispatch started. Programs
+/// with a spilled user-data table (the builder's) whose groups have one
+/// dimension.
+pub fn counts_threads(native: &NativeProgram) -> bool {
+    let StageIo::Cs(cs) = &native.io else {
+        return false;
+    };
+    cs.threads[1] == 1 && cs.threads[2] == 1 && spilled(native).is_some()
 }
 
 /// Whether `native` is a compute program that keeps its root parameters in
@@ -346,6 +373,29 @@ mod tests {
         let mut regs: Vec<Reg> = p.inputs.iter().map(|i| i.0).collect();
         regs.sort();
         assert_eq!(regs, [Reg::S(16), Reg::S(17), Reg::S(20)]);
+    }
+
+    #[test]
+    fn a_spilled_program_starts_with_the_threads_the_dispatch_started() {
+        let layout = || vec![param(RootType::Descriptor, 16, 2, 0), param(RootType::Constants, 20, 16, 2)];
+        let n = native(&TABLE, 4, layout());
+        assert!(counts_threads(&n));
+        // `v_cmpx_gt_u32 exec, s<LAUNCHED>, v0` in front of the title's code.
+        let p = build(&n).unwrap();
+        let first = &p.blocks[0].insts[0];
+        assert_eq!(first.name(), "v_cmpx_gt_u32");
+        assert!(first.read(Reg::S(LAUNCHED)).is_some() && first.read(Reg::V(0)).is_some());
+        // Not groups of two dimensions, nor programs with their parameters
+        // in registers.
+        let mut flat = native(&TABLE, 4, layout());
+        flat.io = StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1 | 1 << 7,
+            threads: [8, 8, 1],
+        });
+        assert!(!counts_threads(&flat));
+        let registers = native(&TABLE, 4, vec![param(RootType::Constants, 0, 4, 0)]);
+        assert!(!counts_threads(&registers));
+        assert_ne!(build(&registers).unwrap().blocks[0].insts[0].name(), "v_cmpx_gt_u32");
     }
 
     #[test]

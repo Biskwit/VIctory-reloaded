@@ -986,7 +986,17 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's host wave size, in place of [`HOST_MAX_WAVE`], which the test threads share.
+    pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 pub(super) fn host_max_wave() -> u32 {
+    #[cfg(test)]
+    if let Some(lanes) = TEST_HOST_WAVE.get() {
+        return lanes;
+    }
     HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -2064,6 +2074,22 @@ impl<'a> Lower<'a> {
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::Launched => {
+                // The dispatch's threads less those of the groups before
+                // this one (never below 1: the host starts no group past
+                // the count).
+                let StageIo::Cs(cs) = self.x.native.io else {
+                    unreachable!()
+                };
+                let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let threads = self.host_word(RootType::Other(super::shader::USER_THREADS), 0, 0);
+                let entry = self.s.entry;
+                let size = self.s.m.i32(cs.threads[0]);
+                let before = self.s.m.bin(entry, Bin::Mul, group, size);
+                return Val::I32(self.s.m.bin(entry, Bin::Sub, threads, before));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
