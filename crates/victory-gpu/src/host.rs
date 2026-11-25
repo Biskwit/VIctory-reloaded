@@ -536,6 +536,8 @@ fn create() -> windows::core::Result<Host> {
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::pix::before_device();
         let mut device: Option<ID3D12Device> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
