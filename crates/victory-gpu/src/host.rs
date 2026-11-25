@@ -1829,11 +1829,12 @@ pub(crate) fn relay() -> bool {
 
 /// The relay's second stage (`VICTORY_RELAY=2` or unset): a submission that reads
 /// title memory a flight's shaders may write (a title buffer copy, a fill
-/// of upload memory, a texture, a refresh of another copy of it), or that
-/// copies into memory a flight reads, waits only until the flights that
-/// declared that memory have landed, not for everything in the air; and at
-/// [`late_most`] lists in the air it waits until there are fewer. At `1`
-/// both wait for everything.
+/// of upload memory, a texture, a refresh of another copy of it) waits only
+/// until the flights that declared that memory have landed, not for
+/// everything in the air; and at [`late_most`] lists in the air it waits
+/// until there are fewer. At `1` both wait for everything. (A title copy
+/// into memory a flight reads waits for the card alone at any stage:
+/// `Host::card_wait`.)
 ///
 /// In run late-13 it gained nothing over `1` (late-12: 207 ms a frame
 /// both; 87 and 93 ms of waits): landing a flight takes a fetch of what
@@ -2019,10 +2020,11 @@ struct Line {
     /// order and joined.
     written: Vec<(usize, usize)>,
     /// `written` per host copy, each in order and joined.
-    copies: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
-    /// The title memory the flights read on the card ([`card_reads`]), in
-    /// order and joined.
-    read: Vec<(usize, usize)>,
+    copies: Vec<Writer>,
+    /// The title memory each flight reads on the card ([`card_reads`]), in
+    /// order and joined, with the value signalled on the host's fence
+    /// behind it: once the card is past that, it reads none of it.
+    read: Vec<(u64, Vec<(usize, usize)>)>,
     /// The title memory the flights' read-backs go to, in order and joined.
     landing: Vec<(usize, usize)>,
     /// The title memory their bottom-of-pipe writes go to, in order and
@@ -2066,7 +2068,9 @@ impl Line {
             };
             join_ranges(&mut self.copies[at].1, ranges.iter().copied());
         }
-        join_ranges(&mut self.read, flight.reads.iter().copied());
+        let mut reads = Vec::new();
+        join_ranges(&mut reads, flight.reads.iter().copied());
+        self.read.push((flight.fence, reads));
         join_ranges(&mut self.landing, flight.lands.iter().copied());
     }
 
@@ -2101,12 +2105,14 @@ impl Line {
         join_ranges(&mut self.told, in_hand);
     }
 
-    /// What [`blocked_by`] looks at.
-    fn air(&self) -> Air<'_> {
+    /// What [`blocked_by`] looks at, with the card past `done` on the
+    /// host's fence.
+    fn air(&self, done: u64) -> Air<'_> {
         Air {
             written: &self.written,
             copies: &self.copies,
             read: &self.read,
+            done,
             landing: &self.landing,
             told: &self.told,
         }
@@ -2115,10 +2121,16 @@ impl Line {
 
 /// What flights in the air may write and read ([`Line`]'s), for
 /// [`blocked_by`].
+/// A host copy flights write through, and the ranges they declared (in
+/// order, joined).
+type Writer = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+
 struct Air<'a> {
     written: &'a [(usize, usize)],
-    copies: &'a [(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
-    read: &'a [(usize, usize)],
+    copies: &'a [Writer],
+    read: &'a [(u64, Vec<(usize, usize)>)],
+    /// The value the card is past on the host's fence.
+    done: u64,
     landing: &'a [(usize, usize)],
     told: &'a [(usize, usize)],
 }
@@ -2236,6 +2248,7 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         written: &written,
         copies: &copies,
         read: &read,
+        done: card_done(),
         landing: &landing,
         told: &told,
     };
@@ -2279,7 +2292,17 @@ fn blocked_by(air: &Air, runs: &[&HostList], count: bool) -> Option<usize> {
         found[kind] = true;
         if on & (1 << kind) != 0 && why.is_none() {
             why = Some(settles);
+            if count {
+                // In `BLOCKED_KIND`'s order.
+                BLOCKED_KIND.store([3, 4, 5, 6][kind], Ordering::Relaxed);
+            }
         }
+    };
+    let blocked = |kind: usize, why: usize| {
+        if count {
+            BLOCKED_KIND.store(kind, Ordering::Relaxed);
+        }
+        Some(why)
     };
     let landed = |from: usize, to: usize| (touches(air.landing, from, to), touches(air.told, from, to));
     for list in runs {
@@ -2290,14 +2313,14 @@ fn blocked_by(air: &Air, runs: &[&HostList], count: bool) -> Option<usize> {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                         }
-                        return Some(WHY_READ);
+                        return blocked(0, WHY_READ);
                     }
-                    if touches(air.read, dst, dst + len) {
+                    if let Some(reads) = read_by(air, dst, dst + len) {
                         static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                         let n = SEEN.fetch_add(u64::from(count), Ordering::Relaxed);
                         if count && (n < 16 || n % 1024 == 0) {
-                            let at = air.read.partition_point(|r| r.1 <= dst);
-                            let read = air.read.get(at).map(|r| format!("{:#x}..{:#x}", r.0, r.1));
+                            let at = reads.partition_point(|r| r.1 <= dst);
+                            let read = reads.get(at).map(|r| format!("{:#x}..{:#x}", r.0, r.1));
                             tracing::info!(
                                 found = n + 1,
                                 "a title copy into {dst:#x}+{len:#x} (from {src:#x}) is to be done while flights read {} on the card",
@@ -2319,8 +2342,9 @@ fn blocked_by(air: &Air, runs: &[&HostList], count: bool) -> Option<usize> {
                     if touches(air.written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            fill_seen(src, len, air.copies);
                         }
-                        return Some(WHY_READ);
+                        return blocked(1, WHY_READ);
                     }
                     (src, src + len)
                 }
@@ -2330,7 +2354,7 @@ fn blocked_by(air: &Air, runs: &[&HostList], count: bool) -> Option<usize> {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
                         }
-                        return Some(WHY_READ);
+                        return blocked(2, WHY_READ);
                     }
                     (at, at + len)
                 }
@@ -2345,7 +2369,7 @@ fn blocked_by(air: &Air, runs: &[&HostList], count: bool) -> Option<usize> {
                     }
                     (from, to)
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::Run(_) => return blocked(7, WHY_RUN),
                 Step::GpuWrite(..) | Step::Host(_) => continue,
             };
             let (a, b) = landed(from, to);
@@ -2360,6 +2384,56 @@ fn blocked_by(air: &Air, runs: &[&HostList], count: bool) -> Option<usize> {
     why
 }
 
+/// What [`blocked_by`] last found that holds a submission back (counted
+/// calls only): 0 a title buffer copy, 1 a fill of upload memory, 2 a
+/// texture, of memory flights' shaders write; 3 a refresh of another copy
+/// of such memory; 4 a read of a read-back's memory, 5 of a bottom-of-pipe
+/// write's; 6 a title copy into memory flights read; 7 a step of ours.
+static BLOCKED_KIND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Since the last frame-rate line: the microseconds submissions were held
+/// back before preparing, by [`BLOCKED_KIND`].
+static KIND_WAITED: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Adds the microseconds since its start to its counter when dropped.
+struct Charge<'a>(&'a std::sync::atomic::AtomicU64, std::time::Instant);
+
+impl Drop for Charge<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Logs (the first 16 times, then every 1024th) a fill of upload memory
+/// from `[src, src + len)`, which flights' shaders write: through which
+/// copies, and where.
+fn fill_seen(src: usize, len: usize, copies: &[Writer]) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    if n >= 16 && n % 1024 != 0 {
+        return;
+    }
+    let writers: Vec<String> = copies
+        .iter()
+        .filter_map(|(s, ranges)| {
+            let hit: Vec<String> = ranges
+                .iter()
+                .filter(|r| r.0 < src + len && r.1 > src)
+                .map(|r| format!("{:#x}..{:#x}", r.0, r.1))
+                .collect();
+            let (start, bytes) = s.span();
+            (!hit.is_empty()).then(|| {
+                format!("{} {start:#x}+{bytes:#x} writes {}", if s.is_window() { "window" } else { "buffer" }, hit.join(", "))
+            })
+        })
+        .collect();
+    tracing::info!(
+        found = n + 1,
+        "a fill of upload memory from {src:#x}+{len:#x} reads what flights' shaders write: {}",
+        writers.join("; ")
+    );
+}
+
 /// Logs (the first 16 times, then every 1024th) a refresh of `[from, to)`
 /// of `shadow` over memory that flights write through other copies of it
 /// (`copies`, as [`Line`] holds them): which copies those are, and where.
@@ -2367,7 +2441,7 @@ fn beside_seen(
     shadow: &std::sync::Arc<crate::shadow::Shadow>,
     from: usize,
     to: usize,
-    copies: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
+    copies: &[Writer],
 ) {
     static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEEN.fetch_add(1, Ordering::Relaxed);
@@ -2400,6 +2474,50 @@ fn beside_seen(
         name(shadow),
         others.join("; ")
     );
+}
+
+/// The value the card is past on the host's fence (0 without a host).
+fn card_done() -> u64 {
+    // SAFETY: a plain query.
+    host().map_or(0, |host| unsafe { host.fence.GetCompletedValue() })
+}
+
+/// The reads (in order, joined) of the first flight the card has not run
+/// yet that reads `[from, to)` on the card, if one does.
+fn read_by<'a>(air: &Air<'a>, from: usize, to: usize) -> Option<&'a [(usize, usize)]> {
+    air.read.iter().find(|r| r.0 > air.done && touches(&r.1, from, to)).map(|r| &r.1[..])
+}
+
+/// [`read_until`] for the flights in the air now.
+fn over_until(runs: &[&HostList]) -> u64 {
+    let read = line().read.clone();
+    let air = Air {
+        written: &[],
+        copies: &[],
+        read: &read,
+        done: card_done(),
+        landing: &[],
+        told: &[],
+    };
+    read_until(&air, runs)
+}
+
+/// The value signalled behind the last flight the card has not run yet
+/// that reads memory a title copy of `runs` writes; 0 if none does.
+fn read_until(air: &Air, runs: &[&HostList]) -> u64 {
+    let mut until = 0;
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let &Step::Copy(dst, _, len) = step {
+                for (fence, reads) in air.read {
+                    if *fence > air.done.max(until) && touches(reads, dst, dst + len) {
+                        until = *fence;
+                    }
+                }
+            }
+        }
+    }
+    until
 }
 
 /// Whether `[from, to)` holds title memory in `written` (in order, joined)
@@ -2876,6 +2994,21 @@ fn late_line(frames: f64) {
             w[WHY_MOST],
             w[WHY_WRITES],
             w[WHY_FENCE],
+        );
+        let k: Vec<f64> = KIND_WAITED.iter().map(|k| k.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
+        tracing::info!(
+            "held back before preparing, per frame, by what was read: memory flights' shaders write by a title copy \
+             {:.1} ms, a fill of upload memory {:.1}, a texture {:.1}, a refresh of another copy of it {:.1}; a \
+             read-back's memory {:.1}; a bottom-of-pipe write's {:.1}; a title copy into memory flights read {:.1}; \
+             a step of ours {:.1}",
+            k[0],
+            k[1],
+            k[2],
+            k[3],
+            k[4],
+            k[5],
+            k[6],
+            k[7],
         );
     }
     if relay() {
@@ -4279,6 +4412,33 @@ impl Host {
         working(was_working);
     }
 
+    /// Waits until the card is past `until` on the host's fence (nothing if
+    /// it is, or `until` is 0), counted as a settle for [`WHY_OVER`]: what
+    /// flights read on the card is not written under them. Their landing is
+    /// not waited for: nothing of theirs is read. Under the submission lock
+    /// (the host's event is the settles').
+    fn card_wait(&self, until: u64) {
+        if until == 0 || card_done() >= until {
+            return;
+        }
+        LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
+        LATE_STATS[WHY_OVER].fetch_add(1, Ordering::Relaxed);
+        let waiting = std::time::Instant::now();
+        // SAFETY: our fence and event, under the submission lock.
+        unsafe {
+            if self.fence.SetEventOnCompletion(until, self.event).is_ok() {
+                let was_working = working(false);
+                WaitForSingleObject(self.event, INFINITE);
+                stood(waiting);
+                working(was_working);
+            }
+        }
+        let us = waiting.elapsed().as_micros() as u64;
+        LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
+        LATE_WAITED[WHY_OVER].fetch_add(us, Ordering::Relaxed);
+        SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
@@ -4298,14 +4458,31 @@ impl Host {
         // what they write.
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
-            if relay_exact() && (why == WHY_READ || why == WHY_OVER) {
-                // Only until the flights that may write what is read (or
-                // read what a title copy writes) have landed: their
-                // copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.air(), runs, false).is_none());
-            } else {
-                self.settle(&mut submitted, why);
+        } else {
+            // Looked at again after a wait for the card alone, which may
+            // leave something else to wait for.
+            let mut looks = 0;
+            while let Some(why) = late_blocked(runs) {
+                let holding = std::time::Instant::now();
+                let kind = BLOCKED_KIND.load(Ordering::Relaxed).min(7);
+                let _charged = Charge(&KIND_WAITED[kind], holding);
+                looks += 1;
+                if why == WHY_OVER && looks < 64 {
+                    // A title copy into memory flights read: only until the
+                    // card has run those flights. Their reads are done then,
+                    // and nothing of theirs has to land first.
+                    self.card_wait(over_until(runs));
+                    continue;
+                }
+                if relay_exact() && why == WHY_READ {
+                    // Only until the flights that may write what is read
+                    // have landed: their copy-back's end, not the card's
+                    // other work.
+                    relay_wait(why, |line| blocked_by(&line.air(card_done()), runs, false).is_none());
+                } else {
+                    self.settle(&mut submitted, why);
+                }
+                break;
             }
         }
         let behind = late && flying();
