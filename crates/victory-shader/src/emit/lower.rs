@@ -1068,7 +1068,7 @@ pub(super) fn with_pair_meetings<R>(f: impl FnOnce() -> R) -> R {
 /// 32..63 by half. Right for code that only relies on what HLSL's wave
 /// operations promise; a program that takes one wave to be its whole
 /// thread group gets per-half results. The last resort for programs that
-/// do not translate otherwise.
+/// do not translate otherwise, with `VICTORY_WAVE_LOCAL=any`.
 pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
     let was = LOCAL_ANY.replace(true);
     let r = with_local_waves(f);
