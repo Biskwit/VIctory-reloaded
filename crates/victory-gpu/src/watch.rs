@@ -738,6 +738,13 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 /// copy of the card's address, which nothing had marked written, and
 /// stored parent links where the stale bytes pointed (run bvh-06: a clip
 /// object's pointer became 0x5000007c4).
+///
+/// A view that mirrors guarded blocks already is still read-only: it loses
+/// its entry in [`Guards::mirrored`] when it is written, opened or mapped
+/// anew ([`open`], [`title_memory_remapped`]), and gets one only when it is
+/// made read-only or while the kernel writes it (whose end opens it). Made
+/// read-only again all the same, run late-39 spent 5,941 calls a frame on
+/// the other views of 1,460 blocks guarded again.
 fn mirror(g: &mut Guards, block: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     #[cfg(feature = "diagnostics")]
@@ -750,9 +757,9 @@ fn mirror(g: &mut Guards, block: usize) {
         add(C::GuardLookupNs, looking.elapsed().as_nanos() as u64);
     }
     for other in others {
-        // Not under a write of the kernel's: the end of that write counts
-        // for `block` instead ([`Writing`]).
-        if !g.held(other / BLOCK) {
+        // Not mirroring already, nor under a write of the kernel's: the end
+        // of that write counts for `block` instead ([`Writing`]).
+        if !g.mirrored.contains_key(&(other / BLOCK)) && !g.held(other / BLOCK) {
             let mut old = 0;
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
@@ -1137,6 +1144,16 @@ mod tests {
             assert_eq!(guard(card, card + 2 * BLOCK), second, "round {round}");
             assert_eq!(guard(card, card + 2 * BLOCK), Some(Vec::new()));
         }
+        // Written at its own address, the block is guarded again without
+        // making the other view read-only again: it still is, and a write
+        // there is still reported.
+        // SAFETY: our view; the handler opens it.
+        unsafe { ((card + BLOCK + 8) as *mut u8).write(9) };
+        assert_eq!(guard(card, card + 2 * BLOCK), second);
+        // SAFETY: as above.
+        unsafe { ((own + BLOCK + 8) as *mut u8).write(10) };
+        assert_eq!(guard(card, card + 2 * BLOCK), second);
+        assert_eq!(guard(card, card + 2 * BLOCK), Some(Vec::new()));
         title_pages_written(section, BLOCK as u64 + 100, 4);
         assert_eq!(guard(card, card + 2 * BLOCK), second);
         // A view mapped after the block was guarded mirrors it as well.
