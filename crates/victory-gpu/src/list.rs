@@ -819,7 +819,24 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        // Out of what the list's own shaders write: when the list has run
+        // and their bytes are back in title memory. Title copies are done
+        // when the list is submitted, before its shaders run; the structure
+        // builder's sizes go to the title this way, and it took the size of
+        // the last structure that used the slot (run bvh-33: a structure of
+        // 0x4f8d80 bytes was copied into the 0x102d80 the title had set
+        // aside for it, over its neighbours).
+        // shortcut: what the list does next with the destination (a draw
+        // that reads it, a copy out of it) still sees the bytes before.
+        if list.shaders_write(from as usize, len as usize) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!("a title copy out of what its list's shaders write is done when the list has run")
+            });
+            list.defer_write(to, Written::Bytes(from as usize), len as usize);
+        } else {
+            list.defer_copy(to, from, len as usize);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
