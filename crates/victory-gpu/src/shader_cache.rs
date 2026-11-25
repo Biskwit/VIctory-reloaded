@@ -1,7 +1,8 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
+//! cache folder, keyed by the container's content and by the translator
+//! that translated it (a hash of its sources, made by the build script), so
+//! a changed translator never serves an old translation and a build that
+//! changed only the rest keeps the cache. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
@@ -37,13 +38,13 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
+/// What identifies this build's translations: the BLAKE3 of the
+/// translator's sources (hashed by the build script, `VICTORY_TRANSLATOR`)
+/// and of the translation settings it runs with (the loop limit, which a
 /// diagnostics build can change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -51,24 +52,15 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                // Which group barriers wait is part of the translation too.
-                bytes.push(victory_shader::emit::group_sync());
-                // So is how the builder's programs reach their root views.
-                bytes.push(u8::from(crate::memory::pages()));
-                *blake3::hash(&bytes).as_bytes()
-            }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
-        }
+        let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
+        bytes.extend_from_slice(&limit.to_le_bytes());
+        // Which group barriers wait is part of the translation too.
+        bytes.push(victory_shader::emit::group_sync());
+        // So is how the builder's programs reach their root views.
+        bytes.push(u8::from(crate::memory::pages()));
+        // And the diagnostics switches a diagnostics build may emit with.
+        bytes.push(u8::from(cfg!(feature = "diagnostics")));
+        *blake3::hash(&bytes).as_bytes()
     })
 }
 
