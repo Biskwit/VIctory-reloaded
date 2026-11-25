@@ -6145,12 +6145,22 @@ impl<'a> Lower<'a> {
     // driver does 1 ULP off the hardware's correctly rounded conversion for
     // some values; correct it with an integer check if a title compares
     // converted values exactly.
-    fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
+    /// `paged`: through a root view reached as title memory by address, the view
+    /// (`src`), the byte in it and the guard, for each dword after the first
+    /// ([`Lower::paged_dword`]).
+    fn format_load(
+        &mut self,
+        h: V,
+        off: V,
+        format: u8,
+        channels: u32,
+        paged: Option<(&Source, V, Option<V>)>,
+    ) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-        let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
+        let load = |l: &mut Self, h: V, at: V, n: u32| -> Vec<V> {
             let mask = l.s.m.i8((1u8 << n) - 1);
             let r = l.s.op(
                 c,
@@ -6171,12 +6181,23 @@ impl<'a> Lower<'a> {
             // A byte or half inside the dword that holds it.
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
-            let w = load(self, at, 1)[0];
+            let w = load(self, h, at, 1)[0];
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
+        } else if let Some((src, first, guard)) = paged {
+            // Each dword from its own page's copy.
+            let mut words = Vec::new();
+            for k in 0..total / 32 {
+                let (h, at) = match k {
+                    0 => (h, off),
+                    _ => self.paged_dword(src, first, k, guard)?,
+                };
+                words.push(load(self, h, at, 1)[0]);
+            }
+            words
         } else {
-            load(self, off, total / 32)
+            load(self, h, off, total / 32)
         };
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
@@ -10157,10 +10178,11 @@ impl<'a> Lower<'a> {
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
         }
-        // A root view reached as title memory by address (`paged_root`): raw bytes there.
+        // A root view reached as title memory by address (`paged_root`): raw bytes there,
+        // also for a typed-format load, which reads raw dwords (`format_load`).
         // `paged`: the byte in the root view and the handle of its copy.
         let mut paged = None;
-        if !typed {
+        if !typed || format.is_some() {
             let byte = match index {
                 None => Some(off),
                 Some(index) if used.is_some_and(|u| u.stride == 1) => Some(self.s.m.bin(c, Bin::Add, index, off)),
@@ -10465,7 +10487,12 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
+            let paged = paged.map(|(first, _)| (src, first, guard));
+            for (k, x) in self
+                .format_load(h, off, f, count, paged)?
+                .into_iter()
+                .enumerate()
+            {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -11515,6 +11542,8 @@ mod tests {
             ([0xE028_1000, 0x8001_0100], 2), // buffer_load_ushort v1, v0, s[4:7], 0 offen
             ([0xF428_0202, 0xFA00_0000], 4), // s_buffer_load_dwordx4 s[8:11], s[4:7], 0
             ([0xDC3C_8000, 0x0104_0000], 3), // global_load_dwordx3 v[1:3], v0, s[4:5]
+            ([0xE828_1000, 0x8001_0100], 1), // tbuffer_load_format_x v1, v0, s[4:7], 0 offen format:8_UINT
+            ([0xEA42_1000, 0x8001_0100], 3), // tbuffer_load_format_xyz v[1:3], ... format:32_32_32_UINT
         ] {
             let mut root = vec![
                 0x8703_FF01,
