@@ -54,6 +54,15 @@ use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
+/// Bits 32 to 39 of what is taken for a title address among a dispatch's
+/// constants and in the builder's tables: the card's addresses (0x7.. to
+/// 0x10..) and the pool's views, not the processor's views of the same
+/// pages below. A constant before a small number looked like one of those
+/// (run bvh-42: a window at 0x130d90000 was numbered and guarded, and the
+/// title's decompression into it stopped on the guard), and each numbered
+/// a copy of pages that already had one.
+const CARD_HIGH: std::ops::RangeInclusive<u32> = 0x07..=0x1f;
+
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
 const COPIES: u32 = 1023;
@@ -508,7 +517,7 @@ impl Memory {
         // it, and any value read is looked at as a number only.
         let pairs = unsafe { std::slice::from_raw_parts(table as *const [u32; 2], LOOKED / 8) };
         for &[low, high] in pairs {
-            if (1..=0xFF).contains(&high) && low >= 0x1_0000 {
+            if CARD_HIGH.contains(&high) && low >= 0x1_0000 {
                 let address = u64::from(low) | u64::from(high) << 32;
                 self.name(address);
                 self.named.push(address);
@@ -606,7 +615,7 @@ pub(crate) fn ready(
     // memory nothing reads; one that is not the title's memory is refused.
     for (i, &c) in constants.iter().enumerate() {
         if let Some(&high) = constants.get(i + 1)
-            && (1..=0xFF).contains(&high)
+            && CARD_HIGH.contains(&high)
             && c >= 0x1_0000
         {
             let address = u64::from(c) | u64::from(high) << 32;
@@ -615,8 +624,13 @@ pub(crate) fn ready(
         }
     }
     m.stored = m.named.len();
+    // Only where the card's addresses of title memory are (from 0x7 to
+    // below 0xe in bits 32 to 39): a float or a packed colour shifted by
+    // 8 bits lands in the pool's views above, which are committed, and
+    // each such guess numbered copies (run bvh-41, with `pages`: 16,838 of
+    // 60,048 page copies, most at 0xe2.., 0xf1.. and 0xf5..).
     for &c in constants {
-        if c >= 0x0100_0000 {
+        if (0x0700_0000..0x0e00_0000).contains(&c) {
             m.name(u64::from(c) << 8);
             m.named.push(u64::from(c) << 8);
         }
@@ -644,9 +658,7 @@ pub(crate) fn ready(
     // shortcut: a copy another list numbers meanwhile is brought up to date
     // by that list's submission, which may run after this one's.
     const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
     /// Keys of [`HostList::first_use`] for a plain copy's writes with `pages`.
     const NEAR_PLAIN: usize = usize::MAX - 0x80_0000;
     // With `pages`: the page copies near what the dispatch names, and those
@@ -669,12 +681,18 @@ pub(crate) fn ready(
         // host's heap, which its stages only read): what the compare took
         // for a shader's store there would go into the heap of this very
         // process.
-        // With `pages`, only where the dispatch names memory in or just
-        // before the copy: a stage that stores through a garbage pointer
-        // (run bvh-26: 75 KiB of node headers in a window of the title's
-        // heap that a fault had numbered) then leaves title memory alone.
-        let named = !pages() || m.named[..m.stored].iter().any(|&a| a < start + len && a + REACH > start);
-        if writes && named && start >> 40 == 0 && (!pages() || list.first_use(NEAR_PLAIN - n)) && (pages() || first_write || n >= numbered) {
+        // Only where the dispatch names memory in or just before the
+        // copy: a stage that stores through a garbage pointer (run bvh-26:
+        // 75 KiB of node headers in a window of the title's heap that a
+        // fault had numbered) then leaves title memory alone, and the
+        // copies a dispatch does not name are not kept and compared for
+        // it (every numbered copy was, once a list: with 4,095 numbers
+        // that is 16 GB a submission, run bvh-20's 0.1 frames a second).
+        // shortcut: what a stage stores through a pointer into a copy no
+        // dispatch of the list names stays in the host's copy; the title
+        // does not see it.
+        let named = m.named[..m.stored].iter().any(|&a| a < start + len && a + REACH > start);
+        if writes && named && start >> 40 == 0 && list.first_use(NEAR_PLAIN - n) {
             shadow.gpu_writes(list, start, len);
         }
     }
