@@ -57,6 +57,18 @@ use crate::shadow::Shadow;
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
 const COPIES: u32 = 1023;
+
+/// [`COPIES`], or what `VICTORY_MEMORY_COPIES` says (one less than a power
+/// of two up to 16383), read once.
+fn copies_most() -> u32 {
+    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_MEMORY_COPIES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(COPIES, |n| n.clamp(1, 16383))
+    })
+}
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -149,8 +161,14 @@ impl Memory {
         if self.refused.contains(&page) {
             return;
         }
+        // Diagnostics: why a page gets no copy.
+        #[cfg(feature = "diagnostics")]
+        let why = |what: &str| crate::pipeline::audit(|| format!("nocopy {page:x} {what}"));
+        #[cfg(not(feature = "diagnostics"))]
+        let why = |_: &str| {};
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
+            why("not committed");
             return;
         }
         // The copy a root view at that address would get; a buffer that
@@ -160,18 +178,22 @@ impl Memory {
             .filter(whole)
             .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
         else {
+            why("no copy holds the whole page");
             return;
         };
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+            why("its copy takes no unordered access");
             return;
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
+            None if self.copies.len() < copies_most() as usize => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::audit(|| format!("copy {n} {:#x}+{:#x} for page {page:x}", shadow.span().0, shadow.span().1));
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that
@@ -197,6 +219,7 @@ impl Memory {
                 ONCE.call_once(|| {
                     tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
                 });
+                why("no number left");
                 return;
             }
         };
@@ -344,7 +367,7 @@ pub(crate) fn ready(
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            let base = heap.dynamic(copies_most() + 1)?;
             heap.null_raw_uav_at(base);
             (base, 0)
         }

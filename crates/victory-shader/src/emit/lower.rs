@@ -2576,13 +2576,13 @@ impl<'a> Lower<'a> {
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         // With the program's tag above the page number (`shader::fault_tag`).
         // `VICTORY_FAULT_SITE=<tag, hex>` (diagnostics; with a cache folder
-        // of its own): that program leaves a quarter of the instruction's
+        // of its own): that program leaves a sixteenth of the instruction's
         // offset instead, to say which of its accesses it was.
         let mut tag = super::shader::fault_tag(&self.x.native.code);
         if cfg!(feature = "diagnostics")
             && std::env::var("VICTORY_FAULT_SITE").ok().and_then(|v| u32::from_str_radix(&v, 16).ok()) == Some(tag)
         {
-            tag = self.fault_at >> 2 & 0x7ff;
+            tag = self.fault_at >> 4 & 0x7ff;
         }
         let tag = k(self, tag << 21);
         let noted = self.s.m.bin(c, Bin::Or, page, tag);
