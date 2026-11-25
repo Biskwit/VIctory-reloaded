@@ -1863,10 +1863,27 @@ pub(crate) fn relay() -> bool {
 /// its shaders wrote to copies in the card's memory, and the fetch goes to
 /// the queue behind every flight sent since (the relay thread waited 36 ms
 /// a frame for fetches), so a wait for one flight lasts until the card
-/// has run most of what is in the air.
+/// has run most of what is in the air. [`fetch_queue`] sends it beside
+/// them.
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v != "1"))
+}
+
+/// With [`relay`]: the fetch of what a landing's flights wrote to copies in
+/// the card's memory goes to a copy queue of the relay's own, and runs as
+/// soon as it is sent (the card has run those flights), beside the flights
+/// sent since. On the host's queue it ran behind them: in run late-66 the
+/// relay waited 37 ms a frame for fetches, and the submitting thread, which
+/// waits for the flights a submission reads after (`relay_exact`), waited
+/// 72 ms a frame; with the copy queue 9 and 55 ms, and 170 ms a frame
+/// against 185-193 (run late-71). The fetch may bring bytes a later flight
+/// is writing, as it could before; the sends of title bytes it counts on
+/// are those ahead of the landing's flights ([`Flight::sends`]).
+/// `VICTORY_FETCH_QUEUE=0`: on the host's queue, as before.
+fn fetch_queue() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_QUEUE").is_none_or(|v| v != "0"))
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -2050,6 +2067,10 @@ struct Flight {
     /// As [`Sent`]'s.
     reads: Vec<(usize, usize)>,
     lands: Vec<(usize, usize)>,
+    /// With [`relay`]: the sends of title bytes to copies in the card's
+    /// memory ([`QUEUE_ORDER`]) put on the queue ahead of the flight; the
+    /// card has them once it has run the flight.
+    sends: u64,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -2878,6 +2899,8 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// behind the submission lock), and the memory the pieces come down to.
 struct RelayFetch {
     list: Prelude,
+    /// With [`fetch_queue`]: the copy queue `list` (a copy list) goes to.
+    queue: Option<ID3D12CommandQueue>,
     fence: ID3D12Fence,
     event: HANDLE,
     /// The last value signalled on `fence`.
@@ -3876,13 +3899,29 @@ impl Host {
 
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
-        let list = self.make_prelude()?;
+        // SAFETY: plain objects of our own.
+        let (list, queue) = if fetch_queue() {
+            unsafe {
+                let kind = D3D12_COMMAND_LIST_TYPE_COPY;
+                let queue: ID3D12CommandQueue = self
+                    .device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: kind, ..Default::default() })
+                    .ok()?;
+                let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(kind).ok()?;
+                let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(0, kind, &allocator, None).ok()?;
+                list.Close().ok()?;
+                ((allocator, list), Some(queue))
+            }
+        } else {
+            (self.make_prelude()?, None)
+        };
         // SAFETY: plain objects of our own.
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
             Some(RelayFetch {
                 list,
+                queue,
                 fence,
                 event,
                 sent: 0,
@@ -3897,11 +3936,12 @@ impl Host {
     /// this thread's own, and what shaders wrote in them goes into title
     /// memory (`Shadow::card_merge_relay`). As [`Host::card_back`], but:
     /// no submission lock; a piece flagged under one range of a plan is
-    /// fetched under all ([`flagged_pieces`]); the fetch runs behind
-    /// whatever was sent meanwhile, so it may bring a later flight's
-    /// bytes, which that flight's landing then finds merged already; and
-    /// nothing is sent back up.
-    fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+    /// fetched under all ([`flagged_pieces`]); the fetch runs beside
+    /// whatever was sent meanwhile ([`fetch_queue`]; behind it without),
+    /// so it may bring a later flight's bytes, which that flight's landing
+    /// then finds merged already; and nothing is sent back up.
+    /// `sends`: the sends of title bytes ahead of the landing's flights.
+    fn relay_card_back(&self, plans: &[&CardPlan], sends: u64, fetch: &mut Option<RelayFetch>) {
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -3943,8 +3983,10 @@ impl Host {
             }
         }
         if pieces.is_empty() {
-            // Nothing to fetch: every send so far is older than the next fetch.
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            // Nothing to fetch: every send so far is older than the next
+            // fetch (on its own queue: those ahead of these flights are).
+            let older = if fetch_queue() { sends } else { *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()) };
+            crate::shadow::relay_fetched(older);
             return;
         }
         if fetch.is_none() {
@@ -3962,6 +4004,7 @@ impl Host {
         };
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+        let own = f.queue.clone();
         let waiting = std::time::Instant::now();
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
@@ -3975,6 +4018,15 @@ impl Host {
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                if let Some(queue) = &own {
+                    // The card has run the flights: the fetch runs now,
+                    // beside what was sent since.
+                    queue.ExecuteCommandLists(&lists);
+                    queue.Signal(&fence, sent)?;
+                    fence.SetEventOnCompletion(sent, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                    return Ok(sends);
+                }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -4045,7 +4097,8 @@ impl Host {
                     ));
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
-                self.relay_card_back(&plans, fetch);
+                let sends = flights.iter().map(|f| f.sends).max().unwrap_or(0);
+                self.relay_card_back(&plans, sends, fetch);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -4310,6 +4363,7 @@ impl Host {
                 back: sent.back,
                 reads: sent.reads,
                 lands: sent.lands,
+                sends: *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
             };
             line.take_in(&flight);
             line.tell(&sent.writes);
@@ -4357,6 +4411,7 @@ impl Host {
                 back: sent.back,
                 reads: sent.reads,
                 lands: sent.lands,
+                sends: *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
             };
             line.take_in(&flight);
             line.tell(&sent.writes);
