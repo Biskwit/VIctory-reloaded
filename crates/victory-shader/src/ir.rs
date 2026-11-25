@@ -594,7 +594,19 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
 /// after it could see that (a scalar register or SCC that the region
 /// changes and the join merges with the value from before; EXEC aside,
 /// which is empty either way). `None` if nothing changes.
+/// Passes repeat until none removes a branch: nested `if`s that share their
+/// join (`if (a) { ..; if (b) { .. } }`) skip to it from both branches, so the
+/// inner branch is a pure skip only once the outer one is gone.
 pub(crate) fn without_skips(p: &Program) -> Option<Program> {
+    let mut out = skips_once(p)?;
+    while let Some(next) = skips_once(&out) {
+        out = next;
+    }
+    Some(out)
+}
+
+/// One pass of [`without_skips`] over `p`.
+fn skips_once(p: &Program) -> Option<Program> {
     let n = p.blocks.len();
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
@@ -1564,6 +1576,41 @@ mod tests {
         assert_eq!(add.read(Reg::S(0)), Some(phi.value));
         assert_eq!(b1.insts[1].read(Reg::S(0)), add.write(Reg::S(0)));
         assert_eq!(b2.insts[0].name(), "s_endpgm");
+    }
+
+    /// The names of the branches that end blocks.
+    fn branches(p: &Program) -> Vec<&'static str> {
+        p.blocks
+            .iter()
+            .filter(|b| matches!(b.exit, Exit::Branch { .. }))
+            .filter_map(|b| b.insts.last().map(Inst::name))
+            .collect()
+    }
+
+    #[test]
+    fn nested_skips_that_share_their_join_both_go() {
+        // if (lane < 40) { v1 = 1; if (lane < 20) v1 = 2; }: both branches skip to
+        // the join, which the inner one is a pure skip to only without the outer.
+        let p = build_words(
+            &[
+                0xBE82_047E, // s_mov_b64 s[2:3], exec
+                0x7DA8_00A8, // v_cmpx_gt_u32 exec, 40, v0
+                0xBF88_0004, // s_cbranch_execz -> join
+                0x7E02_0281, // v_mov_b32 v1, 1
+                0x7DA8_0094, // v_cmpx_gt_u32 exec, 20, v0
+                0xBF88_0001, // s_cbranch_execz -> join
+                0x7E02_0282, // v_mov_b32 v1, 2
+                0xBEFE_0402, // join: s_mov_b64 exec, s[2:3]
+                0x7E04_0301, // v_mov_b32 v2, v1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert_eq!(branches(&p), ["s_cbranch_execz", "s_cbranch_execz"]);
+        let once = skips_once(&p).expect("the outer skip goes");
+        assert_eq!(branches(&once), ["s_cbranch_execz"]);
+        let all = without_skips(&p).expect("both go");
+        assert!(branches(&all).is_empty(), "{:?}", branches(&all));
     }
 
     #[test]
