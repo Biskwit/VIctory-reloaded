@@ -2,7 +2,8 @@
 //! needed (`victory replay-dispatch`, [`crate::replay`]). Only in builds
 //! with diagnostics.
 //!
-//! `VICTORY_DISPATCH_CAPTURE=<shader hash prefix>:<frame>:<folder>`: the
+//! `VICTORY_DISPATCH_CAPTURE=<shader hash prefix>:<frame>:<folder>` (or
+//! several prefixes, `a+b+c`, each written to `<folder>/<hash>`): the
 //! first dispatch, direct or indirect, of a compute pipeline whose shader's
 //! hash starts with the prefix, in that frame or the first one after it that
 //! runs one, is written to the folder (`manifest.json` says what is where).
@@ -34,7 +35,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use victory_shader::RootType;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -89,7 +89,8 @@ pub(crate) enum Groups<'a> {
 /// What `VICTORY_DISPATCH_CAPTURE` asks for: the frame, counted from the
 /// world's first if `world`.
 struct Plan {
-    prefix: String,
+    /// One or several (`a+b+c`; each written to `<folder>/<hash>`).
+    prefixes: Vec<String>,
     frame: u64,
     world: bool,
     folder: PathBuf,
@@ -115,7 +116,7 @@ fn plan() -> Option<&'static Plan> {
         }
         tracing::info!(prefix, frame, world, folder, "a dispatch will be captured");
         Some(Plan {
-            prefix: prefix.trim().to_ascii_lowercase(),
+            prefixes: prefix.split('+').map(|p| p.trim().to_ascii_lowercase()).filter(|p| !p.is_empty()).collect(),
             frame,
             world,
             folder: PathBuf::from(folder),
@@ -124,13 +125,20 @@ fn plan() -> Option<&'static Plan> {
     .as_ref()
 }
 
-/// The capture was taken (or given up): nothing more is noted.
-static TAKEN: AtomicBool = AtomicBool::new(false);
+/// The prefixes whose capture was taken (or given up), by index.
+static TAKEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Whether views and root arguments are noted: a capture is asked for and
-/// not taken yet.
+/// not all taken yet.
 pub(crate) fn armed() -> bool {
-    plan().is_some() && !TAKEN.load(Ordering::Relaxed)
+    plan().is_some_and(|p| TAKEN.lock().unwrap_or_else(|e| e.into_inner()).len() < p.prefixes.len())
+}
+
+/// The prefix of `plan` that `p`'s shader matches and that was not taken.
+fn untaken(plan: &Plan, p: &HostPipeline) -> Option<usize> {
+    let hash = &p.stages.first()?.shader.hash;
+    let taken = TAKEN.lock().unwrap_or_else(|e| e.into_inner());
+    plan.prefixes.iter().enumerate().position(|(i, pre)| !taken.contains(&i) && hash.starts_with(pre.as_str()))
 }
 
 /// Host views by CPU handle, as last made ([`note_view`]).
@@ -159,17 +167,12 @@ pub(crate) fn wants(p: &HostPipeline) -> bool {
     } else {
         plan.frame
     };
-    armed()
-        && p.compute
-        && crate::queue::presented() + 1 >= from
-        && p.stages
-            .first()
-            .is_some_and(|s| s.shader.hash.starts_with(&plan.prefix))
+    p.compute && crate::queue::presented() + 1 >= from && untaken(plan, p).is_some()
 }
 
 /// The capture recorded and not yet written: written at a present once its
 /// list has run ([`presented`]).
-static PENDING: Mutex<Option<Capture>> = Mutex::new(None);
+static PENDING: Mutex<Vec<Capture>> = Mutex::new(Vec::new());
 
 /// Bytes the list copies last, to tell that it ran.
 const MARKER: [u8; 16] = *b"victory capture\0";
@@ -314,10 +317,16 @@ pub(crate) fn begin(
     constant: &dyn Fn(u8, u32) -> u32,
     groups: Groups,
 ) -> Option<Capture> {
-    if TAKEN.swap(true, Ordering::Relaxed) {
-        return None;
-    }
     let plan = plan()?;
+    // Taken by this thread, or another thread took it first.
+    let index = untaken(plan, p)?;
+    {
+        let mut taken = TAKEN.lock().unwrap_or_else(|e| e.into_inner());
+        if taken.contains(&index) {
+            return None;
+        }
+        taken.push(index);
+    }
     let host = crate::host::host()?;
     let device = &host.device;
     let [stage] = &p.stages[..] else { return None };
@@ -766,7 +775,11 @@ pub(crate) fn begin(
     ];
     Some(Capture {
         frame,
-        folder: plan.folder.clone(),
+        folder: if plan.prefixes.len() > 1 {
+            plan.folder.join(&stage.shader.hash)
+        } else {
+            plan.folder.clone()
+        },
         files,
         manifest,
         roots: root_out,
@@ -802,7 +815,7 @@ impl Capture {
             slots = self.slots.len(),
             "dispatch capture recorded; written once its list has run"
         );
-        *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(self);
+        PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(self);
     }
 
     /// Whether the list ran (the marker landed).
@@ -1033,27 +1046,34 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 /// when it does); given up 600 frames on.
 pub(crate) fn presented(frame: u64) {
     let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(capture) = pending.as_mut() else {
+    if pending.is_empty() {
         return;
-    };
-    if capture.landed.is_none() && capture.landed() {
-        capture.landed = Some(frame);
     }
-    if capture.landed.is_none_or(|at| frame < at + 2) {
-        if frame > capture.frame + 600 {
-            tracing::warn!("the captured dispatch's list never ran: capture dropped");
-            *pending = None;
+    let mut ready = Vec::new();
+    let mut kept = Vec::new();
+    for mut capture in std::mem::take(&mut *pending) {
+        if capture.landed.is_none() && capture.landed() {
+            capture.landed = Some(frame);
         }
-        return;
+        if capture.landed.is_some_and(|at| frame >= at + 2) {
+            ready.push(capture);
+        } else if frame > capture.frame + 600 {
+            tracing::warn!("a captured dispatch's list never ran: capture dropped");
+        } else {
+            kept.push(capture);
+        }
     }
-    let Some(capture) = pending.take() else {
-        return;
-    };
+    *pending = kept;
+    let done = pending.is_empty() && !armed();
     drop(pending);
-    // Nothing more is noted.
-    *VIEWS.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    match capture.write() {
-        Ok(folder) => tracing::info!(folder = %folder.display(), "dispatch captured"),
-        Err(e) => tracing::warn!(error = %e, "dispatch capture not written"),
+    // Nothing more is noted once every capture is taken and written.
+    if done {
+        *VIEWS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    for capture in ready {
+        match capture.write() {
+            Ok(folder) => tracing::info!(folder = %folder.display(), "dispatch captured"),
+            Err(e) => tracing::warn!(error = %e, "dispatch capture not written"),
+        }
     }
 }
