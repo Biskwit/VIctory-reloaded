@@ -114,6 +114,11 @@ enum Command {
         /// first run's into this folder.
         #[arg(long)]
         diffs: Option<PathBuf>,
+        /// Make each program again from what the driver keeps of it before
+        /// running it: `blob` (its cached blob) or `library` (stored in a
+        /// pipeline library, serialized and loaded back).
+        #[arg(long)]
+        reload: Option<String>,
         /// Make the first program first with these static sampler changes
         /// (comma-separated; `none`: the captured root signature) and hold
         /// it: whether the driver serves that compile to other samplers.
@@ -246,6 +251,7 @@ fn main() -> Result<()> {
             retranslate,
             show,
             diffs,
+            reload,
             prime,
             hash_salt,
             warp,
@@ -263,6 +269,7 @@ fn main() -> Result<()> {
                 retranslate,
                 show,
                 diffs,
+                reload,
                 prime,
                 hash_salt,
                 warp,
@@ -298,6 +305,7 @@ struct Options {
     retranslate: bool,
     show: usize,
     diffs: Option<PathBuf>,
+    reload: Option<String>,
     prime: Option<String>,
     hash_salt: u8,
     warp: bool,

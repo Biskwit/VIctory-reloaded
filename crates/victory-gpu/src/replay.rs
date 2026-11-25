@@ -462,6 +462,12 @@ pub struct Options {
     /// differ from the first run's (white), each program's first outputs
     /// (packed rows) and its driver blob (`program-<n>.pso`), if anywhere.
     pub diffs: Option<PathBuf>,
+    /// Each program made again from what the driver keeps of it: `blob`,
+    /// from its cached blob; `library`, stored in a pipeline library,
+    /// serialized and loaded back (what the next launch would run);
+    /// `library:<file>`, the same with a library made from a run's file;
+    /// `late-...`: after the runs, which then run once more.
+    pub reload: Option<String>,
     /// Before the programs, the first one is made (and held) with these
     /// static sampler changes (comma-separated; `none`: the captured root
     /// signature): whether the driver serves what it compiled then to a
@@ -930,6 +936,9 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
     // The root signature the programs are made with: the captured one, or
     // with static samplers changed (`samplers`; the library name stays the
     // captured one's, so a library that serves its entry anyway shows).
+    if o.reload.as_deref().is_some_and(|k| k.contains("stress:")) {
+        let _ = POINT_ROOT.set(patch_samplers(&root_blob, &["s3.filter=0x0".to_owned()])?);
+    }
     let made_root = if o.samplers.is_empty() {
         root_blob.clone()
     } else {
@@ -1362,6 +1371,17 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
             None => unsafe { device.CreateComputePipelineState(&desc) }
                 .with_context(|| format!("pipeline of {name}"))?,
         };
+        let _ = PIPELINE_NAME.set(crate::pipeline::library::name("compute", &made_root, &[dxil], ""));
+        // `reload`: the pipeline made again from what the driver keeps of it
+        // (`late-`: after the runs, once more).
+        let mut pso = match o.reload.as_deref() {
+            Some(kind) if !kind.starts_with("late-") => {
+                let again = reload(&device, &pso, &desc, kind, _primed.as_ref().map(|p| &p.1))?;
+                println!("program {name}: made again ({kind})");
+                again
+            }
+            _ => pso,
+        };
         first_pso.get_or_insert_with(|| pso.clone());
         // What the driver made of it: its cached blob, against the first's.
         // SAFETY: a live pipeline; the blob is read in full before release.
@@ -1394,17 +1414,24 @@ pub fn replay_dispatch(dir: &Path, o: &Options) -> Result<Summary> {
         println!("program {name}: {} bytes of DXIL, {compiled}", dxil.len());
         // With `background`, the runs once more after the driver did its
         // background work on the pipeline (it compiles shaders again later).
-        let passes = if o.background { 2 } else { 1 };
+        let late = o.reload.as_deref().and_then(|k| k.strip_prefix("late-"));
+        let passes = if o.background || late.is_some() { 2 } else { 1 };
         for run in 0..o.runs.max(1) * passes {
             let after = run >= o.runs.max(1);
             if after && run == o.runs.max(1) {
-                println!("  the driver's background work: {}", background_work(&device));
+                match late {
+                    Some(kind) => {
+                        pso = reload(&device, &pso, &desc, kind, _primed.as_ref().map(|p| &p.1))?;
+                        println!("  made again ({kind}) after the runs");
+                    }
+                    None => println!("  the driver's background work: {}", background_work(&device)),
+                }
             }
             let outputs = run_once(
                 &mut gpu, &made, &heap, &root, &pso, &bind, &groups, group_base,
             )?;
             let label = if after {
-                format!("{name} after the background work run {}", run - o.runs.max(1))
+                format!("{name} after it was made again run {}", run - o.runs.max(1))
             } else {
                 format!("{name} run {run}")
             };
@@ -1595,6 +1622,143 @@ fn sensitivity(
     }
     Ok(())
 }
+
+/// `pso` made again from what the driver keeps of it ([`Options::reload`]):
+/// `blob`, from its cached blob; otherwise stored in a pipeline library,
+/// serialized, and loaded from a library made from those bytes.
+fn reload(
+    device: &ID3D12Device,
+    pso: &ID3D12PipelineState,
+    desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
+    kind: &str,
+    companion: Option<&ID3D12PipelineState>,
+) -> Result<ID3D12PipelineState> {
+    // `save:<file>`: stored in a new library, written to the file (named as
+    // the game names it, for `--library` in another process); runs as made.
+    if let Some(path) = kind.strip_prefix("save:") {
+        let device1: ID3D12Device1 = device.cast()?;
+        let named = PIPELINE_NAME.get().cloned().unwrap_or_default();
+        let wide = windows::core::HSTRING::from(named.as_str());
+        // SAFETY: a new library and a live pipeline.
+        unsafe {
+            let library: ID3D12PipelineLibrary = device1.CreatePipelineLibrary(&[])?;
+            library.StorePipeline(windows::core::PCWSTR(wide.as_ptr()), pso)?;
+            let mut bytes = vec![0u8; library.GetSerializedSize()];
+            library.Serialize(&mut bytes)?;
+            std::fs::write(path, &bytes)?;
+        }
+        return Ok(pso.clone());
+    }
+    if let Some(threads) = kind.strip_prefix("stress:") {
+        return stress(device, desc, threads.parse().unwrap_or(8));
+    }
+    if kind == "blob" {
+        // SAFETY: a live pipeline; the blob outlives the creation.
+        unsafe {
+            let blob = pso.GetCachedBlob()?;
+            let again = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                // A borrowed pointer the description never releases.
+                pRootSignature: std::mem::transmute_copy(&desc.pRootSignature),
+                CS: desc.CS,
+                CachedPSO: D3D12_CACHED_PIPELINE_STATE {
+                    pCachedBlob: blob.GetBufferPointer(),
+                    CachedBlobSizeInBytes: blob.GetBufferSize(),
+                },
+                ..Default::default()
+            };
+            return Ok(device.CreateComputePipelineState(&again)?);
+        }
+    }
+    let device1: ID3D12Device1 = device.cast()?;
+    let wide = windows::core::HSTRING::from("replayed");
+    // SAFETY: a new library; the serialized bytes outlive the library made
+    // from them, which outlives the load.
+    unsafe {
+        // `library:<file>`: a library made from a run's file to store into,
+        // as a launch stores its new pipelines into the one it loaded.
+        let base = match kind.strip_prefix("library:") {
+            Some(path) => std::fs::read(path).with_context(|| format!("reading {path}"))?,
+            None => Vec::new(),
+        };
+        let first: ID3D12PipelineLibrary = device1.CreatePipelineLibrary(&base)?;
+        // `prime`'s pipeline stored first, as a library of many holds others.
+        if let Some(other) = companion {
+            let name = windows::core::HSTRING::from("primed");
+            first.StorePipeline(windows::core::PCWSTR(name.as_ptr()), other)?;
+        }
+        first.StorePipeline(windows::core::PCWSTR(wide.as_ptr()), pso)?;
+        let mut bytes = vec![0u8; first.GetSerializedSize()];
+        first.Serialize(&mut bytes)?;
+        let second: ID3D12PipelineLibrary = device1.CreatePipelineLibrary(&bytes)?;
+        Ok(second.LoadComputePipeline(windows::core::PCWSTR(wide.as_ptr()), desc)?)
+    }
+}
+
+/// `reload` `stress:<threads>`: as a launch makes pipelines, each of
+/// `threads` threads makes the program four times, two of them with its
+/// shadow sampler made a point sampler (other root signatures), storing
+/// each in one shared library as it is made; the library is serialized and
+/// one of the program's own entries loaded back.
+fn stress(device: &ID3D12Device, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC, threads: usize) -> Result<ID3D12PipelineState> {
+    let device1: ID3D12Device1 = device.cast()?;
+    // SAFETY: a new library.
+    let library: ID3D12PipelineLibrary = unsafe { device1.CreatePipelineLibrary(&[]) }?;
+    // SAFETY: the root signature behind `desc`, held while the threads run.
+    let root: ID3D12RootSignature = unsafe { std::mem::transmute_copy::<_, Option<ID3D12RootSignature>>(&desc.pRootSignature) }
+        .context("no root signature")?;
+    let code = (desc.CS.pShaderBytecode as usize, desc.CS.BytecodeLength);
+    std::thread::scope(|scope| -> Result<()> {
+        let mut workers = Vec::new();
+        for t in 0..threads {
+            let (library, device, root) = (library.clone(), device.clone(), root.clone());
+            workers.push(scope.spawn(move || -> Result<()> {
+                for k in 0..4 {
+                    // The point-sampler twin's root signature: made from the
+                    // same description with s3's filter 0 (see `patch_samplers`).
+                    let use_root = if k % 2 == 1 { point_root(&device)? } else { root.clone() };
+                    let d = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        // SAFETY: a borrowed pointer the description never releases.
+                        pRootSignature: unsafe { std::mem::transmute_copy(&use_root) },
+                        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.0 as *const _, BytecodeLength: code.1 },
+                        ..Default::default()
+                    };
+                    // SAFETY: the description points at live data.
+                    let pso: ID3D12PipelineState = unsafe { device.CreateComputePipelineState(&d) }?;
+                    let name = windows::core::HSTRING::from(format!("stress-{t}-{k}"));
+                    // SAFETY: a live library and pipeline.
+                    unsafe { library.StorePipeline(windows::core::PCWSTR(name.as_ptr()), &pso) }?;
+                }
+                Ok(())
+            }));
+        }
+        for w in workers {
+            w.join().map_err(|_| anyhow::anyhow!("a stress thread panicked"))??;
+        }
+        Ok(())
+    })?;
+    // SAFETY: the library is idle now; the bytes outlive the library made
+    // from them, which outlives the load.
+    unsafe {
+        let mut bytes = vec![0u8; library.GetSerializedSize()];
+        library.Serialize(&mut bytes)?;
+        let second: ID3D12PipelineLibrary = device1.CreatePipelineLibrary(&bytes)?;
+        let name = windows::core::HSTRING::from(format!("stress-{}-0", threads - 1));
+        Ok(second.LoadComputePipeline(windows::core::PCWSTR(name.as_ptr()), desc)?)
+    }
+}
+
+/// `root` with static sampler s3 a point sampler without comparison.
+fn point_root(device: &ID3D12Device) -> Result<ID3D12RootSignature> {
+    let blob = POINT_ROOT.get().context("no point root signature")?;
+    // SAFETY: a serialized root signature.
+    Ok(unsafe { device.CreateRootSignature(0, blob) }?)
+}
+
+/// The library name of the first program, for `reload` `save:`.
+static PIPELINE_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The captured root signature with s3 a point sampler, for [`stress`].
+static POINT_ROOT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
 /// Asks the driver to commit its background work now (the shaders it
 /// compiles again from what it measured) and waits for it: what it says.
@@ -2052,6 +2216,7 @@ mod tests {
             retranslate: false,
             show: 2,
             diffs: None,
+            reload: None,
             prime: None,
             hash_salt: 0,
             warp: false,
