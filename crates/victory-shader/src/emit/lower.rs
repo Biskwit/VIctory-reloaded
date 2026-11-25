@@ -335,8 +335,16 @@ const LANE_MASK: Why = "a lane mask read as data";
 /// bit) as a number.
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
-/// the branch that do not post-dominate it). None with an indirect exit (not followed).
+/// the branch that do not post-dominate it, and the branch's own block if those lead back to
+/// it). None with an indirect exit (not followed).
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+    all_lane_blocks_of(st, &|_| true)
+}
+
+/// [`all_lane_blocks`] for every thread of the group: a branch on a scalar `alike` does not
+/// hold (one that may differ between the group's console waves, [`wave_varying`]) counts as
+/// a branch on lanes too.
+fn all_lane_blocks_of(st: &Structured, alike: &dyn Fn(Value) -> bool) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -376,14 +384,27 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     }
     let mut all = vec![true; n];
     for (d, e) in st.exits.iter().enumerate() {
-        let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
+        let LaneExit::Branch { when, .. } = *e else {
+            continue;
+        };
+        if st
+            .bools
+            .support(when)
+            .iter()
+            .all(|a| matches!(a, Atom::Uniform(v) if alike(*v)))
+        {
             continue; // a uniform branch: all lanes go the same way
         }
         // blocks reachable from the lane branch that do not post-dominate it
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
+            if b == d {
+                // back to the branch itself (which post-dominates itself): it closes or
+                // leaves a loop, whose later passes fewer lanes run
+                all[d] = false;
+                continue;
+            }
             if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
                 continue;
             }
@@ -393,6 +414,56 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
         }
     }
     Some(all)
+}
+
+/// Scalar values (SGPRs, SCC) that may differ between the console waves of one thread group:
+/// the thread-group info SGPR (`info`, which holds the wave's number), EXEC, what lanes give
+/// (an SGPR a vector instruction writes: `v_readfirstlane`, `v_readlane`, compares), lane
+/// masks read as numbers, and whatever is computed from those. The user SGPRs, the group's
+/// ids and constants, and loads from such addresses, are the group's.
+fn wave_varying(p: &Program, st: &Structured, info: Option<u8>) -> HashSet<Value> {
+    let lanes = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let mut varying: HashSet<Value> = p
+        .inputs
+        .iter()
+        .filter(|(r, _)| matches!(*r, Reg::S(c) if Some(c) == info || c == EXEC || c == EXEC + 1))
+        .map(|&(_, v)| v)
+        .collect();
+    loop {
+        let before = varying.len();
+        for block in &p.blocks {
+            for phi in block
+                .phis
+                .iter()
+                .filter(|phi| !matches!(phi.reg, Reg::V(_)))
+            {
+                if phi.args.iter().any(|&a| varying.contains(&a) || lanes(a)) {
+                    varying.insert(phi.value);
+                }
+            }
+            for inst in &block.insts {
+                let vector = !matches!(
+                    inst.fields,
+                    Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }
+                );
+                let from = inst
+                    .reads
+                    .iter()
+                    .any(|&(r, v)| !matches!(r, Reg::V(_)) && (varying.contains(&v) || lanes(v)));
+                if vector || from {
+                    varying.extend(
+                        inst.writes
+                            .iter()
+                            .filter(|w| !matches!(w.0, Reg::V(_)))
+                            .map(|w| w.1),
+                    );
+                }
+            }
+        }
+        if varying.len() == before {
+            return varying;
+        }
+    }
 }
 
 /// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
@@ -1274,7 +1345,16 @@ impl<'a> Lower<'a> {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
-                    if let Some(all) = all_lane_blocks(x.st) {
+                    // With several console waves in the group, a block is one the whole group
+                    // runs only if no branch that may go one way in one console wave and
+                    // another in the next lies before it: the barriers of the exchanges must
+                    // be the same for every thread.
+                    let varying = if group > 64 {
+                        wave_varying(p, x.st, cs.system_sgprs().1)
+                    } else {
+                        HashSet::new()
+                    };
+                    if let Some(all) = all_lane_blocks_of(x.st, &|v| !varying.contains(&v)) {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
@@ -11186,5 +11266,58 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::{all_lane_blocks, all_lane_blocks_of, wave_varying};
+    use crate::ir::{self, Reg};
+    use crate::structure;
+
+    fn build(words: &[u32]) -> ir::Program {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        ir::build(&code, true, 16).expect("ir::build")
+    }
+
+    #[test]
+    fn a_loop_its_lanes_leave_is_not_run_by_every_lane() {
+        // One block that loops until every lane left it (the last pass runs one key's
+        // lanes): it is the branch's own block, which post-dominates itself.
+        let p = build(&[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x7E02_0500, // loop: v_readfirstlane_b32 s1, v0
+            0x7D84_0001, // v_cmp_eq_u32 vcc, s1, v0
+            0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+            0x89FE_7E02, // s_xor_b64 exec, s[2:3], exec
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0xBF81_0000, // s_endpgm
+        ]);
+        let st = structure::structure(&p).unwrap();
+        assert_eq!(all_lane_blocks(&st).unwrap(), [true, false, true]);
+    }
+
+    #[test]
+    fn a_branch_on_a_lane_s_value_splits_the_console_waves_of_a_group() {
+        // s1 is the first lane's v0: one console wave may branch and the next not. s0, a
+        // user SGPR, is the group's.
+        for (scalar, varies) in [(0x7E02_0500, true), (0xBE81_0300, false)] {
+            let p = build(&[
+                scalar,      // v_readfirstlane_b32 s1, v0 | s_mov_b32 s1, s0
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0001, // s_cbranch_scc1 -> end
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xBF81_0000, // end: s_endpgm
+            ]);
+            let st = structure::structure(&p).unwrap();
+            let varying = wave_varying(&p, &st, None);
+            let s1 = p.blocks[0].insts[0].write(Reg::S(1)).unwrap();
+            assert_eq!(varying.contains(&s1), varies);
+            // one console wave: the branch is uniform either way
+            assert_eq!(all_lane_blocks(&st).unwrap(), [true, true, true]);
+            // several: the skipped block is run by every thread only if s1 is the group's
+            let all = all_lane_blocks_of(&st, &|v| !varying.contains(&v)).unwrap();
+            assert_eq!(all, [true, !varies, true]);
+        }
     }
 }
