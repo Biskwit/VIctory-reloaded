@@ -705,12 +705,23 @@ pub(crate) enum Written {
     GpuTimestamp,
     /// The CPU's performance counter.
     SystemTimestamp,
+    /// The bytes of title memory at this address, as they are then (a
+    /// title copy out of what the list's own shaders write).
+    Bytes(usize),
 }
 
 impl Written {
     /// Stores the low `bytes` (4 or 8) of the value at `at`.
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
         let value = match self {
+            #[cfg(windows)]
+            Written::Bytes(from) => {
+                crate::host::copy_mapped(at, from as *const u8, bytes, true);
+                crate::watch::wrote(at as usize, bytes);
+                return;
+            }
+            #[cfg(not(windows))]
+            Written::Bytes(_) => return,
             Written::Value(v) => v,
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -1082,5 +1093,17 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bytes_are_copied_as_they_are_when_written() {
+        let mut from = [1u8; 24];
+        let mut at = [0u8; 24];
+        let what = Written::Bytes(from.as_ptr() as usize);
+        // What a shader stores after the copy was recorded.
+        from[20] = 7;
+        what.write(at.as_mut_ptr(), 24);
+        assert_eq!(at, from);
     }
 }

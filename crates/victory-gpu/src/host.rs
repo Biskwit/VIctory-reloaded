@@ -5525,6 +5525,15 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
+    /// Whether shaders of the list, as recorded so far, may write title
+    /// memory in `[address, address + len)` ([`HostList::defer_gpu_write`]).
+    pub(crate) fn shaders_write(&self, address: usize, len: usize) -> bool {
+        self.deferred()
+            .copies
+            .iter()
+            .any(|step| matches!(step, Step::GpuWrite(_, at, n) if *at < address + len && address < *at + *n))
+    }
+
     /// A read back: once the list has run, `rows` rows of `row` bytes go
     /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
