@@ -594,7 +594,19 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
 /// after it could see that (a scalar register or SCC that the region
 /// changes and the join merges with the value from before; EXEC aside,
 /// which is empty either way). `None` if nothing changes.
+/// Passes repeat until none removes a branch: nested `if`s that share their
+/// join (`if (a) { ..; if (b) { .. } }`) skip to it from both branches, so the
+/// inner branch is a pure skip only once the outer one is gone.
 pub(crate) fn without_skips(p: &Program) -> Option<Program> {
+    let mut out = skips_once(p)?;
+    while let Some(next) = skips_once(&out) {
+        out = next;
+    }
+    Some(out)
+}
+
+/// One pass of [`without_skips`] over `p`.
+fn skips_once(p: &Program) -> Option<Program> {
     let n = p.blocks.len();
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
@@ -661,6 +673,194 @@ pub(crate) fn without_skips(p: &Program) -> Option<Program> {
             blocks[b].exit = Exit::Jump(not_taken);
             any = true;
         }
+    }
+    if !any {
+        return None;
+    }
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks).ok()?;
+    Some(rename(blocks, p.wave64, p.vgprs))
+}
+
+/// The program with every branch on lanes decided as the console's wave
+/// decides it: `s_cbranch_execz`/`execnz` and `vccz`/`vccnz` test whether
+/// EXEC or VCC holds any lane (`s_bcnt1_i32` of it into a spare scalar, then
+/// `s_cmp_lg_u32` against 0 and `s_cbranch_scc0`/`scc1`). The lowering then
+/// sees no branch that sends some lanes one way and some another: every lane
+/// goes where the console wave goes, lanes outside EXEC under its guards, as
+/// on the console, so scalar values and joins are the console's exactly. A
+/// thread group that is one console wave then reaches every block whole, and
+/// its two host waves can meet anywhere.
+/// A branch is left as it is where SCC is live after it (the compare would
+/// change it), and without `loops` so is a loop's closing branch (a waterfall
+/// loop over per-lane descriptors is one resource tracking needs per lane).
+/// `None` if no branch changes or no spare scalar code is left.
+pub(crate) fn uniform_branches(p: &Program, loops: bool) -> Option<Program> {
+    let mut used = [false; 256];
+    let mut mark = |r: Reg| {
+        if let Reg::S(c) = r {
+            used[usize::from(c)] = true;
+        }
+    };
+    for (reg, _) in &p.inputs {
+        mark(*reg);
+    }
+    for block in &p.blocks {
+        for phi in &block.phis {
+            mark(phi.reg);
+        }
+        for inst in &block.insts {
+            for &(r, _) in inst.reads.iter().chain(&inst.writes) {
+                mark(r);
+            }
+        }
+    }
+    // a code no machine word names (255 stays unused, as for parked scalars)
+    let spare = (usize::from(PARKED)..255).rev().find(|&c| !used[c])? as u8;
+    let order = reverse_postorder(&p.blocks);
+    let (_, live_out) = liveness(&p.blocks, &order);
+    let (wave64, lanes) = (p.wave64, 1 + u8::from(p.wave64));
+    let decoded = |word: u32, offset: usize| -> Option<Instruction> {
+        // (then `s_endpgm`: the decoder follows the code to its end)
+        let code: Vec<u8> = [word, 0xBF81_0000]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let mut i = gfx10::decode(&code).ok()?.into_iter().next()?;
+        i.offset = offset;
+        Some(i)
+    };
+    let inst = |machine: Instruction, fields: Fields| -> Option<Inst> {
+        let name = machine.name()?;
+        let (reads, writes) = effects(&machine, &fields, name, lanes, p.vgprs).ok()??;
+        let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
+        Some(Inst {
+            machine,
+            fields,
+            reads: unset(reads),
+            writes: unset(writes),
+        })
+    };
+    // `s_bcnt1_i32_b64` (b32 in wave32) of mask register `mask` into the spare code, then
+    // `s_cmp_lg_u32` of that against 0: SCC is whether the mask holds any lane. (SOP1 and
+    // SOPC words naming s0, which becomes the spare code, as no word can hold it.)
+    let any_lane = |mask: u8, at: usize| -> Option<[Inst; 2]> {
+        let op: u32 = if wave64 { 0x10 } else { 0x0F };
+        let count = decoded(0xBE80_0000 | op << 8 | u32::from(mask), at)?;
+        let mut count_fields = count.fields(wave64);
+        if let Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            ..
+        } = &mut count_fields
+        {
+            *code = spare;
+        }
+        let cmp = decoded(0xBF07_8000, at)?;
+        let mut cmp_fields = cmp.fields(wave64);
+        if let Fields::Sop { src, .. } = &mut cmp_fields
+            && let Some(Operand::Scalar { code, .. }) = src.first_mut()
+        {
+            *code = spare;
+        }
+        Some([inst(count, count_fields)?, inst(cmp, cmp_fields)?])
+    };
+    let width = if wave64 { "_b64" } else { "_b32" };
+    let mut rpo = vec![usize::MAX; p.blocks.len()];
+    for (n, &b) in order.iter().enumerate() {
+        rpo[b] = n;
+    }
+    let mut blocks = p.blocks.clone();
+    let mut any = false;
+    for (b, block) in blocks.iter_mut().enumerate() {
+        let Exit::Branch { taken, not_taken } = block.exit else {
+            continue;
+        };
+        let closes_loop = rpo[taken] <= rpo[b] || rpo[not_taken] <= rpo[b];
+        if contains(&live_out[b], Reg::Scc) || closes_loop && !loops {
+            continue;
+        }
+        let Some(last) = block.insts.last() else {
+            continue;
+        };
+        let at = last.machine.offset;
+        // the mask tested, and the SOPP word of the branch on SCC that replaces this one
+        let (mask, word) = match last.name() {
+            "s_cbranch_execz" => (EXEC, Some(0xBF84_0000)), // s_cbranch_scc0
+            "s_cbranch_execnz" => (EXEC, Some(0xBF85_0000)), // s_cbranch_scc1
+            "s_cbranch_vccz" => (VCC, Some(0xBF84_0000)),
+            "s_cbranch_vccnz" => (VCC, Some(0xBF85_0000)),
+            // SCC of a lane-mask operation (`s_andn2_b64 s0, s0, exec` closing a loop over
+            // lanes): whether its result, still in its register, holds any lane
+            "s_cbranch_scc0" | "s_cbranch_scc1" => {
+                let n = block.insts.len() - 1;
+                let Some(w) = (0..n)
+                    .rev()
+                    .find(|&i| block.insts[i].write(Reg::Scc).is_some())
+                else {
+                    continue;
+                };
+                let writer = &block.insts[w];
+                let Some(op) = writer
+                    .name()
+                    .strip_prefix("s_")
+                    .and_then(|o| o.strip_suffix(width))
+                else {
+                    continue;
+                };
+                let (base, to_exec) =
+                    match (op.strip_suffix("_saveexec"), op.strip_suffix("_wrexec")) {
+                        (Some(f), _) | (_, Some(f)) => (f, true),
+                        _ => (op, false),
+                    };
+                let bitwise = [
+                    "and", "or", "xor", "andn1", "andn2", "orn1", "orn2", "nand", "nor", "xnor",
+                    "not",
+                ];
+                if !bitwise.contains(&base) {
+                    continue;
+                }
+                let mask = match &writer.fields {
+                    _ if to_exec => EXEC,
+                    Fields::Sop {
+                        dst: Some(Operand::Scalar { code, .. }),
+                        ..
+                    } if *code != gfx10::NULL => *code,
+                    _ => continue,
+                };
+                let regs = [Reg::S(mask), Reg::S(mask + u8::from(wave64))];
+                if block.insts[w + 1..n]
+                    .iter()
+                    .any(|i| regs.iter().any(|&r| i.write(r).is_some()))
+                {
+                    continue;
+                }
+                (mask, None)
+            }
+            _ => continue,
+        };
+        let Some(test) = any_lane(mask, at) else {
+            continue;
+        };
+        let branch = match word {
+            Some(word) => {
+                let Some(branch) = decoded(word, at) else {
+                    continue;
+                };
+                let fields = branch.fields(wave64);
+                let Some(branch) = inst(branch, fields) else {
+                    continue;
+                };
+                branch
+            }
+            None => last.clone(),
+        };
+        block.insts.pop();
+        block.insts.extend(test);
+        block.insts.push(branch);
+        any = true;
     }
     if !any {
         return None;
@@ -1564,6 +1764,101 @@ mod tests {
         assert_eq!(add.read(Reg::S(0)), Some(phi.value));
         assert_eq!(b1.insts[1].read(Reg::S(0)), add.write(Reg::S(0)));
         assert_eq!(b2.insts[0].name(), "s_endpgm");
+    }
+
+    /// The names of the branches that end blocks.
+    fn branches(p: &Program) -> Vec<&'static str> {
+        p.blocks
+            .iter()
+            .filter(|b| matches!(b.exit, Exit::Branch { .. }))
+            .filter_map(|b| b.insts.last().map(Inst::name))
+            .collect()
+    }
+
+    #[test]
+    fn nested_skips_that_share_their_join_both_go() {
+        // if (lane < 40) { v1 = 1; if (lane < 20) v1 = 2; }: both branches skip to
+        // the join, which the inner one is a pure skip to only without the outer.
+        let p = build_words(
+            &[
+                0xBE82_047E, // s_mov_b64 s[2:3], exec
+                0x7DA8_00A8, // v_cmpx_gt_u32 exec, 40, v0
+                0xBF88_0004, // s_cbranch_execz -> join
+                0x7E02_0281, // v_mov_b32 v1, 1
+                0x7DA8_0094, // v_cmpx_gt_u32 exec, 20, v0
+                0xBF88_0001, // s_cbranch_execz -> join
+                0x7E02_0282, // v_mov_b32 v1, 2
+                0xBEFE_0402, // join: s_mov_b64 exec, s[2:3]
+                0x7E04_0301, // v_mov_b32 v2, v1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert_eq!(branches(&p), ["s_cbranch_execz", "s_cbranch_execz"]);
+        let once = skips_once(&p).expect("the outer skip goes");
+        assert_eq!(branches(&once), ["s_cbranch_execz"]);
+        let all = without_skips(&p).expect("both go");
+        assert!(branches(&all).is_empty(), "{:?}", branches(&all));
+    }
+
+    #[test]
+    fn uniform_branches_test_the_wave_as_the_console_does() {
+        // A loop over the lanes' keys: each pass takes the first lane's key and
+        // leaves out the lanes holding it, until no lane is left.
+        let p = build_words(
+            &[
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0x7E02_0500, // loop: v_readfirstlane_b32 s1, v0
+                0x7D84_0001, // v_cmp_eq_u32 vcc, s1, v0
+                0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+                0x89FE_7E02, // s_xor_b64 exec, s[2:3], exec
+                0xBF89_FFFB, // s_cbranch_execnz -> loop
+                0x7D84_0001, // v_cmp_eq_u32 vcc, s1, v0
+                0xBF87_0001, // s_cbranch_vccnz -> end
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,    // end
+            ],
+            true,
+        );
+        assert_eq!(branches(&p), ["s_cbranch_execnz", "s_cbranch_vccnz"]);
+        let u = uniform_branches(&p, true).expect("both branches change");
+        assert_eq!(branches(&u), ["s_cbranch_scc1", "s_cbranch_scc1"]);
+        // Each tests a count of the mask's lanes in a code no machine word names.
+        for block in u
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.exit, Exit::Branch { .. }))
+        {
+            let [.., count, cmp, _] = &block.insts[..] else {
+                panic!()
+            };
+            assert!(
+                count.name().starts_with("s_bcnt1_i32_b64"),
+                "{}",
+                count.name()
+            );
+            let spare = count.writes.iter().find_map(|w| match w.0 {
+                Reg::S(c) if c >= PARKED => Some(w.1),
+                _ => None,
+            });
+            assert!(spare.is_some() && cmp.reads.iter().any(|r| Some(r.1) == spare));
+        }
+        // Every branch is one the whole wave takes one way.
+        let st = crate::structure::structure(&u).unwrap();
+        for exit in &st.exits {
+            if let crate::structure::LaneExit::Branch { when, .. } = *exit {
+                let atoms = st.bools.support(when);
+                assert!(
+                    atoms
+                        .iter()
+                        .all(|a| matches!(a, crate::structure::Atom::Uniform(_))),
+                    "{atoms:?}"
+                );
+            }
+        }
+        // Without loops, the loop's closing branch stays a branch on lanes.
+        let u = uniform_branches(&p, false).expect("the second branch changes");
+        assert_eq!(branches(&u), ["s_cbranch_execnz", "s_cbranch_scc1"]);
     }
 
     #[test]
