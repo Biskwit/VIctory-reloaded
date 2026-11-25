@@ -173,6 +173,232 @@ fn private_mb() -> u64 {
     c.PagefileUsage as u64 >> 20
 }
 
+/// What the title asks the structure builder for in one call, while the
+/// call runs on this thread (`XboxBvhBuilder.dll`'s
+/// `BuildRaytracingAccelerationStructureBatched2X` and
+/// `CopyRaytracingAccelerationStructure`, which the title's code calls and
+/// `victory-hle` passes through here): the stretches of title memory the
+/// call's dispatches read, and those they also store in.
+///
+/// With [`pages`] these are made ready, to the page, before the first
+/// dispatch of the call, and nothing else is guessed for the builder's
+/// dispatches: a structure is built once, and a stage that found a page
+/// without a copy ran on zeros (run bvh-50: the first build stage missed
+/// 278 pages in its first frame, and the title died 23 frames later on
+/// what the stages stored from there). The descriptions say all of it: the
+/// structure and the scratch memory with the sizes the builder itself
+/// answers for the same inputs, each geometry's vertices, indices and
+/// transform with their counts, the instances and the structures they
+/// name.
+struct Batch {
+    /// `(address, bytes)`, stored in.
+    writes: Vec<(u64, u64)>,
+    /// `(address, bytes)`, only read.
+    reads: Vec<(u64, u64)>,
+    /// The lists whose submission already brings these up to date.
+    lists: Vec<usize>,
+}
+
+thread_local! {
+    static BATCH: std::cell::RefCell<Option<Batch>> = const { std::cell::RefCell::new(None) };
+}
+
+/// By address, a structure's bytes and the structures it names.
+type Structures = std::collections::BTreeMap<u64, (u64, Vec<u64>)>;
+
+/// The structures the builder was asked for: the bytes the builder said
+/// each may take, and for one built over instances the structures those
+/// name. The programs that walk a structure reach all of it through
+/// pointers, from an acceleration structure view that only gives the
+/// address.
+static STRUCTURES: Mutex<Structures> = Mutex::new(Structures::new());
+
+/// While it lives, the builder's dispatches on this thread are those of
+/// one call ([`Batch`]).
+pub struct Builds(());
+
+impl Drop for Builds {
+    fn drop(&mut self) {
+        BATCH.with(|b| *b.borrow_mut() = None);
+    }
+}
+
+/// A title address that can be read here: `len` bytes of it.
+fn title_bytes(at: u64, len: usize) -> Option<&'static [u8]> {
+    // SAFETY: just found committed; the title may be writing, and what is
+    // read is taken as numbers only.
+    (at != 0 && crate::texture::committed(at as *const u8, len)).then(|| unsafe { std::slice::from_raw_parts(at as *const u8, len) })
+}
+
+fn dword(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+}
+
+fn qword(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
+/// The bytes of the structure at `address`, at most `most`: what its
+/// header says once it is built (the second dword is its last 64-byte
+/// node; the leaves lie before it, run bvh-38's listing), so a structure
+/// that turned out smaller than the builder's bound holds fewer pages.
+fn structure_bytes(address: u64, most: u64) -> u64 {
+    match title_bytes(address, 8) {
+        Some(head) if dword(head, 0) & 0xfff0_ffff == 0x8000_0006 => ((u64::from(dword(head, 4)) + 1) * 64).min(most),
+        _ => most,
+    }
+}
+
+/// The bytes of a geometry's indices in the builder's packed format (53):
+/// a 12-byte header (clusters in the low 17 bits of the first dword,
+/// triangles in the second), 16 bytes a cluster, a dword a triangle (three
+/// 7-bit corners and the cluster), then the clusters' 16-bit vertex
+/// numbers, a cluster's from the offset its entry gives. Read off the
+/// refit stage's code (5062bc7a48e842f8 from 0x1cc), which finds a corner
+/// at `12 + 16 * clusters + 4 * triangles + 2 * (offset + corner)`.
+fn packed_index_bytes(head: &[u8], table: &[u8]) -> u64 {
+    let (clusters, triangles) = (u64::from(dword(head, 0) & 0x1_ffff), u64::from(dword(head, 4)));
+    let last = table
+        .chunks_exact(16)
+        .map(|e| u64::from(dword(e, 0) << 2 & 0x1_0000 | dword(e, 4) & 0xffff))
+        .max()
+        .unwrap_or(0);
+    12 + 16 * clusters + 4 * triangles + 2 * (last + 128)
+}
+
+/// [`packed_index_bytes`] of the indices at `at` in title memory.
+fn packed_index_bytes_at(at: u64) -> u64 {
+    let Some(head) = title_bytes(at, 12) else { return 12 };
+    let clusters = (dword(head, 0) & 0x1_ffff) as usize;
+    packed_index_bytes(head, title_bytes(at + 12, clusters * 16).unwrap_or(&[]))
+}
+
+/// What the build described by the 80 bytes of `desc` reads and stores
+/// (`D3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2`: the
+/// PC's build description, 48 bytes; the count and array of post-build
+/// notes; 16 bytes of stream description). `sizes` are the builder's own
+/// bounds for these inputs: the structure, the scratch memory of a build
+/// and of an update.
+/// shortcut: a procedural geometry's boxes are taken as 24 bytes each
+/// where the stride is smaller; no title seen has any.
+fn build_ranges(desc: &[u8], sizes: [u64; 3], batch: &mut Batch, structures: &mut Structures) {
+    let (dest, top, flags) = (qword(desc, 0), dword(desc, 8) == 0, dword(desc, 12));
+    let (count, pointers, inputs) = (dword(desc, 16) as usize, dword(desc, 20) == 1, qword(desc, 24));
+    let (source, scratch) = (qword(desc, 32), qword(desc, 40));
+    let update = flags & 0x20 != 0;
+    batch.writes.push((dest, sizes[0]));
+    batch.writes.push((scratch, if update { sizes[2] } else { sizes[1] }));
+    if update && source != 0 && source != dest {
+        let most = structures.get(&source).map_or(sizes[0], |s| s.0);
+        batch.reads.push((source, structure_bytes(source, most)));
+    }
+    if let Some(notes) = title_bytes(qword(desc, 56), dword(desc, 48) as usize * 16) {
+        batch.writes.extend(notes.chunks_exact(16).map(|n| (qword(n, 0), 64)));
+    }
+    // Each description, in an array or behind an array of pointers.
+    let each = |size: usize, i: usize| {
+        if pointers {
+            title_bytes(inputs + i as u64 * 8, 8).and_then(|p| title_bytes(qword(p, 0), size))
+        } else {
+            title_bytes(inputs + (i * size) as u64, size)
+        }
+    };
+    let mut parts = Vec::new();
+    for i in 0..count {
+        if top {
+            // An instance: its structure's address in its last 8 bytes.
+            if pointers {
+                batch.reads.push((inputs + i as u64 * 8, 8));
+            }
+            let Some(instance) = each(64, i) else { continue };
+            batch.reads.push((instance.as_ptr() as u64, 64));
+            let part = qword(instance, 56);
+            if part != 0 && !parts.contains(&part) {
+                parts.push(part);
+                let most = structures.get(&part).map_or(0, |s| s.0);
+                batch.reads.push((part, structure_bytes(part, most).max(256)));
+            }
+            continue;
+        }
+        let Some(g) = each(56, i) else { continue };
+        if dword(g, 0) == 1 {
+            batch.reads.push((qword(g, 16), qword(g, 8) * qword(g, 24).max(24)));
+            continue;
+        }
+        let (transform, format) = (qword(g, 8), dword(g, 16));
+        let (indices, vertices) = (u64::from(dword(g, 24)), u64::from(dword(g, 28)));
+        if transform != 0 {
+            batch.reads.push((transform, 48));
+        }
+        let index_at = qword(g, 32);
+        if index_at != 0 {
+            let bytes = match format {
+                42 => indices * 4,
+                53 => packed_index_bytes_at(index_at),
+                _ => indices * 2,
+            };
+            batch.reads.push((index_at, bytes));
+        }
+        // 16 bytes past the last vertex's start cover every position
+        // format, whatever the stride.
+        batch.reads.push((qword(g, 40), vertices * qword(g, 48) + 16));
+    }
+    // What lay where the new structure goes is no structure any more.
+    let gone: Vec<u64> = structures.range(dest..dest + sizes[0].max(1)).map(|(&a, _)| a).collect();
+    for a in gone {
+        structures.remove(&a);
+    }
+    structures.insert(dest, (sizes[0], parts));
+}
+
+/// The title asks the builder for the `count` builds described at `descs`
+/// (80 bytes each, [`build_ranges`]); `sizes` are the builder's bounds for
+/// each. Until the answer is dropped, the builder's dispatches on this
+/// thread have exactly that memory made ready ([`Batch`]).
+///
+/// # Safety
+/// `descs` points at `count` descriptions as the title passes them.
+pub unsafe fn structure_builds(descs: *const u8, count: u32, sizes: &[[u64; 3]]) -> Builds {
+    let mut batch = Batch { writes: Vec::new(), reads: Vec::new(), lists: Vec::new() };
+    let mut structures = STRUCTURES.lock().unwrap_or_else(|e| e.into_inner());
+    for (i, &sizes) in sizes.iter().enumerate().take(count as usize) {
+        // SAFETY: the caller's descriptions.
+        let desc = unsafe { std::slice::from_raw_parts(descs.add(i * 80), 80) };
+        build_ranges(desc, sizes, &mut batch, &mut structures);
+        #[cfg(feature = "diagnostics")]
+        crate::pipeline::audit(|| {
+            let words: Vec<u32> = (0..20).map(|k| dword(desc, k * 4)).collect();
+            format!("build {words:08x?} sizes {sizes:x?}")
+        });
+    }
+    drop(structures);
+    #[cfg(feature = "diagnostics")]
+    crate::pipeline::audit(|| {
+        let bytes = |r: &[(u64, u64)]| r.iter().map(|r| r.1).sum::<u64>() >> 10;
+        let (w, r) = (&batch.writes, &batch.reads);
+        format!("builds {count} writes {} ({} KiB) reads {} ({} KiB)", w.len(), bytes(w), r.len(), bytes(r))
+    });
+    BATCH.with(|b| *b.borrow_mut() = Some(batch));
+    Builds(())
+}
+
+/// The title asks the builder to copy the structure at `source` to
+/// `dest`, compacted: as [`structure_builds`], for the copy's dispatches.
+pub fn structure_copy(dest: u64, source: u64) -> Builds {
+    let mut structures = STRUCTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let (most, parts) = structures.get(&source).cloned().unwrap_or((0, Vec::new()));
+    // Its header is the title's by now: the title read the compacted size
+    // back before it asked. Unknown here, the megabyte a window gave.
+    let bytes = structure_bytes(source, if most == 0 { 1 << 20 } else { most });
+    #[cfg(feature = "diagnostics")]
+    crate::pipeline::audit(|| format!("copies {source:#x} to {dest:#x} bytes {bytes:#x} of {most:#x}"));
+    structures.insert(dest, (bytes, parts));
+    drop(structures);
+    let batch = Batch { writes: vec![(dest, bytes)], reads: vec![(source, bytes)], lists: Vec::new() };
+    BATCH.with(|b| *b.borrow_mut() = Some(batch));
+    Builds(())
+}
+
 struct Memory {
     /// Whether the process holds more than [`most_mb`], as of this frame.
     full: bool,
@@ -260,12 +486,15 @@ impl Memory {
             }
         };
         let stand_in = (FAR_FIRST + k as u64 * FAR_SPAN) * PAGE + (address - cell);
-        // The megabyte from the address on, as far as the range goes: the
-        // refit stage read its table past the two pages made ready before
-        // (run bvh-40: its faults at pages 0x1f2e0e, 0x1f2e2a, 0x1f2e37).
+        // From the address on, as far as the range goes: the refit stage
+        // read its table past the two pages made ready before (run bvh-40:
+        // its faults at pages 0x1f2e0e, 0x1f2e2a, 0x1f2e37), and past the
+        // megabyte made ready after that (run bvh-51: 400 to 1,100 pages a
+        // frame, up to 30 pages into a range). The copies are windows of
+        // 4 MiB, there with the first page.
         let end = (FAR_FIRST + (k as u64 + 1) * FAR_SPAN) * PAGE;
         let mut at = stand_in;
-        while at < (stand_in + 16 * PAGE).min(end) {
+        while at < end {
             self.map(at);
             at += PAGE;
         }
@@ -656,20 +885,28 @@ pub(crate) fn ready(
         m.frame = frame;
         m.refused.clear();
         m.full = private_mb() > most_mb();
+        #[cfg(feature = "diagnostics")]
+        crate::pipeline::audit(|| format!("held {} copies, {} of them pages; {} MB, full {}", m.copies.len(), m.held.len(), private_mb(), m.full));
         m.take_faults();
     }
     m.take_remapped();
     let numbered = m.copies.len();
     m.named.clear();
+    // The dispatches of a call of the structure builder have what the call
+    // describes, and no more ([`Batch`]).
+    let batched = pages() && BATCH.with(|b| b.borrow().is_some());
     for &address in addresses {
         if pages() && address / PAGE >= FAR_FIRST {
             // Reached through its stand-in range (`root_address`).
             m.stand_in(address);
+        } else if batched {
+            m.map(address);
         } else {
             m.name(address);
             m.named.push(address);
         }
     }
+    let (constants, structures) = if batched { (&[][..], &[][..]) } else { (constants, structures) };
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
     // memory nothing reads; one that is not the title's memory is refused.
@@ -689,6 +926,22 @@ pub(crate) fn ready(
     for &address in structures {
         m.name(address);
         m.named.push(address);
+        // One the builder was asked for, with the structures its instances
+        // name: every page of each, which a walk reaches through pointers
+        // (run bvh-50: the two programs that walk them found 700 to 3,500
+        // pages without a copy in most frames).
+        if pages() {
+            let known = STRUCTURES.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((most, parts)) = known.get(&address) {
+                let part = |&a: &u64| (a, known.get(&a).map_or(0, |s| s.0));
+                for (at, most) in std::iter::once((address, *most)).chain(parts.iter().map(part)) {
+                    for page in at / PAGE..(at + structure_bytes(at, most)).div_ceil(PAGE) {
+                        m.map(page * PAGE);
+                    }
+                }
+                continue;
+            }
+        }
         if address >> 40 != 0 || !crate::texture::committed(address as *const u8, 8) {
             continue;
         }
@@ -715,8 +968,41 @@ pub(crate) fn ready(
             m.named.push(u64::from(c) << 8);
         }
     }
-    for &address in addresses {
-        m.name_table(address);
+    if !batched {
+        for &address in addresses {
+            m.name_table(address);
+        }
+    }
+    // Each stretch of the call, once a list: its pages get their copies,
+    // and the copies are the ones brought up to date and, where the call
+    // stores, compared afterwards.
+    let mut near: Vec<(u32, bool)> = Vec::new();
+    if batched {
+        BATCH.with(|b| {
+            let mut b = b.borrow_mut();
+            let Some(b) = b.as_mut().filter(|b| !b.lists.contains(&(std::ptr::from_ref(list) as usize))) else {
+                return;
+            };
+            b.lists.push(std::ptr::from_ref(list) as usize);
+            for (ranges, stored) in [(&b.writes, true), (&b.reads, false)] {
+                for &(at, len) in ranges.iter().filter(|r| r.0 != 0 && r.1 != 0) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::pipeline::audit(|| format!("range {at:#x} {len:#x} {stored}"));
+                    for page in at / PAGE..(at + len).div_ceil(PAGE) {
+                        m.map(page * PAGE);
+                        match m.paged.get(&page) {
+                            Some(&n) => near.push((n, stored)),
+                            // A title buffer's copy or a window: by the
+                            // names, as without a call.
+                            None => m.named.push(page * PAGE),
+                        }
+                    }
+                }
+                if stored {
+                    m.stored = m.named.len();
+                }
+            }
+        });
     }
     let key = std::ptr::from_ref(heap) as usize;
     let (base, made) = match m.heaps.get(&key) {
@@ -743,8 +1029,8 @@ pub(crate) fn ready(
     const NEAR_PLAIN: usize = usize::MAX - 0x80_0000;
     // With `pages`: the page copies near what the dispatch names, and those
     // made since the last dispatch; the other copies as before.
-    let mut near: Vec<(u32, bool)> = std::mem::take(&mut m.fresh).into_iter().map(|n| (n, false)).collect();
-    for (i, &address) in m.named.iter().enumerate() {
+    near.extend(std::mem::take(&mut m.fresh).into_iter().map(|n| (n, false)));
+    for (i, &address) in m.named.iter().enumerate().filter(|_| !batched) {
         let page = address / PAGE;
         near.extend(m.paged.range(page..=page + REACH / PAGE).map(|(_, &n)| (n, i < m.stored)));
     }
@@ -805,4 +1091,96 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put(bytes: &mut [u8], at: usize, v: u64, len: usize) {
+        bytes[at..at + len].copy_from_slice(&v.to_le_bytes()[..len]);
+    }
+
+    /// Two clusters and five triangles; the second cluster's vertex
+    /// numbers begin 0x1_0003 words in (bit 14 of its first dword, the low
+    /// word of its second).
+    #[test]
+    fn packed_indices_end_after_the_last_clusters_numbers() {
+        let mut head = [0u8; 12];
+        put(&mut head, 0, 0xfff0_0002, 4);
+        put(&mut head, 4, 5, 4);
+        let mut table = [0u8; 32];
+        put(&mut table, 4, 0x9999_0040, 4);
+        put(&mut table, 16, 1 << 14, 4);
+        put(&mut table, 20, 3, 4);
+        assert_eq!(packed_index_bytes(&head, &table), 12 + 32 + 20 + 2 * (0x1_0003 + 128));
+    }
+
+    /// A bottom-level build of two geometries, then a top-level update
+    /// over two instances of it: what each reads and stores.
+    #[test]
+    fn a_build_names_what_its_description_says() {
+        let transform = [0u8; 48];
+        let mut geometry = [0u8; 112];
+        // 300 16-bit indices at 0x7_1000_0000, 100 vertices of 12 bytes.
+        put(&mut geometry, 8, transform.as_ptr() as u64, 8);
+        put(&mut geometry, 16, 57, 4);
+        put(&mut geometry, 24, 300, 4);
+        put(&mut geometry, 28, 100, 4);
+        put(&mut geometry, 32, 0x7_1000_0000, 8);
+        put(&mut geometry, 40, 0x7_2000_0000, 8);
+        put(&mut geometry, 48, 12, 8);
+        // 30 32-bit indices, 10 vertices of 32 bytes, no transform.
+        put(&mut geometry, 56 + 16, 42, 4);
+        put(&mut geometry, 56 + 24, 30, 4);
+        put(&mut geometry, 56 + 28, 10, 4);
+        put(&mut geometry, 56 + 32, 0x7_3000_0000, 8);
+        put(&mut geometry, 56 + 40, 0x7_4000_0000, 8);
+        put(&mut geometry, 56 + 48, 32, 8);
+        let note = [0x7_5000_0000u64, 0];
+        let mut desc = [0u8; 80];
+        put(&mut desc, 0, 0x8_0000_0000, 8);
+        put(&mut desc, 8, 1, 4);
+        put(&mut desc, 16, 2, 4);
+        put(&mut desc, 24, geometry.as_ptr() as u64, 8);
+        put(&mut desc, 40, 0x9_0000_0000, 8);
+        put(&mut desc, 48, 1, 4);
+        put(&mut desc, 56, note.as_ptr() as u64, 8);
+        let mut batch = Batch { writes: Vec::new(), reads: Vec::new(), lists: Vec::new() };
+        let mut structures = Structures::new();
+        // A structure that lay inside the new one's bytes is forgotten.
+        structures.insert(0x8_0000_1000, (64, Vec::new()));
+        build_ranges(&desc, [0x3000, 0x5000, 0x800], &mut batch, &mut structures);
+        assert_eq!(batch.writes, [(0x8_0000_0000, 0x3000), (0x9_0000_0000, 0x5000), (0x7_5000_0000, 64)]);
+        assert_eq!(
+            batch.reads,
+            [
+                (transform.as_ptr() as u64, 48),
+                (0x7_1000_0000, 600),
+                (0x7_2000_0000, 1216),
+                (0x7_3000_0000, 120),
+                (0x7_4000_0000, 336)
+            ]
+        );
+        assert_eq!(structures.into_iter().collect::<Vec<_>>(), [(0x8_0000_0000, (0x3000, Vec::new()))]);
+
+        let mut instances = [0u8; 128];
+        put(&mut instances, 56, 0x8_0000_0000, 8);
+        put(&mut instances, 64 + 56, 0x8_0000_0000, 8);
+        let mut desc = [0u8; 80];
+        put(&mut desc, 0, 0xa_0000_0000, 8);
+        put(&mut desc, 12, 0x20, 4);
+        put(&mut desc, 16, 2, 4);
+        put(&mut desc, 24, instances.as_ptr() as u64, 8);
+        put(&mut desc, 32, 0xb_0000_0000, 8);
+        put(&mut desc, 40, 0x9_0000_0000, 8);
+        let mut batch = Batch { writes: Vec::new(), reads: Vec::new(), lists: Vec::new() };
+        let mut structures = Structures::from([(0x8_0000_0000, (0x3000, Vec::new())), (0xb_0000_0000, (0x700, Vec::new()))]);
+        build_ranges(&desc, [0x1000, 0x5000, 0x800], &mut batch, &mut structures);
+        // The scratch memory of an update, and the structure updated from.
+        assert_eq!(batch.writes, [(0xa_0000_0000, 0x1000), (0x9_0000_0000, 0x800)]);
+        let at = instances.as_ptr() as u64;
+        assert_eq!(batch.reads, [(0xb_0000_0000, 0x700), (at, 64), (0x8_0000_0000, 0x3000), (at + 64, 64)]);
+        assert_eq!(structures[&0xa_0000_0000], (0x1000, vec![0x8_0000_0000]));
+    }
 }
