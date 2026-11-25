@@ -951,7 +951,7 @@ fn into_destination(
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        let _open = victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -966,6 +966,24 @@ fn into_destination(
             (offset + len).div_ceil(PAGE),
         )
     };
+    // Grand Theft Auto VI enqueues requests whose page list it has not
+    // filled in yet (a run that read the lists at enqueue found page number
+    // 0 in 22,933 of them, bvh-09) and fills them in before the console
+    // gets to them. A worker here can get there first: the request then
+    // failed on "page 0" and its resource stayed unwritten (15 requests in
+    // run bvh-08, 61 in fx38-rt, where the title's threads were slower).
+    // So a list with a page 0 in it is waited for.
+    // shortcut: for two seconds at most, looked at every millisecond; a
+    // list still not filled in fails as before.
+    // SAFETY: the title's list, as above; read anew each time (the title
+    // is writing it).
+    let filled = || pages.iter().all(|page| unsafe { std::ptr::from_ref(page).read_volatile() } != 0);
+    for _ in 0..2000 {
+        if filled() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {

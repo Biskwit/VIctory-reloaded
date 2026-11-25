@@ -386,6 +386,16 @@ struct Guards {
     /// blocks ([`mirror`]), with those blocks: a write here is a write
     /// there.
     mirrored: BTreeMap<usize, Vec<usize>>,
+    /// Block ranges the kernel is writing ([`writing`]): not made
+    /// read-only until it is done.
+    held: Vec<(usize, usize)>,
+}
+
+impl Guards {
+    /// Whether the kernel is writing block `block`.
+    fn held(&self, block: usize) -> bool {
+        self.held.iter().any(|&(from, to)| from <= block && block < to)
+    }
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -393,6 +403,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     mirrored: BTreeMap::new(),
+    held: Vec::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -539,11 +550,16 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             mirror(g, block);
         }
     };
-    if set(from, to) {
+    let held = (from..to).any(|block| g.held(block));
+    if !held && set(from, to) {
         note(g, from, to);
         return;
     }
     for block in from..to {
+        if g.held(block) {
+            // The kernel is writing it: it stays open, and written.
+            continue;
+        }
         if set(block, block + 1) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
@@ -562,9 +578,13 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 fn mirror(g: &mut Guards, block: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     for other in crate::inplace::other_views(block * BLOCK) {
-        let mut old = 0;
-        // SAFETY: title view memory; only its protection changes.
-        unsafe { VirtualProtect(other as *const _, BLOCK, PAGE_READONLY, &mut old) };
+        // Not under a write of the kernel's: the end of that write counts
+        // for `block` instead ([`Writing`]).
+        if !g.held(other / BLOCK) {
+            let mut old = 0;
+            // SAFETY: title view memory; only its protection changes.
+            unsafe { VirtualProtect(other as *const _, BLOCK, PAGE_READONLY, &mut old) };
+        }
         let of = g.mirrored.entry(other / BLOCK).or_default();
         if !of.contains(&block) {
             of.push(block);
@@ -583,9 +603,11 @@ pub(crate) fn view_mapped(at: usize, len: usize) {
     for block in at / BLOCK..at.saturating_add(len).div_ceil(BLOCK) {
         for other in crate::inplace::other_views(block * BLOCK) {
             if g.protected.contains(&(other / BLOCK)) {
-                let mut old = 0;
-                // SAFETY: title view memory; only its protection changes.
-                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) };
+                if !g.held(block) {
+                    let mut old = 0;
+                    // SAFETY: title view memory; only its protection changes.
+                    unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) };
+                }
                 g.mirrored.entry(block).or_default().push(other / BLOCK);
             }
         }
@@ -651,15 +673,44 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     !blocks.is_empty()
 }
 
-/// Before our own write into title memory `[at, at + len)` through the
-/// kernel (which does not fault into our handler): opens its guarded blocks.
-/// The runtime calls it (as `kernel_will_write`) before the title's kernel
+/// Before a write into title memory `[at, at + len)` through the kernel
+/// (which does not fault into our handler, but fails): opens its guarded
+/// blocks, and keeps them open until what it returns is dropped. The
+/// runtime calls it (as `kernel_will_write`) around the title's kernel
 /// reads into its own memory.
-pub fn writing(at: usize, len: usize) {
+///
+/// Opening alone was not enough: another thread's copy could guard the
+/// block again before the kernel wrote it. With the title's own addresses
+/// mirroring the card's ([`mirror`]) that happened: two DirectStorage reads
+/// failed with 0x800706f8 and the title stopped on a breakpoint (run
+/// fx38-rt).
+#[must_use = "the blocks may be guarded again once this is dropped"]
+pub fn writing(at: usize, len: usize) -> Writing {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    let end = at.saturating_add(len);
+    let range = (at / BLOCK, end.div_ceil(BLOCK));
+    {
+        let mut g = guards();
+        g.held.push(range);
+        open(&mut g, at, end);
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+    Writing(range)
+}
+
+/// A write of the kernel's into title memory under way ([`writing`]).
+pub struct Writing((usize, usize));
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        let mut g = guards();
+        if let Some(at) = g.held.iter().position(|&held| held == self.0) {
+            g.held.swap_remove(at);
+        }
+        // What was guarded or mirrored meanwhile was written.
+        open(&mut g, self.0.0 * BLOCK, self.0.1.saturating_mul(BLOCK));
+    }
 }
 
 /// Held shared by a read of title memory in place, and alone by the runtime
@@ -926,8 +977,15 @@ mod tests {
             !read(&mut file),
             "the kernel does not fault into our handler"
         );
-        writing(view + 100, 13);
+        let open = writing(view + 100, 13);
+        // A copy that asks meanwhile does not close the block under the
+        // kernel's write, and is told again once the write is over.
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some((view / PAGE..view / PAGE + 1).collect())
+        );
         assert!(read(&mut file));
+        drop(open);
         // SAFETY: the bytes just read.
         let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
         assert_eq!(landed, b"from the disk");
@@ -1186,7 +1244,7 @@ mod tests {
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
         let top = usize::MAX - 16;
-        writing(top, PAGE);
+        drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
     }
 }
