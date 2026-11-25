@@ -309,6 +309,28 @@ pub(crate) fn other_views(at: usize) -> Vec<usize> {
     v.slices.get(&key).map_or_else(Vec::new, |shown| shown.iter().copied().filter(|&a| a != at).collect())
 }
 
+/// The physical pages `at` shows: the section and the offset in it, if a
+/// view the runtime told of holds `at`.
+pub(crate) fn slice_of(at: usize) -> Option<(usize, u64)> {
+    let v = views();
+    let (&base, &(_, section, offset)) = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at)?;
+    Some((section, offset + (at - base) as u64))
+}
+
+/// Where the views that follow one another without a gap from `at` on end,
+/// `most` bytes on at the latest (`at` itself if no view holds it).
+pub(crate) fn viewed_to(at: usize, most: usize) -> usize {
+    let v = views();
+    let mut reached = at;
+    while reached < at + most {
+        match v.views.range(..=reached).next_back().filter(|(base, view)| *base + view.0 > reached) {
+            Some((&base, view)) => reached = base + view.0,
+            None => break,
+        }
+    }
+    reached.min(at + most)
+}
+
 /// The addresses that show the 64 KiB at `offset` of `section`.
 pub(crate) fn views_of(section: usize, offset: u64) -> Vec<usize> {
     views().slices.get(&(section, offset)).cloned().unwrap_or_default()

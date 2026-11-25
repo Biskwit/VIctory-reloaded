@@ -51,6 +51,40 @@ pub const SLOT_FAULTS: u8 = 253;
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// `RootType::Other` code of a user-data dword the host computes: the low
+/// 32 bits of the title address of the root view of root parameter `slot`;
+/// [`USER_ROOT_ADDRESS`] + 1: its bits from 32 up. Asked for with
+/// [`memory_pages`], by programs with a spilled user-data table, which
+/// then reach their root views as title memory by address.
+pub const USER_ROOT_ADDRESS: u32 = 0x105;
+
+/// See [`memory_pages`].
+static MEMORY_PAGES_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Programs with a spilled user-data table (the ray-tracing structure
+/// builder's) reach their root views as title memory by address
+/// ([`SLOT_MEMORY`]) too, at the view's address plus the offset. The host
+/// can then hold title memory by address in copies of a page each: a
+/// stage's stores through a root view and another's loads through an
+/// address meet in the same copy, which they do not when the view is a
+/// buffer of its own. Part of the translation.
+pub fn set_memory_pages(on: bool) {
+    MEMORY_PAGES_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_memory_pages`] is on.
+pub fn memory_pages() -> bool {
+    MEMORY_PAGES_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What a program leaves in the [`SLOT_FAULTS`] buffer above a page's
+/// number (bits 21 up): a number made from its code, by which the host
+/// says which program touched the page.
+pub fn fault_tag(code: &[u8]) -> u32 {
+    let sum = code.iter().fold(0x811c_9dc5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    (sum ^ sum >> 11 ^ sum >> 22) & 0x7ff
+}
+
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

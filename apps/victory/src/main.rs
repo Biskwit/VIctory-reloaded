@@ -161,6 +161,10 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
+            // `VICTORY_MEMORY_PAGES=1`: translate as with title memory by address in page copies
+            if std::env::var_os("VICTORY_MEMORY_PAGES").is_some_and(|v| v == "1") {
+                victory_shader::emit::set_memory_pages(true);
+            }
             translate::run(paths, validate, pipelines, list, jobs)
         }
         Command::Run {

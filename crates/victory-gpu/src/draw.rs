@@ -693,12 +693,22 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_THREADS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_THREADS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
         if kind == USER_THREADS {
             return self.threads.unwrap_or(u32::MAX);
+        }
+        if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
+            // The root view the program reaches as title memory by address.
+            return match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::View(address)) => {
+                    let address = crate::memory::root_address(address);
+                    if kind == USER_ROOT_ADDRESS { address as u32 } else { (address >> 32) as u32 }
+                }
+                _ => 0,
+            };
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -720,8 +730,8 @@ impl State {
         // The title address of the buffer view at that dword of the table.
         let address = match self.roots_ref(compute).get(usize::from(slot)) {
             Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
-                .and_then(|view| crate::descriptor::host::buffer_range(&view))
-                .map_or(0, |range| range.0),
+                .and_then(|view| crate::descriptor::host::view_address(&view))
+                .unwrap_or(0),
             _ => 0,
         };
         if address == 0 {
@@ -737,7 +747,13 @@ impl State {
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    fn memory_ready(
+        &self,
+        list: &HostList,
+        compute: bool,
+        writes: bool,
+        user: &[victory_shader::emit::UserData],
+    ) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
@@ -750,7 +766,19 @@ impl State {
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        // The structures the shader takes from acceleration structure
+        // views of its tables.
+        let structures: Vec<u64> = user
+            .iter()
+            .filter(|u| u.root == RootType::Other(victory_shader::emit::USER_VIEW_ADDRESS))
+            .filter_map(|u| match self.roots_ref(compute).get(usize::from(u.slot)) {
+                Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(u.dword) * 4),
+                _ => None,
+            })
+            .filter(|view| matches!(view, crate::descriptor::View::Shader(_, Some(desc)) if desc[1] == 11))
+            .filter_map(|view| crate::descriptor::host::view_address(&view))
+            .collect();
+        crate::memory::ready(list, heap, &addresses, &constants, &structures, writes)
     }
 
     /// The bound heap holding `handle`.
@@ -936,7 +964,7 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let Some(ready) = self.memory_ready(list, compute, writes, &t.host.user_data) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1814,6 +1842,24 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_builder(self.pipeline as This) {
             crate::pipeline::audit(|| self.op_text(format!("list {:#x} thread {:?} dispatch {x}x{y}x{z}", std::ptr::from_ref(list) as usize, std::thread::current().id()), true));
+        }
+        // The tables the builder's own code keeps outside title memory
+        // (root views above 40 bits), as they are when the dispatch is
+        // recorded.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            for root in self.roots_ref(true) {
+                if let Root::View(address) = *root
+                    && (address >> 40 != 0 || std::env::var_os("VICTORY_BVH_AUDIT_ROOTS").is_some())
+                    && crate::texture::committed(address as *const u8, 0x180)
+                {
+                    crate::pipeline::audit(|| {
+                        // SAFETY: just found committed.
+                        let bytes = unsafe { std::slice::from_raw_parts(address as *const u32, 0x60) };
+                        format!("table {address:#x} {bytes:08x?}")
+                    });
+                }
+            }
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
