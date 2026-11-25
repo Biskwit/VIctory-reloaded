@@ -735,8 +735,10 @@ pub(crate) struct HostList {
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
-    /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// shader-writable word in the card's memory, and a word of the host's
+    /// mapped memory zeroed when the list is submitted, copied into it
+    /// where the list first takes it ([`HostList::budget`]).
+    budget: OnceLock<Option<(ID3D12Resource, ID3D12Resource, usize)>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
@@ -1210,6 +1212,10 @@ pub(crate) fn dred_on() -> bool {
         cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
     })
 }
+
+/// Bytes of the budget words ([`HostList::budget`]): the work spent, the
+/// largest group count a mesh record asked for, the groups asked in all.
+const BUDGET_WORDS: u64 = 12;
 
 /// Indirect mesh dispatches since the last frame line: the largest group
 /// count a record asked for, and the groups asked in all (from the lists'
@@ -5048,6 +5054,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        self.budget_back();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -5632,17 +5639,37 @@ impl HostList {
 
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
+    ///
+    /// The shaders' atomic operations on it went to the host's memory, a
+    /// trip over the bus each: the amplification stage of a mesh draw made
+    /// four in a row, and dropping them took 18.0 ms of the card's 60 a
+    /// frame for mesh draws to 15.3 (timing runs tr-22, tr-24). The words
+    /// now live in the card's memory: the zeroed host words are copied in
+    /// where the list first takes the budget, and back out when it closes
+    /// (the frame line's mesh counts, read a run late as before).
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
+        let (card, buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
+                let host = host()?;
+                let (b, d) = host.shared_buffer(256)?;
+                Some((host.uav_buffer(256)?, b, d as usize))
             })
             .as_ref()?;
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
+            // SAFETY: an open list; live buffers. The host words are zeroed
+            // at submission (below), before the list runs; the card's words
+            // then take the shaders' atomic operations.
+            unsafe {
+                self.list.CopyBufferRegion(card, 0, buffer, 0, BUDGET_WORDS);
+                self.list.ResourceBarrier(&[transition(
+                    card,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
             let at = *data;
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
@@ -5664,7 +5691,27 @@ impl HostList {
             })));
         }
         // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some(unsafe { card.GetGPUVirtualAddress() })
+    }
+
+    /// Where the list took its budget: the card's words go back to the
+    /// host's, for the frame line's mesh counts.
+    fn budget_back(&self) {
+        if !self.deferred().budget_zeroed {
+            return;
+        }
+        let Some(Some((card, buffer, _))) = self.budget.get() else {
+            return;
+        };
+        // SAFETY: an open list; live buffers.
+        unsafe {
+            self.list.ResourceBarrier(&[transition(
+                card,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            self.list.CopyBufferRegion(buffer, 0, card, 0, BUDGET_WORDS);
+        }
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
