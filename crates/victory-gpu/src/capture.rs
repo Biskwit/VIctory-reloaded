@@ -334,16 +334,150 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// Sizes `<width>x<height>` named in `var` (comma-separated).
+fn sizes(var: &str) -> Vec<(u64, u32)> {
+    std::env::var(var)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| {
+            let (w, h) = s.trim().split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Whether a target of `width` x `height` is dumped: `VICTORY_DUMP_TARGETS`
+/// naming sizes (`2048x8192,1024x1024`) dumps only those (a frame has a
+/// hundred targets, the shadow atlas among them); anything else, all.
+fn dump_size(width: u64, height: u32) -> bool {
+    static ONLY: std::sync::OnceLock<Vec<(u64, u32)>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| sizes("VICTORY_DUMP_TARGETS"));
+    only.is_empty() || only.contains(&(width, height))
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|&(r, _)| r == resource as usize)
-        && let Some(copy) = crate::resource::host_copy(resource)
-    {
+    if targets.iter().any(|&(r, _)| r == resource as usize) {
+        return;
+    }
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    if dump_size(d.Width, d.Height) {
         targets.push((resource as usize, copy));
+    }
+}
+
+/// `VICTORY_DUMP_RECORDS=<width>x<height>`: in the frames
+/// `VICTORY_CAPTURE_FRAMES` lists, the group counts the title's indirect mesh
+/// records ask for, in the draws through the amplification stage into a
+/// depth target of that size (a shadow atlas, whose casters come from the
+/// title's culling dispatches). Such a draw gets a budget of its own, a slot
+/// of a buffer of ours, where the stage notes the record's group count (the
+/// largest and total words of `amplify.hlsl`) and charges only that draw.
+/// Written two presents later, when the frame's lists have run, as
+/// `frame-<n>-records-<w>x<h>.txt`: a line per draw, its group count, then
+/// the draw as the op listing gives it.
+static RECORDS: std::sync::Mutex<Vec<Records>> = std::sync::Mutex::new(Vec::new());
+
+/// The draws of one frame [`RECORDS`] notes.
+struct Records {
+    frame: u64,
+    size: (u64, u32),
+    buffer: ID3D12Resource,
+    data: usize,
+    draws: Vec<String>,
+}
+
+/// Bytes of a draw's slot: the stage's budget, largest and total words.
+const RECORD_SLOT: u64 = 16;
+/// Draws a frame notes at most.
+const RECORD_DRAWS: usize = 1 << 14;
+
+/// For an amplified draw of a record into a depth target of `depth`'s size:
+/// the address of the budget slot that notes its group count, if
+/// [`RECORDS`] wants it; `describe` names the draw.
+pub(crate) fn record_budget(
+    depth: Option<(u64, u32)>,
+    describe: impl FnOnce() -> String,
+) -> Option<u64> {
+    static ONLY: std::sync::OnceLock<Vec<(u64, u32)>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| sizes("VICTORY_DUMP_RECORDS"));
+    let size = depth?;
+    let frame = crate::queue::presented() + 1;
+    if folder().is_none() || !only.contains(&size) || !listed(frame) {
+        return None;
+    }
+    let mut records = RECORDS.lock().unwrap_or_else(|e| e.into_inner());
+    if !records.iter().any(|r| r.frame == frame && r.size == size) {
+        let (buffer, data) =
+            crate::host::host()?.shared_buffer(RECORD_SLOT * RECORD_DRAWS as u64)?;
+        records.push(Records {
+            frame,
+            size,
+            buffer,
+            data: data as usize,
+            draws: Vec::new(),
+        });
+    }
+    let r = records
+        .iter_mut()
+        .find(|r| r.frame == frame && r.size == size)?;
+    if r.draws.len() == RECORD_DRAWS {
+        return None;
+    }
+    let slot = r.draws.len() as u64;
+    r.draws.push(describe());
+    // SAFETY: a live buffer.
+    Some(unsafe { r.buffer.GetGPUVirtualAddress() } + slot * RECORD_SLOT)
+}
+
+/// At the present of `frame`: writes the [`RECORDS`] of frames presented two
+/// or more frames before.
+pub(crate) fn records_landed(frame: u64) {
+    let Some(folder) = folder() else { return };
+    let landed: Vec<Records> = {
+        let mut records = RECORDS.lock().unwrap_or_else(|e| e.into_inner());
+        let (landed, kept) = std::mem::take(&mut *records)
+            .into_iter()
+            .partition(|r| r.frame + 2 <= frame);
+        *records = kept;
+        landed
+    };
+    for r in landed {
+        let mut text = String::new();
+        let (mut asked, mut empty) = (0u64, 0usize);
+        for (i, draw) in r.draws.iter().enumerate() {
+            // SAFETY: the buffer's mapped words; the lists that wrote them ran.
+            let words: [u32; 3] = std::array::from_fn(|k| unsafe {
+                ((r.data + i * RECORD_SLOT as usize) as *const u32)
+                    .add(k)
+                    .read_volatile()
+            });
+            asked += u64::from(words[2]);
+            empty += usize::from(words[2] == 0);
+            text.push_str(&format!(
+                "{i} groups {} charged {} | {draw}\n",
+                words[2],
+                words[0] / 128
+            ));
+        }
+        let path = folder.join(format!(
+            "frame-{}-records-{}x{}.txt",
+            r.frame, r.size.0, r.size.1
+        ));
+        match std::fs::write(&path, text) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), draws = r.draws.len(), asked, empty, "indirect mesh records saved")
+            }
+            Err(e) => tracing::warn!(error = %e, path = %path.display(), "records not saved"),
+        }
     }
 }
 

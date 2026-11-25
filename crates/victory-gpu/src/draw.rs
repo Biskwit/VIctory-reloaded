@@ -1902,18 +1902,23 @@ impl State {
 
     /// A mesh draw through the pipeline's twin with an amplification stage
     /// (`crate::pipeline::host::Amplified`): the title's record at `record`
-    /// (a host copy and its offset), bounded and charged to the list's
+    /// (a host copy, its offset, and the title's address), bounded and charged to the list's
     /// budget by the stage, or `direct` groups. False if it cannot run so
     /// (no twin, an unaligned record, no budget): the caller goes the
     /// plain way.
-    fn amplified(&mut self, list: &HostList, record: Option<(&ID3D12Resource, u64)>, direct: u32) -> bool {
+    fn amplified(
+        &mut self,
+        list: &HostList,
+        record: Option<(&ID3D12Resource, u64, u64)>,
+        direct: u32,
+    ) -> bool {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
         let Some(a) = &p.amplified else {
             return false;
         };
-        if record.is_some_and(|(_, offset)| !offset.is_multiple_of(4)) {
+        if record.is_some_and(|(_, offset, _)| !offset.is_multiple_of(4)) {
             return false;
         }
         let (Some(budget), Ok(l6)) = (list.budget(), list.list.cast::<ID3D12GraphicsCommandList6>()) else {
@@ -1926,9 +1931,27 @@ impl State {
             return false;
         }
         // SAFETY: a live buffer.
-        let at = record.map_or(budget, |(buffer, offset)| unsafe { buffer.GetGPUVirtualAddress() } + offset);
+        let at = record.map_or(
+            budget,
+            |(buffer, offset, _)| unsafe { buffer.GetGPUVirtualAddress() } + offset,
+        );
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("mesh {direct} amplified"), false));
+        // A record's group count noted in a slot of its own
+        // (`VICTORY_DUMP_RECORDS`).
+        #[cfg(feature = "diagnostics")]
+        let budget = record
+            .and_then(|(_, _, title)| {
+                let depth = crate::resource::host_made(self.depth as This).map(|r| {
+                    // SAFETY: a live resource.
+                    let d = unsafe { r.GetDesc() };
+                    (d.Width, d.Height)
+                });
+                crate::capture::record_budget(depth, || {
+                    self.op_text(format!("mesh 0 amplified at {title:#x}"), false)
+                })
+            })
+            .unwrap_or(budget);
         self.mesh_scissor(list, true);
         // SAFETY: an open list with everything else set; the twin's root
         // signature has these parameters; the host copy and the budget are
@@ -2509,7 +2532,11 @@ impl State {
         // with no clamp pass of ours ahead of the draw.
         if kind == MESH && max == 1 && count.is_none() && crate::pipeline::host::amplify_takes().1 {
             args.refresh(list, arguments, len);
-            if self.amplified(list, Some((&args.buffer, args.offset(arguments))), 0) {
+            if self.amplified(
+                list,
+                Some((&args.buffer, args.offset(arguments), arguments)),
+                0,
+            ) {
                 self.window = None;
                 return true;
             }
