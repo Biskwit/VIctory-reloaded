@@ -59,8 +59,11 @@ pub(crate) enum C {
     BackCompared,
     /// Reading around unmapped pages after a failed bulk read.
     SparseUs,
-    /// Guarding view memory (part of the write-watch askings' time).
-    GuardUs,
+    /// Guarding view memory (part of the write-watch askings' time), in
+    /// nanoseconds, as all the guards' times: most of their calls take
+    /// under a microsecond, and summed in whole microseconds run late-39's
+    /// parts came to 13 of the 27 ms a frame of guarding.
+    GuardNs,
     /// Bytes copied whole because their memory is neither write-watched
     /// nor a view (`Shadow::update_free`).
     WholeBytes,
@@ -128,22 +131,29 @@ pub(crate) enum C {
     WaitsForBuffers,
     IndirectBounded,
     /// Guards put back (`crate::watch`): VirtualProtect calls for runs of
-    /// blocks and their microseconds, for other views of the same pages and
-    /// theirs, and blocks looked at outside clean runs.
+    /// blocks and their time, for other views of the same pages and theirs,
+    /// and blocks looked at outside clean runs.
     GuardProtects,
-    GuardProtectUs,
+    GuardProtectNs,
     GuardMirrors,
-    GuardMirrorUs,
+    GuardMirrorNs,
     GuardBlocks,
     /// Questions to Windows about unmapped view memory (`VirtualQuery`) in
-    /// guarding and their microseconds; microseconds waited for the guards'
-    /// lock in guarding; bytes copied in place (`watch::copy_guarded`).
+    /// guarding and their time; the time waited for the guards' lock in
+    /// guarding; bytes copied in place (`watch::copy_guarded`).
     GuardQueries,
-    GuardQueryUs,
-    GuardLockUs,
+    GuardQueryNs,
+    GuardLockNs,
     InPlaceBytes,
+    /// In guarding: lookups of the other views of a block's pages
+    /// (`inplace::other_views`) and questions whether a range is view
+    /// memory (`watch::is_view`), with their time.
+    GuardLookups,
+    GuardLookupNs,
+    GuardViewAsks,
+    GuardViewAskNs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1106,7 +1116,8 @@ pub(crate) fn log(frames: f64) {
          refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
          guards {:.1} ms ({:.0} blocks outside clean runs; {:.0} runs guarded again {:.1} ms, \
-         {:.0} other views {:.1} ms; {:.0} questions about unmapped memory {:.1} ms; waiting for \
+         {:.0} other views {:.1} ms; {:.0} questions about unmapped memory {:.1} ms; {:.0} lookups of other \
+         views {:.1} ms; {:.0} questions whether memory is a view {:.1} ms; waiting for \
          the guards' lock {:.1} ms; {:.1} MB copied in place); {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
          {:.0} steps {:.1} MB left out",
@@ -1122,15 +1133,19 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::SnapshotUs as usize]),
         mb(c[C::BackCompared as usize]),
         ms(c[C::SparseUs as usize]),
-        ms(c[C::GuardUs as usize]),
+        c[C::GuardNs as usize] / 1e6,
         c[C::GuardBlocks as usize],
         c[C::GuardProtects as usize],
-        ms(c[C::GuardProtectUs as usize]),
+        c[C::GuardProtectNs as usize] / 1e6,
         c[C::GuardMirrors as usize],
-        ms(c[C::GuardMirrorUs as usize]),
+        c[C::GuardMirrorNs as usize] / 1e6,
         c[C::GuardQueries as usize],
-        ms(c[C::GuardQueryUs as usize]),
-        ms(c[C::GuardLockUs as usize]),
+        c[C::GuardQueryNs as usize] / 1e6,
+        c[C::GuardLookups as usize],
+        c[C::GuardLookupNs as usize] / 1e6,
+        c[C::GuardViewAsks as usize],
+        c[C::GuardViewAskNs as usize] / 1e6,
+        c[C::GuardLockNs as usize] / 1e6,
         mb(c[C::InPlaceBytes as usize]),
         mb(c[C::WholeBytes as usize]),
         c[C::PaceWaits as usize],

@@ -16,7 +16,7 @@ use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
-use crate::structure::{Bool, LaneExit, Meets, Structured};
+use crate::structure::{Atom, Bool, LaneExit, Meets, Structured};
 
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
@@ -234,7 +234,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
                 // is the same in every lane: its loop is lowered as it stands
                 // and needs no proof.
@@ -1113,8 +1113,8 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, at `site`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, site: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1122,8 +1122,16 @@ impl<'a> Tracer<'a> {
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
-        // Only the lanes that reach the access read the descriptor.
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // Only the lanes that reach the access read the descriptor, and of
+        // a vector access those in its EXEC (where lane branches are the
+        // wave's, `ir::uniform_branches`, lanes outside EXEC reach it too).
+        let mut known = Vec::new();
+        if let Some(lanes) = self.lanes {
+            known.push((lanes.reach[site.0], true));
+            if let Some(&Some(guard)) = lanes.guards.get(site.0).and_then(|g| g.get(site.1)) {
+                known.push((guard, true));
+            }
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -1231,6 +1239,13 @@ impl<'a> Tracer<'a> {
                 && taken != not_taken
             {
                 known.push((when, taken == block));
+                // a wave that went the way of "no lane in the mask" has
+                // none of its lanes
+                if let Some((mask, none)) = self.none_of(lanes, when)
+                    && (taken == block) == none
+                {
+                    known.push((mask, false));
+                }
             }
             let possible = self.meet(lanes, known);
             known.truncate(n);
@@ -1242,6 +1257,49 @@ impl<'a> Tracer<'a> {
             }
         }
         only
+    }
+
+    /// A branch on the wave's own test of a lane mask (`s_bcnt1_i32` of
+    /// the mask, `s_cmp_lg_u32` or `s_cmp_eq_u32` of the count against 0,
+    /// a branch on that SCC, as `ir::uniform_branches` makes them): the
+    /// mask's lanes, and the value of `when` on the way the wave goes when
+    /// the mask holds no lane.
+    fn none_of(&self, lanes: &Structured, when: Bool) -> Option<(Bool, bool)> {
+        let (Atom::Uniform(scc), lo, hi) = lanes.bools.node(when)? else {
+            return None;
+        };
+        let direct = match (lo, hi) {
+            (Bool::FALSE, Bool::TRUE) => true,
+            (Bool::TRUE, Bool::FALSE) => false,
+            _ => return None,
+        };
+        let cmp = self.def(scc)?;
+        let zero_sets = match cmp.name() {
+            "s_cmp_eq_u32" => true,
+            "s_cmp_lg_u32" => false,
+            _ => return None,
+        };
+        let Fields::Sop { src, .. } = &cmp.fields else {
+            return None;
+        };
+        let [Operand::Scalar { code, .. }, zero] = src.as_slice() else {
+            return None;
+        };
+        if self.term(cmp, zero) != Some(Term::Const(0)) {
+            return None;
+        }
+        let count = self.def(cmp.read(Reg::S(*code))?)?;
+        if !count.name().starts_with("s_bcnt1_i32_") {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &count.fields else {
+            return None;
+        };
+        let Some(&Operand::Scalar { code, .. }) = src.first() else {
+            return None;
+        };
+        let mask = *lanes.masks.get(&count.read(Reg::S(code))?)?;
+        Some((mask, zero_sets == direct))
     }
 
     /// Whether lowering can make a handle for `source` in any block: its
@@ -3844,5 +3902,63 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    /// A buffer descriptor loaded in a branch skipped when no lane is left
+    /// for it, read after the join (`s_load_dwordx4` from the table at s9).
+    fn loaded_in_a_skip(p: &Program) -> Result<Source, ShaderError> {
+        let r = track(p, &[param(Table, 9, 1)], HwStage::Cs, lanes(p).as_ref())?;
+        Ok(r.descriptors[0].source.clone())
+    }
+
+    #[test]
+    fn a_descriptor_loaded_in_a_skip_is_read_by_the_lanes_in_exec() {
+        // EXEC stays the if's after the join: lanes that skipped the load
+        // reach the read but do not run it.
+        let code: Vec<u8> = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0xBF88_0002, // s_cbranch_execz -> 0x1c
+            0xF408_0101,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], 0x0
+            0xE030_1000,
+            0x8001_0100, // 0x1c: buffer_load_dword v1, v0, s[4:7], 0 offen
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let source = loaded_in_a_skip(&p);
+        assert!(matches!(source, Ok(Source::Loaded { .. })), "{source:?}");
+    }
+
+    #[test]
+    fn a_descriptor_loaded_where_the_wave_tests_its_mask_is_traced_past_the_join() {
+        // The skip tests a copy of the entry EXEC, so no lane skips the
+        // load; with the branch made the wave's own count of it
+        // (`ir::uniform_branches`) that edge is still one no lane takes.
+        let code: Vec<u8> = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBEA8_037E, // s_mov_b32 s40, exec_lo
+            0xBE94_3C28, // s_and_saveexec_b32 s20, s40
+            0xBF88_0002, // s_cbranch_execz -> 0x1c
+            0xF408_0101,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], 0x0
+            0xBEFE_0314, // 0x1c: s_mov_b32 exec_lo, s20
+            0xE030_1000,
+            0x8001_0100, // buffer_load_dword v1, v0, s[4:7], 0 offen
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let uniform = crate::ir::uniform_branches(&p, true).expect("the skip changes");
+        let source = loaded_in_a_skip(&uniform);
+        assert!(matches!(source, Ok(Source::Loaded { .. })), "{source:?}");
     }
 }
