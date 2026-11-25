@@ -627,7 +627,7 @@ fn create() -> windows::core::Result<Host> {
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
-fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
+pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     // SAFETY: plain DXGI adapter queries.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
@@ -5591,6 +5591,33 @@ impl HostList {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
         list.cast().ok()
+    }
+
+    /// The scratch chunk holding host address `gpu` and the offset in it
+    /// (diagnostics: a dispatch capture copies constants the list put
+    /// there).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn scratch_at(&self, gpu: u64) -> Option<(ID3D12Resource, u64)> {
+        let s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        s.chunks
+            .iter()
+            .find(|(c, size)| gpu >= c.gpu && gpu < c.gpu + size)
+            .map(|(c, _)| (c._buffer.clone(), gpu - c.gpu))
+    }
+
+    /// Moves host texture `texture` to `wanted` (a host state) if the list
+    /// tracks its state, recording the barrier: the state it was in, `None`
+    /// if the list does not track it (diagnostics: a dispatch capture copies
+    /// the textures a dispatch reads where they are, and puts them back).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn move_tracked(&self, texture: &ID3D12Resource, wanted: u32) -> Option<u32> {
+        let copy = {
+            let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            states.values().find(|(_, _, c)| c.texture.as_raw() == texture.as_raw())?.2.clone()
+        };
+        let before = self.states.lock().unwrap_or_else(|e| e.into_inner()).get(&(std::sync::Arc::as_ptr(&copy) as usize))?.1;
+        self.settle(&copy, wanted);
+        Some(before)
     }
 
     /// Notes what the command about to be recorded does, as a marker

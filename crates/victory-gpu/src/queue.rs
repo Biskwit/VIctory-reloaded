@@ -824,6 +824,7 @@ extern "system" fn present(
         crate::capture::frame_drew(frame, crate::draw::drawn());
         crate::pix::presented(frame);
         crate::capture::records_landed(frame);
+        crate::dispatch::presented(frame);
         let targets = crate::capture::take_targets();
         if crate::capture::dumped(frame) || crate::control::dumps(frame) {
             crate::capture::dump_targets(frame, &targets);

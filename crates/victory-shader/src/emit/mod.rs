@@ -112,8 +112,23 @@ pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_THREADS,
     USER_VIEW_ADDRESS, USER_ROOT_ADDRESS, USER_VIEW_BIAS, fault_tag, memory_pages, set_memory_pages,
-    set_view_heap_limit,
+    set_salt, set_view_heap_limit, view_heap_limit,
 };
+
+/// Writes the digest D3D12 checks into `container` again, after a change
+/// of its parts (a replay that varies the shader hash part alone).
+pub fn rehash_container(container: &mut [u8]) {
+    if container.len() > 20 {
+        let digest = container::hash(&container[20..]);
+        container[4..20].copy_from_slice(&digest);
+    }
+}
+
+/// The widest host wave [`set_host_max_wave`] set (0: not known), for a
+/// replay that translates as the run did.
+pub fn host_max_wave() -> u32 {
+    lower::host_max_wave()
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -163,6 +178,18 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// Whether the console's fused multiply-adds (`v_fma_f32`, `v_fmac_f32` and
+/// the others lowered to DXIL's FMad, which a driver may fuse or not, so
+/// one compile of a program may round otherwise than another) are
+/// translated as a product rounded and then the sum, which no compile
+/// fuses (`VICTORY_SHADER_FMAD=split`; FMad otherwise). An experiment on
+/// results that depend on the compile; part of the translation, so the
+/// shader cache keys on it (`victory-gpu`'s does).
+pub fn mad_split() -> bool {
+    static SPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SPLIT.get_or_init(|| std::env::var("VICTORY_SHADER_FMAD").is_ok_and(|v| v.trim() == "split"))
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,

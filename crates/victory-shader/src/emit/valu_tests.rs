@@ -1210,6 +1210,32 @@ fn ds_min_max_f32_are_atomic_across_waves() {
     }
 }
 
+/// A salted translation (`super::set_salt`, the replay's variants) is other
+/// DXIL, which validates and computes what the plain one does.
+#[test]
+fn a_salted_program_is_other_code_with_the_same_results() {
+    // The largest of 64 threads' (thread - 32) through LDS, as above.
+    let mut body = vec![vop1(0x001, 5, 0x80)];
+    body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+    body.push(S_BARRIER);
+    body.push(vop2(0x26, 6, vgpr(0), 3)); // v_sub_nc_u32 v6, v0, v3
+    body.push(vop1(0x005, 6, vgpr(6))); // v_cvt_f32_i32
+    body.extend(ds(DS_MAX_F32, 0, 5, 6));
+    body.push(S_BARRIER);
+    body.extend(ds(DS_READ_B32, 0, 5, 0));
+    let plain = build_cs(&body, 64, 512);
+    super::set_salt(3);
+    let salted = build_cs(&body, 64, 512);
+    super::set_salt(0);
+    assert_ne!(plain.dxil, salted.dxil);
+    assert_eq!(build_cs(&body, 64, 512).dxil, plain.dxil, "salt 0 translates as before");
+    for shader in [&plain, &salted] {
+        run_cases(shader, &[[f32::NEG_INFINITY.to_bits(), 0, 32, 0]], |backend, _, _, got| {
+            assert_eq!(f32::from_bits(got), 31.0, "{backend}");
+        });
+    }
+}
+
 /// A program run with a count of threads (`spill::counts_threads`): groups
 /// of `group` threads along x, waves of 64 lanes or of 32, its one
 /// parameter (the table of the raw UAV) in a spilled user-data table whose

@@ -3460,6 +3460,11 @@ impl<'a> Lower<'a> {
     }
 
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
+        if super::mad_split() {
+            // A product rounded, then the sum: never fused, in any compile.
+            let m = self.s.m.bin(self.cur, Bin::Mul, a, b);
+            return self.s.m.bin(self.cur, Bin::Add, m, c);
+        }
         self.s.op(
             self.cur,
             "tertiary.f32",

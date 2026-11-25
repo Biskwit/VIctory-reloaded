@@ -139,6 +139,13 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// The container as the title gave it (a dispatch capture keeps it, to
+    /// translate it again offline).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn container(&self) -> &[u8] {
+        &self.container
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -751,7 +758,7 @@ static FUNCTIONS: Table<24> = {
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
-mod library;
+pub(crate) mod library;
 #[cfg(windows)]
 mod make;
 

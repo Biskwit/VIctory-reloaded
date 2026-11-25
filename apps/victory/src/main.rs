@@ -85,6 +85,82 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Run a compute dispatch captured from a run
+    /// (`VICTORY_DISPATCH_CAPTURE=<shader hash prefix>:<frame>:<folder>`,
+    /// diagnostics builds) again on this GPU, and compare what it writes
+    /// with what it wrote in the run.
+    ReplayDispatch {
+        /// The capture's folder (its `manifest.json`).
+        dir: PathBuf,
+        /// Programs to run: the captured code, then translations of the
+        /// captured shader with salts 1, 2, ... (each compiled anew by the
+        /// driver); outputs that differ between them show code whose results
+        /// depend on its compilation.
+        #[arg(long, default_value_t = 1)]
+        variants: u32,
+        /// Runs of each program.
+        #[arg(long, default_value_t = 2)]
+        runs: u32,
+        /// Run this DXIL container instead of the captured code.
+        #[arg(long, conflicts_with = "retranslate")]
+        dxil: Option<PathBuf>,
+        /// Run the captured shader as this build translates it.
+        #[arg(long)]
+        retranslate: bool,
+        /// Differing places listed per resource.
+        #[arg(long, default_value_t = 4)]
+        show: usize,
+        /// Write a picture of where each texture output differs from the
+        /// first run's into this folder.
+        #[arg(long)]
+        diffs: Option<PathBuf>,
+        /// Make each program again from what the driver keeps of it before
+        /// running it: `blob` (its cached blob) or `library` (stored in a
+        /// pipeline library, serialized and loaded back).
+        #[arg(long)]
+        reload: Option<String>,
+        /// Make the first program first with these static sampler changes
+        /// (comma-separated; `none`: the captured root signature) and hold
+        /// it: whether the driver serves that compile to other samplers.
+        #[arg(long)]
+        prime: Option<String>,
+        /// Xor the programs' shader hash part with this (nothing else
+        /// changes): whether that part keys what the driver serves.
+        #[arg(long, default_value_t = 0)]
+        hash_salt: u8,
+        /// Run on the software adapter (WARP): a reference.
+        #[arg(long)]
+        warp: bool,
+        /// Change a static sampler of the root signature the programs are
+        /// made with: `s<register>.<field>=<value>`, fields filter, u, v, w,
+        /// func, border, aniso, bias, minlod, maxlod (repeatable).
+        #[arg(long = "sampler")]
+        samplers: Vec<String>,
+        /// Compare with another replay's outputs instead of the capture's:
+        /// the prefix of its `--diffs` files, e.g. `<dir>/program-0`.
+        #[arg(long)]
+        expect: Option<PathBuf>,
+        /// Load each program from this pipeline library of a run
+        /// (`host-pipelines.bin`) when it is there under its name: the
+        /// driver's binary that run used. Compiled otherwise.
+        #[arg(long)]
+        library: Option<PathBuf>,
+        /// Dispatch the groups this many at a time in x, each part from its
+        /// first group (other co-scheduling of groups and waves; the same
+        /// results for code without races).
+        #[arg(long, default_value_t = 0)]
+        split: u32,
+        /// Zero each input in turn and run the first program again: which
+        /// outputs change, and how much of that where the replay differs
+        /// from the capture.
+        #[arg(long)]
+        sensitivity: bool,
+        /// After each program's runs, have the driver commit its background
+        /// work (it compiles shaders again after their first use) and run
+        /// the program as many times again.
+        #[arg(long)]
+        background: bool,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -167,6 +243,45 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::ReplayDispatch {
+            dir,
+            variants,
+            runs,
+            dxil,
+            retranslate,
+            show,
+            diffs,
+            reload,
+            prime,
+            hash_salt,
+            warp,
+            samplers,
+            expect,
+            library,
+            split,
+            sensitivity,
+            background,
+        } => {
+            let options = Options {
+                variants,
+                runs,
+                dxil,
+                retranslate,
+                show,
+                diffs,
+                reload,
+                prime,
+                hash_salt,
+                warp,
+                samplers,
+                expect,
+                library,
+                split,
+                sensitivity,
+                background,
+            };
+            replay_dispatch(&dir, options)
+        }
         Command::Run {
             exe,
             unimplemented,
@@ -177,6 +292,49 @@ fn main() -> Result<()> {
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
     }
+}
+
+/// What `replay-dispatch` runs (`victory_gpu::replay::Options` on Windows).
+#[cfg(windows)]
+use victory_gpu::replay::Options;
+#[cfg(not(windows))]
+struct Options {
+    variants: u32,
+    runs: u32,
+    dxil: Option<PathBuf>,
+    retranslate: bool,
+    show: usize,
+    diffs: Option<PathBuf>,
+    reload: Option<String>,
+    prime: Option<String>,
+    hash_salt: u8,
+    warp: bool,
+    samplers: Vec<String>,
+    expect: Option<PathBuf>,
+    library: Option<PathBuf>,
+    split: u32,
+    sensitivity: bool,
+    background: bool,
+}
+
+#[cfg(windows)]
+fn replay_dispatch(dir: &std::path::Path, options: Options) -> Result<()> {
+    if let Some(diffs) = &options.diffs {
+        std::fs::create_dir_all(diffs)?;
+    }
+    // On a thread with room for the translator's recursion (the main
+    // thread's stack is the linker's 1 MiB).
+    let dir = dir.to_owned();
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || victory_gpu::replay::replay_dispatch(&dir, &options).map(|_| ()))?
+        .join()
+        .map_err(|_| anyhow::anyhow!("the replay panicked"))?
+}
+
+#[cfg(not(windows))]
+fn replay_dispatch(_: &std::path::Path, _: Options) -> Result<()> {
+    anyhow::bail!("replay-dispatch needs D3D12 (Windows)")
 }
 
 fn show_config() -> Result<()> {

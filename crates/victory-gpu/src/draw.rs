@@ -214,6 +214,10 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// While the dispatch to capture is bound (`crate::dispatch`): the root
+    /// arguments `bind` sets, in order.
+    #[cfg(feature = "diagnostics")]
+    noted: Option<Vec<(u32, crate::dispatch::RootArg)>>,
 }
 
 impl Drop for State {
@@ -1040,6 +1044,8 @@ impl State {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
                 }
+                #[cfg(feature = "diagnostics")]
+                self.note_root(param, || crate::dispatch::RootArg::Constants(values.clone()));
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
@@ -1055,6 +1061,8 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, m.directory);
                                 }
                             }
+                            #[cfg(feature = "diagnostics")]
+                            self.note_root(param, || crate::dispatch::RootArg::View("srv", m.directory, None));
                         }
                         continue;
                     }
@@ -1064,13 +1072,18 @@ impl State {
                         match self.heap_buffers(list) {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
-                            Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                            Some(gpu) => {
+                                // SAFETY: as above.
+                                unsafe {
+                                    if compute {
+                                        l.SetComputeRootShaderResourceView(param, gpu);
+                                    } else {
+                                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                                    }
                                 }
-                            },
+                                #[cfg(feature = "diagnostics")]
+                                self.note_root(param, || crate::dispatch::RootArg::View("srv", gpu, None));
+                            }
                             None => once!("a shader picks buffers from a view heap that is not set"),
                         }
                         continue;
@@ -1118,6 +1131,10 @@ impl State {
                             (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
                         }
                     }
+                    #[cfg(feature = "diagnostics")]
+                    self.note_root(param, || {
+                        crate::dispatch::RootArg::View(if srv { "srv" } else { "cbv" }, gpu, Some(address))
+                    });
                 }
             }
             for &(slot, param) in &stage.root_uavs {
@@ -1133,6 +1150,8 @@ impl State {
                                 l.SetGraphicsRootUnorderedAccessView(param, m.faults);
                             }
                         }
+                        #[cfg(feature = "diagnostics")]
+                        self.note_root(param, || crate::dispatch::RootArg::View("uav", m.faults, None));
                     }
                     continue;
                 }
@@ -1216,6 +1235,8 @@ impl State {
                     list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            self.note_root(param, || crate::dispatch::RootArg::View("uav", gpu, Some(a)));
             return true;
         }
         let heap = match self.heaps[0] {
@@ -1267,6 +1288,8 @@ impl State {
                 list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        self.note_root(param, || crate::dispatch::RootArg::Table(handle.ptr));
         true
     }
 
@@ -1350,6 +1373,8 @@ impl State {
                 list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        self.note_root(param, || crate::dispatch::RootArg::Table(handle.ptr));
         true
     }
 
@@ -1820,6 +1845,32 @@ impl State {
         }
     }
 
+    /// Notes a root argument `bind` set, while the dispatch to capture is
+    /// bound (`crate::dispatch`).
+    #[cfg(feature = "diagnostics")]
+    fn note_root(&mut self, param: u32, arg: impl FnOnce() -> crate::dispatch::RootArg) {
+        if let Some(noted) = &mut self.noted {
+            noted.push((param, arg()));
+        }
+    }
+
+    /// Starts the capture of the dispatch just bound with `p`, whose root
+    /// arguments are `roots` (`crate::dispatch::begin`).
+    #[cfg(feature = "diagnostics")]
+    fn capture(
+        &self,
+        list: &HostList,
+        p: &HostPipeline,
+        roots: Vec<(u32, crate::dispatch::RootArg)>,
+        groups: crate::dispatch::Groups,
+    ) -> Option<crate::dispatch::Capture> {
+        let heap = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            .flatten();
+        let constant = |slot, dword| self.user_value(true, slot, RootType::Constants, dword);
+        crate::dispatch::begin(list, p, roots, heap, &constant, groups)
+    }
+
     /// For the frame listing, after a dropped dispatch's line: its group
     /// counts and the compute root arguments it was recorded with (root
     /// constants as hex dwords, root views with the title buffer they
@@ -1936,8 +1987,14 @@ impl State {
             self.threads = Some(x);
             x = x.div_ceil(group);
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::dispatch::wants(p) {
+            self.noted = Some(Vec::new());
+        }
         let bound = self.bind(list, p, true);
         self.threads = None;
+        #[cfg(feature = "diagnostics")]
+        let noted = self.noted.take();
         if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -1971,8 +2028,14 @@ impl State {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let capture = noted.and_then(|roots| self.capture(list, p, roots, crate::dispatch::Groups::Direct([x, y, z])));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if let Some(capture) = capture {
+            capture.end(list);
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2796,12 +2859,18 @@ impl State {
                 (bounded, 0)
             }
         };
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH && crate::dispatch::wants(p) {
+            self.noted = Some(Vec::new());
+        }
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
+        #[cfg(feature = "diagnostics")]
+        let noted = self.noted.take();
         if !ran {
             crate::indirect::done(list, &bounded);
             why("prepare failed");
@@ -2814,6 +2883,18 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        #[cfg(feature = "diagnostics")]
+        let capture = noted.and_then(|roots| {
+            let groups = crate::dispatch::Groups::Indirect {
+                args: &bounded,
+                at,
+                records: max,
+                stride,
+                wide: wide.is_some(),
+                count: counter.as_ref().filter(|_| wide.is_none()).map(|(s, at)| (&s.buffer, s.offset(*at))),
+            };
+            self.capture(list, p, roots, groups)
+        });
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -2838,6 +2919,10 @@ impl State {
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(capture) = capture {
+            capture.end(list);
         }
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {

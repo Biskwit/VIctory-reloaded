@@ -306,6 +306,9 @@ pub(crate) struct HostPipeline {
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
+    /// `root` serialized (a dispatch capture keeps it).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) root_blob: Vec<u8>,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
     /// The vertex buffer slots it reads (bit per slot).
@@ -629,6 +632,8 @@ impl HostPipeline {
                 mesh: false,
                 pso,
                 root,
+                #[cfg(feature = "diagnostics")]
+                root_blob: root_blob.clone(),
                 stages: bound,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -699,6 +704,8 @@ impl HostPipeline {
                 mesh: true,
                 pso,
                 root,
+                #[cfg(feature = "diagnostics")]
+                root_blob: root_blob.clone(),
                 stages: bound,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -815,6 +822,8 @@ impl HostPipeline {
             mesh: false,
             pso,
             root,
+            #[cfg(feature = "diagnostics")]
+            root_blob: root_blob.clone(),
             stages: bound,
             name: format!("{shaders:?}"),
             slots: g.slots(),

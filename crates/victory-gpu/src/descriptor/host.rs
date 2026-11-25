@@ -828,7 +828,7 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         ..Default::default()
     };
     // SAFETY: a slot of a sampler heap of ours.
-    unsafe { host.device.CreateSampler(&desc, at) };
+    unsafe { create_sampler(&host.device, &desc, at) };
 }
 
 impl HostHeap {
@@ -1301,8 +1301,7 @@ impl HostHeap {
         };
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
-            host.device
-                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
+            create_srv(&host.device, Some(buffer), Some(&desc), self.cpu(index))
         };
         self.keep(index, Some(buffer.clone()));
     }
@@ -1336,12 +1335,7 @@ impl HostHeap {
         };
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
-            host.device.CreateUnorderedAccessView(
-                buffer,
-                None::<&ID3D12Resource>,
-                Some(&desc),
-                self.cpu(index),
-            )
+            create_uav(&host.device, Some(buffer), Some(&desc), self.cpu(index))
         };
         self.keep(index, Some(buffer.clone()));
     }
@@ -1364,12 +1358,7 @@ impl HostHeap {
         };
         // SAFETY: a slot of our heap; a null resource is allowed with a desc.
         unsafe {
-            host.device.CreateUnorderedAccessView(
-                None::<&ID3D12Resource>,
-                None::<&ID3D12Resource>,
-                Some(&desc),
-                self.cpu(index),
-            )
+            create_uav(&host.device, None, Some(&desc), self.cpu(index))
         };
     }
 
@@ -1393,8 +1382,7 @@ impl HostHeap {
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
+            create_cbv(&host.device, &desc, self.cpu(index))
         };
     }
 
@@ -1572,6 +1560,21 @@ impl HostHeap {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         let shown = kept.get(index as usize)?.as_ref()?;
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+    }
+
+    /// Slot `index` for a dispatch capture (diagnostics): its CPU handle,
+    /// under which its view was noted (`create_srv`), and the host resource
+    /// it views; `None` past the heap.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn captured_slot(&self, index: u32) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, Option<ID3D12Resource>)> {
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        Some((self.cpu(index), kept.get(index as usize)?.clone()))
+    }
+
+    /// Its slots, the title's and the dynamic ones (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn size(&self) -> u32 {
+        self.count + self.dynamic
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -2019,8 +2022,7 @@ fn buffer_srv(
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
-        host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+        create_srv(&host.device, Some(&shadow.buffer), Some(&desc), at)
     };
     Some(Some(shadow.buffer.clone()))
 }
@@ -2118,8 +2120,7 @@ fn buffer_uav(
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
-        host.device
-            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
+        create_uav(&host.device, Some(&shadow.buffer), Some(&desc), at)
     };
     Some(Some(shadow.buffer.clone()))
 }
@@ -2276,7 +2277,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 SizeInBytes: size.next_multiple_of(256),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
-            unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+            unsafe { create_cbv(device, &desc, at) };
             Some(Some(shadow.buffer.clone()))
         }
         View::Shader(resource, desc) => {
@@ -2288,11 +2289,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
-                    device.CreateShaderResourceView(
-                        texture,
-                        desc.as_ref().map(std::ptr::from_ref),
-                        at,
-                    )
+                    create_srv(device, Some(texture), desc.as_ref(), at)
                 };
                 Some(Some(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
@@ -2349,12 +2346,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
-                device.CreateUnorderedAccessView(
-                    texture,
-                    None::<&ID3D12Resource>,
-                    desc.as_ref().map(std::ptr::from_ref),
-                    at,
-                )
+                create_uav(device, Some(texture), desc.as_ref(), at)
             };
             Some(Some(texture.clone()))
         }
@@ -2366,13 +2358,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     .read_unaligned()
             };
             // SAFETY: a slot of our sampler heap.
-            unsafe { device.CreateSampler(&desc, at) };
+            unsafe { create_sampler(device, &desc, at) };
             Some(None)
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
-            unsafe { device.CreateSampler(&desc, at) };
+            unsafe { create_sampler(device, &desc, at) };
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
@@ -2469,7 +2461,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Constant(..) => {
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
             // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            return unsafe { create_cbv(&host.device, &desc, at) };
         }
         _ => return null_view(at),
     };
@@ -2483,14 +2475,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         null_uav_desc(dimension)
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device.CreateUnorderedAccessView(
-            None::<&ID3D12Resource>,
-            None::<&ID3D12Resource>,
-            Some(&desc),
-            at,
-        )
-    };
+    unsafe { create_uav(&host.device, None, Some(&desc), at) };
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
@@ -2551,8 +2536,7 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+        create_srv(&host.device, None, Some(&desc), at)
     };
 }
 
@@ -2578,9 +2562,66 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+        create_srv(&host.device, None, Some(&desc), at)
     };
+}
+
+/// `CreateShaderResourceView` of `resource` (none: a null view), noted for
+/// a dispatch capture (`crate::dispatch`), as the other `create_*` are: a
+/// capture remakes the view offline from what was noted.
+///
+/// # Safety
+/// As the device method's: `at` is a slot of a live heap of ours.
+unsafe fn create_srv(
+    device: &ID3D12Device,
+    resource: Option<&ID3D12Resource>,
+    desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) {
+    #[cfg(feature = "diagnostics")]
+    crate::dispatch::note_view(at, || crate::dispatch::Made::Srv(desc.copied()));
+    // SAFETY: the caller's.
+    unsafe { device.CreateShaderResourceView(resource, desc.map(std::ptr::from_ref), at) }
+}
+
+/// `CreateUnorderedAccessView` without a counter, noted ([`create_srv`]).
+///
+/// # Safety
+/// As the device method's.
+unsafe fn create_uav(
+    device: &ID3D12Device,
+    resource: Option<&ID3D12Resource>,
+    desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) {
+    #[cfg(feature = "diagnostics")]
+    crate::dispatch::note_view(at, || crate::dispatch::Made::Uav(desc.copied()));
+    // SAFETY: the caller's.
+    unsafe {
+        device.CreateUnorderedAccessView(resource, None::<&ID3D12Resource>, desc.map(std::ptr::from_ref), at)
+    }
+}
+
+/// `CreateConstantBufferView`, noted ([`create_srv`]).
+///
+/// # Safety
+/// As the device method's.
+unsafe fn create_cbv(device: &ID3D12Device, desc: &D3D12_CONSTANT_BUFFER_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    #[cfg(feature = "diagnostics")]
+    crate::dispatch::note_view(at, || crate::dispatch::Made::Cbv(*desc));
+    // SAFETY: the caller's.
+    unsafe { device.CreateConstantBufferView(Some(desc), at) }
+}
+
+/// `CreateSampler`, noted ([`create_srv`]).
+///
+/// # Safety
+/// As the device method's.
+unsafe fn create_sampler(device: &ID3D12Device, desc: &D3D12_SAMPLER_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    #[cfg(feature = "diagnostics")]
+    crate::dispatch::note_view(at, || crate::dispatch::Made::Sampler(*desc));
+    // SAFETY: the caller's.
+    unsafe { device.CreateSampler(desc, at) }
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
@@ -2602,8 +2643,7 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+        create_srv(&host.device, None, Some(&desc), at)
     };
 }
 

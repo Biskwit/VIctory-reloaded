@@ -24,6 +24,8 @@ mod control;
 mod copystat;
 pub mod descriptor;
 pub mod device;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod dispatch;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
@@ -48,6 +50,8 @@ mod pix;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+pub mod replay;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

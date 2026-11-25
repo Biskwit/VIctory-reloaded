@@ -461,6 +461,14 @@ impl Module {
         self.extract(block, r, 0)
     }
 
+    /// Moves the last `n` instructions of `block` to its start, in order
+    /// (values are numbered when the module is written).
+    pub fn to_front(&mut self, block: usize, n: usize) {
+        let body = &mut self.blocks[block].body;
+        let n = n.min(body.len());
+        body.rotate_right(n);
+    }
+
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
