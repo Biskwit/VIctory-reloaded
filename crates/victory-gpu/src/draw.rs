@@ -148,8 +148,9 @@ const WINDOW_MOST: u64 = 64;
 /// host writes in its memory is copied every frame (`State::heap_textures`;
 /// `VICTORY_ALIAS_ONCE=1`: once, as before).
 fn alias_every_frame() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_ONCE").is_none_or(|v| v != "1"))
+    static ON: crate::live::Switch =
+        crate::live::Switch::new("VICTORY_ALIAS_ONCE", |v| u32::from(v.is_none_or(|v| v != "1")));
+    ON.value() != 0
 }
 
 fn windows() -> bool {
@@ -258,8 +259,9 @@ impl State {
 /// not drawn at all. Off by default: a rectangle the title sets is part of
 /// its picture.
 fn scissor_test() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_SCISSOR_TEST").as_deref() == Ok("full"))
+    static ON: crate::live::Switch =
+        crate::live::Switch::new("VICTORY_SCISSOR_TEST", |v| u32::from(v == Some("full")));
+    ON.value() != 0
 }
 
 /// An experiment on mesh draws (`VICTORY_MESH_TEST`): 1 for `skip` (none
@@ -372,8 +374,9 @@ fn reupload_when_full() -> bool {
 /// Whether textures picked by index are looked at again after their upload
 /// (`VICTORY_HEAP_RECHECK=0`: no).
 fn heap_recheck() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
+    static ON: crate::live::Switch =
+        crate::live::Switch::new("VICTORY_HEAP_RECHECK", |v| u32::from(v.is_none_or(|v| v != "0")));
+    ON.value() != 0
 }
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
@@ -2850,8 +2853,9 @@ impl State {
 /// the program takes the first group of its dispatch
 /// (`VICTORY_WIDE_DISPATCH=0`: one, cut to 65,535 groups in x, as before).
 fn wide_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_DISPATCH").is_none_or(|v| v != "0"))
+    static ON: crate::live::Switch =
+        crate::live::Switch::new("VICTORY_WIDE_DISPATCH", |v| u32::from(v.is_none_or(|v| v != "0")));
+    ON.value() != 0
 }
 
 /// For a compute pipeline whose program adds the first group of its

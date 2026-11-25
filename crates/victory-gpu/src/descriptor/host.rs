@@ -279,12 +279,16 @@ pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
 /// `VICTORY_STALE_TEXTURES=overlap`: wherever their spans overlap, the rule
 /// until run 188.
 fn stale_rule() -> Rule {
-    static RULE: std::sync::OnceLock<Rule> = std::sync::OnceLock::new();
-    *RULE.get_or_init(|| match std::env::var("VICTORY_STALE_TEXTURES").as_deref() {
-        Ok("0") => Rule::Never,
-        Ok("overlap") => Rule::Overlap,
+    static RULE: crate::live::Switch = crate::live::Switch::new("VICTORY_STALE_TEXTURES", |v| match v {
+        Some("0") => 2,
+        Some("overlap") => 1,
+        _ => 0,
+    });
+    match RULE.value() {
+        2 => Rule::Never,
+        1 => Rule::Overlap,
         _ => Rule::Start,
-    })
+    }
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`, or is

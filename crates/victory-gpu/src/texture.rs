@@ -654,9 +654,10 @@ impl Staging {
         // came up to eight frames late and each plane on its own turn, so
         // frames mixed planes of different pictures) is hashed at every
         // check from then on.
-        static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static GUARD: crate::live::Switch =
+            crate::live::Switch::new("VICTORY_TEXTURE_GUARD", |v| u32::from(v.is_none_or(|v| v != "0")));
         let mut missed = false;
-        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
+        if GUARD.value() != 0
             && !last.blind
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {

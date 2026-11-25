@@ -171,8 +171,9 @@ fn mirror(handle: u64) {
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
     use std::sync::atomic::Ordering::Relaxed;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
+    static ON: crate::live::Switch =
+        crate::live::Switch::new("VICTORY_HEAP_SYNC", |v| u32::from(v.is_none_or(|v| v != "0")));
+    if ON.value() == 0 {
         return;
     }
     let started = std::time::Instant::now();
