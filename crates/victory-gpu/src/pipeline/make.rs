@@ -117,7 +117,10 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         let priority = if urgent_compute() && is_compute(p) { URGENT } else { REQUESTED };
         start(p, priority);
-        wait(p, crate::frame::current());
+        let frame = crate::frame::current();
+        if !(is_compute(p) && wait_compute(p, frame)) {
+            wait(p, frame);
+        }
     }
     let made = p.made.get()?.as_ref();
     // Also one that could not be made (a shader that does not translate):
@@ -157,6 +160,74 @@ pub(crate) fn early(p: &Arc<Pending>) {
 fn shared_budget() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
+}
+
+/// Waiting allowed for one compute pipeline and for all of a title
+/// frame's: `VICTORY_COMPUTE_WAIT=<per pipeline ms>,<per frame ms>`
+/// (default 5000,15000; 0: no such wait, the frame's budget as for draws).
+fn compute_wait() -> (Duration, Duration) {
+    static WAIT: OnceLock<(Duration, Duration)> = OnceLock::new();
+    *WAIT.get_or_init(|| {
+        let value = std::env::var("VICTORY_COMPUTE_WAIT").unwrap_or_default();
+        let mut parts = value.split(',').map(|v| v.trim().parse::<u64>().ok());
+        let per = parts.next().flatten().unwrap_or(5000);
+        let frame = parts.next().flatten().unwrap_or(15_000);
+        (Duration::from_millis(per), Duration::from_millis(frame))
+    })
+}
+
+/// A dispatch waits for its compute pipeline being made (first in the
+/// queue, [`urgent_compute`]) up to [`compute_wait`]'s time for it and
+/// what is left of the frame's, instead of being dropped after the frame's
+/// half-second budget for draws: a compute pass often keeps state from
+/// frame to frame, which a launch that drops it for minutes never gets back
+/// (the pale picture of cold launches, `urgent_compute`). Capped, because
+/// a wait for every pipeline the title asks for ended the title (72 s into
+/// a cold launch's first world frame). False if there is no such wait
+/// left (the caller waits on the frame's budget).
+fn wait_compute(p: &Pending, frame: u64) -> bool {
+    /// The frame the waits belong to, waited so far, pipelines waited for,
+    /// and of them those not made in time.
+    static SPENT: Mutex<(u64, Duration, u32, u32)> = Mutex::new((u64::MAX, Duration::ZERO, 0, 0));
+    let (per, cap) = compute_wait();
+    let left = {
+        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        if spent.0 != frame {
+            // The frame before, if it waited long: for the caps' measure.
+            if spent.1 >= Duration::from_secs(1) {
+                tracing::info!(
+                    frame = spent.0,
+                    ms = spent.1.as_millis() as u64,
+                    pipelines = spent.2,
+                    not_in_time = spent.3,
+                    "dispatches waited for their compute pipelines"
+                );
+            }
+            *spent = (frame, Duration::ZERO, 0, 0);
+        }
+        per.min(cap.saturating_sub(spent.1))
+    };
+    if left.is_zero() {
+        return false;
+    }
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = left.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    if spent.0 == frame {
+        spent.1 += started.elapsed();
+        spent.2 += 1;
+        spent.3 += u32::from(p.made.get().is_none());
+    }
+    true
 }
 
 /// Waits for `p` while frame `frame` has budget left.
