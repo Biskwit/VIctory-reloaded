@@ -1582,6 +1582,28 @@ impl State {
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
             }
+            // Diagnostics: a texture this pass copies from the texture the
+            // host writes in its memory, once (the slot is not looked at
+            // again until it is written).
+            #[cfg(feature = "diagnostics")]
+            if let Some(source) = crate::resource::alias_of(resource) {
+                static SEEN: AtomicU64 = AtomicU64::new(0);
+                if SEEN.fetch_add(1, Ordering::Relaxed) < 64 {
+                    let size = crate::resource::host_resource(source).map(|t| {
+                        // SAFETY: a live texture.
+                        let d = unsafe { t.GetDesc() };
+                        (d.Width, d.Height, d.MipLevels, d.DepthOrArraySize)
+                    });
+                    tracing::info!(
+                        slot = index,
+                        texture = ?resource,
+                        ?source,
+                        ?size,
+                        frame,
+                        "a texture picked by index is copied from the texture the host writes in its memory, once"
+                    );
+                }
+            }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !GONE.load(Ordering::Relaxed)

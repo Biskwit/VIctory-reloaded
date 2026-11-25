@@ -1245,6 +1245,21 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     same.then_some(other)
 }
 
+/// Diagnostics: the texture the host writes whose memory holds part of
+/// `[at, at + len)`, if one does, as text (its memory and description).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn target_over(at: u64, len: u64) -> Option<String> {
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    for (&start, &other) in targets.range(..at + len).rev().take(64) {
+        let o = resource(other as This);
+        let size = footprint(&o.desc).map_or(0, |f| f.size);
+        if start + size > at {
+            return Some(format!("{start:#x}+{size:#x} {:?}", o.desc));
+        }
+    }
+    None
+}
+
 /// Whether host copies are made on first use. On by default;
 /// `VICTORY_LAZY_TEXTURES=0` makes each when the title creates its texture,
 /// as before.
