@@ -189,6 +189,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
+    crate::memory::pages();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let programs = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,

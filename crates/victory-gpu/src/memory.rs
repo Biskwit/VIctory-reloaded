@@ -58,16 +58,82 @@ use crate::shadow::Shadow;
 /// listed frame of the opening cutscene names about 50 windows.
 const COPIES: u32 = 1023;
 
-/// [`COPIES`], or what `VICTORY_MEMORY_COPIES` says (one less than a power
-/// of two up to 16383), read once.
+/// [`COPIES`] (with [`pages`], [`PAGE_COPIES`]), or what
+/// `VICTORY_MEMORY_COPIES` says (up to 65535), read once.
 fn copies_most() -> u32 {
     static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
         std::env::var("VICTORY_MEMORY_COPIES")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .map_or(COPIES, |n| n.clamp(1, 16383))
+            .map_or(if pages() { PAGE_COPIES } else { COPIES }, |n| n.clamp(1, 65535))
     })
+}
+
+/// Copies that can be numbered with [`pages`]: a page each, so many more.
+const PAGE_COPIES: u32 = 65535;
+/// A copy of view memory with [`pages`]: its page, and the page after it
+/// for an access that begins in the page's last bytes.
+const PAGE_COPY: u64 = 2 * PAGE;
+/// How far from an address a dispatch names its stages are taken to reach
+/// ([`pages`]): the 4 MiB a window was, twice.
+const REACH: u64 = 2 * CELL;
+
+/// `VICTORY_MEMORY_PAGES=1`: view memory (the title's physical pages, where
+/// Grand Theft Auto VI streams its models) is held by address in copies of
+/// one 64 KiB page, one per physical page however many addresses show it,
+/// and a dispatch brings up to date and has compared only the copies near
+/// what its arguments name. Memory that is no view, and title buffers, are
+/// held as before.
+///
+/// As 4 MiB windows by address the structure builder's memory needed more
+/// copies than can be numbered: all 1,023 were given out 1.1 seconds after
+/// it started (run bvh-19), 596 of them to scattered pages of streamed
+/// models, a window for a page, and every page after that read zeros; with
+/// 4,095 it was 16.5 GB of windows at 0.1 fps (bvh-18), every dispatch
+/// bringing all of them up to date and every submission comparing them.
+///
+/// The programs of the structure builder then reach their root views as
+/// title memory by address too (`victory_shader::emit::set_memory_pages`):
+/// a view bound as a buffer of its own would be other host bytes than the
+/// page copies, and the stages feed each other through both.
+///
+/// shortcut: off unless set, until runs have shown it right.
+/// shortcut: a copy another address names is brought up to date when it is
+/// made and when a dispatch names memory near it, not by every dispatch: a
+/// page the title rewrites in place that stages only reach through
+/// pointers stays as it was. Stores through such pointers, more than
+/// [`REACH`] from every named address, are not copied back into title
+/// memory.
+/// shortcut: a store that begins in a page's last bytes and ends in the
+/// next page lands in the first page's copy only (the builder's nodes lie
+/// on 64 bytes). Copies of pages the title maps anew are not given up, nor
+/// their numbers used again.
+pub(crate) fn pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_MEMORY_PAGES").is_some_and(|v| v == "1");
+        victory_shader::emit::set_memory_pages(on);
+        on
+    })
+}
+
+/// Remappings told by the runtime and not yet taken in ([`remapped`]).
+static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// The runtime mapped or unmapped title memory `[at, at + len)`: with
+/// [`pages`] the directory's entries there name copies of what the pages
+/// showed before. Noted here and taken in before the next dispatch (the
+/// runtime holds its own locks when it tells).
+pub(crate) fn remapped(at: usize, len: usize) {
+    if !pages() || len == 0 {
+        return;
+    }
+    let mut noted = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    match noted.last_mut() {
+        Some(last) if last.0 + last.1 == at as u64 => last.1 += len as u64,
+        _ => noted.push((at as u64, len as u64)),
+    }
 }
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
@@ -87,6 +153,82 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// With [`pages`]: the copy (its place in `copies`) of each physical
+    /// page held (the section's handle, the offset in it).
+    slices: HashMap<(usize, u64), u32>,
+    /// With [`pages`]: the directory's entries that name page copies, by
+    /// page number, with the copy.
+    paged: std::collections::BTreeMap<u64, u32>,
+    /// With [`pages`]: per page copy the physical page it stands for (none
+    /// once its own address shows another) and the pages whose entries
+    /// name it.
+    held: HashMap<u32, (Option<(usize, u64)>, Vec<u64>)>,
+    /// The copies that are no page copies (title buffers, windows).
+    plain: Vec<u32>,
+    /// With [`pages`]: page copies made and not yet brought up to date.
+    fresh: Vec<u32>,
+    /// The addresses the dispatch being made ready names.
+    named: Vec<u64>,
+    /// Of those, how many come first that its stages may store near: its
+    /// root views and the address pairs among its constants. Not what a
+    /// geometry table names (read only), nor a constant taken for an
+    /// address in 256-byte units (any number of 0x0100_0000 or more is).
+    stored: usize,
+    /// With [`pages`]: the 4 MiB cells of memory past the directory that
+    /// have a stand-in range in it ([`root_address`]), in the ranges' order.
+    far: Vec<u64>,
+}
+
+/// The first page of the directory's stand-in ranges, its last 4 GiB, and
+/// the pages of a range: a cell and the one after it.
+const FAR_FIRST: u64 = MEMORY_PAGES as u64 - 0x1_0000;
+const FAR_SPAN: u64 = 2 * CELL / PAGE;
+
+/// With [`pages`], the address a program is given for a root view at
+/// `address` that it reaches as title memory by address: the address
+/// itself, or for memory the directory does not reach (the builder's own
+/// tables lie in the host's heap, above 40 bits) an address in a stand-in
+/// range of the directory that shows the 8 MiB from the address's 4 MiB
+/// cell on. The program only ever adds offsets to it.
+/// shortcut: there are 512 such ranges; when all are taken they are given
+/// out again from the first, and what an earlier list was given for a
+/// range may then show other memory (the builder's tables change with
+/// every frame).
+pub(crate) fn root_address(address: u64) -> u64 {
+    if address / PAGE < FAR_FIRST {
+        return address;
+    }
+    match MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        Some(m) => m.stand_in(address),
+        None => address,
+    }
+}
+
+impl Memory {
+    /// [`root_address`] of an address past the directory, its page and the
+    /// next made ready.
+    fn stand_in(&mut self, address: u64) -> u64 {
+        let cell = address & !(CELL - 1);
+        let k = match self.far.iter().position(|&c| c == cell) {
+            Some(k) => k,
+            None => {
+                if self.far.len() as u64 >= (u64::from(MEMORY_PAGES) - 1 - FAR_FIRST) / FAR_SPAN {
+                    // Every range is taken: their entries are emptied.
+                    self.far.clear();
+                    for page in FAR_FIRST..u64::from(MEMORY_PAGES) - 1 {
+                        // SAFETY: inside the directory's mapping.
+                        unsafe { self.directory.1.add(page as usize * 2).write_volatile(0) };
+                    }
+                }
+                self.far.push(cell);
+                self.far.len() - 1
+            }
+        };
+        let stand_in = (FAR_FIRST + k as u64 * FAR_SPAN) * PAGE + (address - cell);
+        self.map(stand_in);
+        self.map(stand_in + PAGE);
+        stand_in
+    }
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -138,6 +280,14 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            slices: HashMap::new(),
+            paged: Default::default(),
+            held: HashMap::new(),
+            plain: Vec::new(),
+            fresh: Vec::new(),
+            named: Vec::new(),
+            stored: 0,
+            far: Vec::new(),
         })
     }
 
@@ -155,7 +305,17 @@ impl Memory {
         if unsafe { entry.read() } != 0 {
             return;
         }
-        let start = page * PAGE;
+        // A page of the stand-in range shows memory past the directory
+        // (`root_address`).
+        let far = page >= FAR_FIRST;
+        let start = if far {
+            let Some(&cell) = self.far.get(((page - FAR_FIRST) / FAR_SPAN) as usize) else {
+                return;
+            };
+            cell + (page - FAR_FIRST) % FAR_SPAN * PAGE
+        } else {
+            page * PAGE
+        };
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
@@ -169,6 +329,48 @@ impl Memory {
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
             why("not committed");
+            return;
+        }
+        // View memory outside title buffers, with `pages`: the copy of the
+        // physical page, whichever address asked first.
+        if pages()
+            && !far
+            && crate::shadow::extent(start).is_none()
+            && let Some(slice) = crate::inplace::slice_of(start as usize)
+        {
+            let n = match self.slices.get(&slice) {
+                Some(&n) => n,
+                None if self.copies.len() < copies_most() as usize => {
+                    let Some(shadow) = crate::shadow::window_at(start, PAGE_COPY) else {
+                        why("no copy could be made");
+                        return;
+                    };
+                    self.copies.push(shadow);
+                    let n = self.copies.len() as u32 - 1;
+                    self.slices.insert(slice, n);
+                    self.held.insert(n, (Some(slice), Vec::new()));
+                    self.fresh.push(n);
+                    n
+                }
+                None => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(most = copies_most(), "title memory by address: no number left for another page's copy; its pages read zeros")
+                    });
+                    why("no number left");
+                    return;
+                }
+            };
+            self.paged.insert(page, n);
+            if let Some((_, named)) = self.held.get_mut(&n) {
+                named.push(page);
+            }
+            // The offset first: a shader that sees the number sees it too.
+            // SAFETY: inside the directory's mapping.
+            unsafe {
+                entry.add(1).write_volatile(0);
+                entry.write_volatile(n + 1);
+            }
             return;
         }
         // The copy a root view at that address would get; a buffer that
@@ -192,6 +394,7 @@ impl Memory {
             None if self.copies.len() < copies_most() as usize => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
+                self.plain.push(n as u32);
                 #[cfg(feature = "diagnostics")]
                 crate::pipeline::audit(|| format!("copy {n} {:#x}+{:#x} for page {page:x}", shadow.span().0, shadow.span().1));
                 // Every page the copy holds whole, not only the one asked
@@ -306,7 +509,9 @@ impl Memory {
         let pairs = unsafe { std::slice::from_raw_parts(table as *const [u32; 2], LOOKED / 8) };
         for &[low, high] in pairs {
             if (1..=0xFF).contains(&high) && low >= 0x1_0000 {
-                self.name(u64::from(low) | u64::from(high) << 32);
+                let address = u64::from(low) | u64::from(high) << 32;
+                self.name(address);
+                self.named.push(address);
             }
         }
     }
@@ -314,8 +519,49 @@ impl Memory {
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it.
     fn name(&mut self, address: u64) {
+        // With `pages`, in view memory: the pages from the address to where
+        // the views that follow one another end (a streamed resource).
+        if pages() && crate::inplace::slice_of(address as usize).is_some() {
+            let end = crate::inplace::viewed_to(address as usize, REACH as usize) as u64;
+            let mut at = address & !(PAGE - 1);
+            while at < end {
+                self.map(at);
+                at += PAGE;
+            }
+            return;
+        }
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
+    }
+
+    /// Takes in what the runtime mapped anew ([`remapped`]): the entries of
+    /// those pages are emptied, and a copy whose own address is among them
+    /// no longer stands for its physical page.
+    fn take_remapped(&mut self) {
+        let noted = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        for (at, len) in noted {
+            let range = at / PAGE..(at + len).div_ceil(PAGE);
+            let gone: Vec<(u64, u32)> = self.paged.range(range.clone()).map(|(&page, &n)| (page, n)).collect();
+            for (page, n) in gone {
+                self.paged.remove(&page);
+                // SAFETY: inside the directory's mapping (the page had an entry).
+                unsafe { self.directory.1.add(page as usize * 2).write_volatile(0) };
+                let start = self.copies[n as usize].span().0;
+                let Some((slice, named)) = self.held.get_mut(&n) else { continue };
+                named.retain(|&p| p != page);
+                if range.contains(&(start / PAGE)) {
+                    if let Some(slice) = slice.take() {
+                        self.slices.remove(&slice);
+                    }
+                    // Its other addresses find the page's new copy.
+                    for other in std::mem::take(named) {
+                        self.paged.remove(&other);
+                        // SAFETY: as above.
+                        unsafe { self.directory.1.add(other as usize * 2).write_volatile(0) };
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -343,10 +589,17 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
+    m.take_remapped();
     let numbered = m.copies.len();
+    m.named.clear();
     for &address in addresses {
-        m.name(address);
-        m.name_table(address);
+        if pages() && address / PAGE >= FAR_FIRST {
+            // Reached through its stand-in range (`root_address`).
+            m.stand_in(address);
+        } else {
+            m.name(address);
+            m.named.push(address);
+        }
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -356,11 +609,20 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
+            let address = u64::from(c) | u64::from(high) << 32;
+            m.name(address);
+            m.named.push(address);
         }
+    }
+    m.stored = m.named.len();
+    for &c in constants {
         if c >= 0x0100_0000 {
             m.name(u64::from(c) << 8);
+            m.named.push(u64::from(c) << 8);
         }
+    }
+    for &address in addresses {
+        m.name_table(address);
     }
     let key = std::ptr::from_ref(heap) as usize;
     let (base, made) = match m.heaps.get(&key) {
@@ -385,12 +647,46 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
+    /// Keys of [`HostList::first_use`] for a plain copy's writes with `pages`.
+    const NEAR_PLAIN: usize = usize::MAX - 0x80_0000;
+    // With `pages`: the page copies near what the dispatch names, and those
+    // made since the last dispatch; the other copies as before.
+    let mut near: Vec<(u32, bool)> = std::mem::take(&mut m.fresh).into_iter().map(|n| (n, false)).collect();
+    for (i, &address) in m.named.iter().enumerate() {
+        let page = address / PAGE;
+        near.extend(m.paged.range(page..=page + REACH / PAGE).map(|(_, &n)| (n, i < m.stored)));
+    }
+    // Each once, stored near if any of its names says so.
+    near.sort_unstable_by_key(|&(n, stored)| (n, !stored));
+    near.dedup_by_key(|&mut (n, _)| n);
+    for &n in &m.plain {
+        let (n, shadow) = (n as usize, &m.copies[n as usize]);
         let (start, len) = shadow.span();
         if first_read || n >= numbered {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        // Not memory past the title's 40 bits (the builder's tables in the
+        // host's heap, which its stages only read): what the compare took
+        // for a shader's store there would go into the heap of this very
+        // process.
+        // With `pages`, only where the dispatch names memory in or just
+        // before the copy: a stage that stores through a garbage pointer
+        // (run bvh-26: 75 KiB of node headers in a window of the title's
+        // heap that a fault had numbered) then leaves title memory alone.
+        let named = !pages() || m.named[..m.stored].iter().any(|&a| a < start + len && a + REACH > start);
+        if writes && named && start >> 40 == 0 && (!pages() || list.first_use(NEAR_PLAIN - n)) && (pages() || first_write || n >= numbered) {
+            shadow.gpu_writes(list, start, len);
+        }
+    }
+    for (n, stored) in near {
+        // Once per list each, as the others.
+        const NEAR: usize = usize::MAX - 0x100_0000;
+        let shadow = &m.copies[n as usize];
+        let (start, len) = shadow.span();
+        if list.first_use(NEAR - 2 * n as usize) {
+            shadow.refresh(list, start, len);
+        }
+        if writes && stored && list.first_use(NEAR - 2 * n as usize - 1) {
             shadow.gpu_writes(list, start, len);
         }
     }

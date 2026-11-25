@@ -2721,8 +2721,8 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 }
 
 /// The title buffer holding `address`, as (start, length), without making
-/// its copy (diagnostics: which buffer a dropped program's root view names).
-#[cfg(feature = "diagnostics")]
+/// its copy (which buffer a dropped program's root view names; whether
+/// memory by address lies in a buffer).
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
     buffers()
         .range(..=(address, usize::MAX))
@@ -3071,7 +3071,20 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// The copy of exactly `[start, start + len)` of title memory outside
+/// buffers (64 KiB units), made on first use: `crate::memory` holds view
+/// memory by address in copies of a page and the page after, whatever the
+/// windows' grid is.
+pub(crate) fn window_at(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    loose_as(start, start + len, false, false, Some((start, len)))
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+    loose_as(address, end, unsized_ask, any, None)
+}
+
+/// [`loose`]; with `exact` the window is that span and no other.
+fn loose_as(address: u64, end: u64, unsized_ask: bool, any: bool, exact: Option<(u64, u64)>) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
@@ -3087,6 +3100,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     } else {
         named
     };
+    let (start, len) = exact.unwrap_or((start, len));
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);

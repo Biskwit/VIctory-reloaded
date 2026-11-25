@@ -184,6 +184,9 @@ struct Lower<'a> {
     lane_fail: HashMap<Value, Why>,
     /// The offset of the instruction whose memory access is being lowered (`memory`).
     fault_at: u32,
+    /// The handle of the instruction being lowered, where its root view is reached as title
+    /// memory by address (`paged_root`): [`Lower::handle`] gives it for the instruction's source.
+    paged: Option<V>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
     /// DXIL block per IR block (unreachable: none).
@@ -1432,6 +1435,7 @@ impl<'a> Lower<'a> {
             bad,
             lane_fail: HashMap::new(),
             fault_at: 0,
+            paged: None,
             vals: HashMap::new(),
             floats: HashMap::new(),
             block: vec![None; p.blocks.len()],
@@ -1621,6 +1625,9 @@ impl<'a> Lower<'a> {
             };
             if let Some(bias) = self.root_bias(a.param) {
                 off = self.s.m.bin(c, Bin::Add, off, bias);
+            }
+            if let Some((_, at)) = self.paged_root(&src, off, guard) {
+                off = at;
             }
             Some(self.handle((b, i), &src, false, (11, 0))?)
         };
@@ -4483,6 +4490,7 @@ impl<'a> Lower<'a> {
     // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
+        self.paged = None;
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
@@ -5226,6 +5234,9 @@ impl<'a> Lower<'a> {
             let so = self.operand(inst, soffset)?;
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
+        if let Some((_, at)) = self.paged_root(src, addr, None) {
+            addr = at;
+        }
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
             // A descriptor built around a table in the code.
             for k in 0..count {
@@ -5295,7 +5306,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+        if self.paged.is_some() || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
@@ -5828,6 +5839,44 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether this program reaches its root views as title memory by address
+    /// (`shader::memory_pages`).
+    fn pages_roots(&self) -> bool {
+        super::shader::memory_pages() && crate::spill::is_spilled(self.x.native)
+    }
+
+    /// With [`Lower::pages_roots`], for an access at byte `byte` of the root view (not a
+    /// constant buffer) the descriptor `src` is built around: the handle of the copy that
+    /// holds that byte of title memory and the byte in it ([`Lower::memory`]). The handle
+    /// is then what [`Lower::handle`] gives for the rest of the instruction.
+    fn paged_root(&mut self, src: &Source, byte: V, guard: Option<V>) -> Option<(V, V)> {
+        use super::shader::USER_ROOT_ADDRESS;
+        if !self.pages_roots() {
+            return None;
+        }
+        let Source::Built { address, .. } = src else {
+            return None;
+        };
+        let rp = *self.x.native.layout.get(address.param)?;
+        if rp.root != RootType::Descriptor {
+            return None;
+        }
+        let kind = self.x.native.used.iter().find(|u| u.user_data == rp.user_data).map(|u| u.kind);
+        if !matches!(kind, Some(ResourceType::Srv | ResourceType::Uav)) {
+            return None;
+        }
+        let lo = self.host_word(RootType::Other(USER_ROOT_ADDRESS), rp.slot, 0);
+        let hi = self.host_word(RootType::Other(USER_ROOT_ADDRESS + 1), rp.slot, 0);
+        let c = self.cur;
+        let sum = self.s.m.bin(c, Bin::Add, lo, byte);
+        let carry = self.s.m.cmp(c, pred::IULT, sum, lo);
+        let carry = self.s.m.cast(c, Cast::ZExt, carry, self.s.t.i32);
+        let hi = self.s.m.bin(c, Bin::Add, hi, carry);
+        let (h, at) = self.memory(sum, hi, guard);
+        self.paged = Some(h);
+        Some((h, at))
+    }
+
     /// For a root view the host binds as a raw view that may begin before
     /// the title's address (`shader.rs` `USER_VIEW_BIAS`): the bytes to add
     /// to offsets through it. Every root UAV, and the root SRVs of programs
@@ -5836,7 +5885,7 @@ impl<'a> Lower<'a> {
     fn root_bias(&mut self, param: usize) -> Option<V> {
         use super::shader::USER_VIEW_BIAS;
         let rp = *self.x.native.layout.get(param)?;
-        if rp.root != RootType::Descriptor {
+        if rp.root != RootType::Descriptor || self.pages_roots() {
             return None;
         }
         let kind = self
@@ -5902,6 +5951,9 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        if let Some(h) = self.paged {
+            return Ok(h);
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);
@@ -9628,6 +9680,20 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Mul, element, k);
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
+        }
+        // A root view reached as title memory by address (`paged_root`): raw bytes there.
+        if !typed {
+            let byte = match index {
+                None => Some(off),
+                Some(index) if used.is_some_and(|u| u.stride == 1) => Some(self.s.m.bin(c, Bin::Add, index, off)),
+                Some(_) => None,
+            };
+            if let Some(byte) = byte
+                && let Some((_, at)) = self.paged_root(src, byte, guard)
+            {
+                off = at;
+                index = None;
+            }
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).

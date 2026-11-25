@@ -693,12 +693,22 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_THREADS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_THREADS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
         if kind == USER_THREADS {
             return self.threads.unwrap_or(u32::MAX);
+        }
+        if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
+            // The root view the program reaches as title memory by address.
+            return match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::View(address)) => {
+                    let address = crate::memory::root_address(address);
+                    if kind == USER_ROOT_ADDRESS { address as u32 } else { (address >> 32) as u32 }
+                }
+                _ => 0,
+            };
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
