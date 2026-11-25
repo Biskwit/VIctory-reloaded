@@ -49,6 +49,11 @@ fn module() -> Option<isize> {
     })
 }
 
+/// Whether a capture is wanted (the capturer then wraps the host device).
+pub(crate) fn active() -> bool {
+    wanted().is_some()
+}
+
 /// Before the host device is made: loads the capturer when a capture is wanted.
 pub(crate) fn before_device() {
     if wanted().is_some() {

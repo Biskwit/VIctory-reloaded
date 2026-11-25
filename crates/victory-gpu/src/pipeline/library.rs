@@ -567,6 +567,13 @@ pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    // Under PIX's capturer the driver rejects the library on disk ("made for
+    // another driver version") and a run starts an empty one: saved, it
+    // replaced the folder's library with 848 bytes (run pix-1).
+    #[cfg(feature = "diagnostics")]
+    if crate::pix::active() {
+        return;
+    }
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
