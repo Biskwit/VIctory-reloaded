@@ -1,9 +1,9 @@
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
-//! shortcut: every submission is waited for, so CPU and GPU never overlap
-//! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
-//! overlap them with per-submission fences once more than clears run.
+//! Submissions are sent ahead and waited for only where their work can be
+//! observed ([`late`], on by default; `VICTORY_LATE_WAIT=0` waits for
+//! every one, so CPU and GPU never overlap).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -1652,8 +1652,9 @@ impl Drop for Deferred {
 }
 
 /// Whether a queue's submissions go to the card without a wait for each
-/// (`VICTORY_LATE_WAIT=1`; off by default, and off in the timing run, which
-/// waits for every list on its own).
+/// (`VICTORY_LATE_WAIT=1`; on by default at stage 3 with the relay, see
+/// [`relay`]; `VICTORY_LATE_WAIT=0` turns it off; off in the timing run,
+/// which waits for every list on its own).
 ///
 /// Every submission was prepared, sent, waited for and copied back before
 /// the next one was looked at, so the card stood idle while we prepared
@@ -1705,7 +1706,10 @@ pub(crate) fn late() -> bool {
     late_stage() > 0
 }
 
-/// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
+/// `VICTORY_LATE_WAIT`: 0 (off), 1, 2 ([`late_exact`]) or 3
+/// ([`late_free_present`]). Unset: 3 with the relay ([`relay`], on by
+/// default), else 0; also 0 with title buffers in place
+/// (`VICTORY_INPLACE=2`, which assumes every submission is waited for).
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
@@ -1717,7 +1721,7 @@ fn late_stage() -> u8 {
             Ok("2") => 2,
             Ok("3") => 3,
             // The relay alone: on top of stage 3.
-            Err(_) if crate::shadow::relay() => 3,
+            Err(_) if crate::shadow::relay() && crate::inplace::level() < 2 => 3,
             _ => 0,
         }
     })
@@ -1764,9 +1768,21 @@ pub(crate) fn late_free_present() -> bool {
     late_stage() > 2
 }
 
-/// The relay's first stage (`VICTORY_RELAY=1`; off by default; it turns
-/// [`late`] on at stage 3 unless `VICTORY_LATE_WAIT` says another stage,
-/// and is off with it, in the timing run and with kept snapshots).
+/// The relay's first stage (`VICTORY_RELAY=1`; with its second stage,
+/// [`relay_exact`], the default; `VICTORY_RELAY=0` turns it off). It turns
+/// [`late`] on at stage 3 unless `VICTORY_LATE_WAIT` says another stage;
+/// a stage named there runs without the relay unless `VICTORY_RELAY` asks
+/// for it (`VICTORY_LATE_WAIT=0` is every submission waited for, as
+/// before). Off in the timing run and with kept snapshots.
+///
+/// The default since run late-13 (2026-11-25, opening cutscene, RTX 4090):
+/// 207 ms a frame against 267 with every submission waited for (late-04,
+/// same build), 223 at stage 3 without the relay (late-11), 224 at stage 2
+/// (late-10), 248 at stage 1 (late-01). Its frames show nothing that the
+/// runs without late waits do not show too (those differ from run to run:
+/// blocky tiles at the bottom, sky through the cell's walls, the fence in
+/// the window); what keeps preparing from seeing a flight's work too early
+/// is the list in [`late`].
 ///
 /// With [`late`] alone every settle does three things on the thread that
 /// holds the submission lock: it waits for everything in the air, copies
@@ -1801,16 +1817,23 @@ pub(crate) fn relay() -> bool {
     *ON.get_or_init(|| late_stage() > 0 && crate::shadow::relay())
 }
 
-/// The relay's second stage (`VICTORY_RELAY=2`): a submission that reads
+/// The relay's second stage (`VICTORY_RELAY=2` or unset): a submission that reads
 /// title memory a flight's shaders may write (a title buffer copy, a fill
 /// of upload memory, a texture, a refresh of another copy of it), or that
 /// copies into memory a flight reads, waits only until the flights that
 /// declared that memory have landed, not for everything in the air; and at
 /// [`late_most`] lists in the air it waits until there are fewer. At `1`
 /// both wait for everything.
+///
+/// In run late-13 it gained nothing over `1` (late-12: 207 ms a frame
+/// both; 87 and 93 ms of waits): landing a flight takes a fetch of what
+/// its shaders wrote to copies in the card's memory, and the fetch goes to
+/// the queue behind every flight sent since (the relay thread waited 36 ms
+/// a frame for fetches), so a wait for one flight lasts until the card
+/// has run most of what is in the air.
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"))
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v != "1"))
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -2602,9 +2625,10 @@ fn late_threads() {
             tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow");
         }
         tracing::info!(
+            stage = late_stage(),
             most = late_most(),
             writes = late_writes(),
-            "submissions are sent to the card without a wait for each (VICTORY_LATE_WAIT=1)"
+            "submissions are sent to the card without a wait for each (VICTORY_LATE_WAIT=0 waits for every one)"
         );
         if relay() {
             // Without it nothing would ever land.
