@@ -4106,7 +4106,13 @@ impl Host {
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 let sends = flights.iter().map(|f| f.sends).max().unwrap_or(0);
+                #[cfg(feature = "diagnostics")]
+                let timed = crate::copystat::Timed::new(crate::copystat::C::RelayCardNs);
                 self.relay_card_back(&plans, sends, fetch);
+                #[cfg(feature = "diagnostics")]
+                drop(timed);
+                #[cfg(feature = "diagnostics")]
+                let _timed = crate::copystat::Timed::new(crate::copystat::C::RelayHandNs);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -4136,6 +4142,8 @@ impl Host {
             }
         }
         // In the order given: what tells the title the card is done.
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::copystat::Timed::new(crate::copystat::C::RelayRestNs);
         let mut last = 0;
         let mut landed = Vec::new();
         for item in items {

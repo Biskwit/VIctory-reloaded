@@ -230,6 +230,22 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
+    #[cfg(feature = "diagnostics")]
+    {
+        // The bytes the ranges cover, against those the askings walk.
+        let mut pages: Vec<(usize, usize)> =
+            ranges.iter().filter(|r| r.0 < r.1).map(|&(s, e)| (s / PAGE, e.div_ceil(PAGE))).collect();
+        pages.sort_unstable();
+        let (mut covered, mut end) = (0, 0);
+        for (a, b) in pages {
+            let a = a.max(end);
+            if b > a {
+                covered += b - a;
+                end = b;
+            }
+        }
+        crate::copystat::add(crate::copystat::C::AskCoveredBytes, (covered * PAGE) as u64);
+    }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -334,6 +350,9 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
+        add(C::AskKernelCalls, 1);
+        add(C::AskKernelBytes, ((last - first) * PAGE) as u64);
+        add(C::AskKernelNs, started.elapsed().as_nanos() as u64);
     }
     let now = j.ahead_asked;
     note_written(j, count, std::iter::empty(), now);
@@ -1681,5 +1700,85 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod asking_bench {
+    /// What a kernel asking costs, with and without the reset, over a
+    /// write-watched region with a few pages written, while other threads
+    /// of the process run (a reset's TLB flush reaches them). Run with
+    /// `cargo test --profile diag -p victory-gpu -- --ignored --nocapture asking_cost`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn asking_cost() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const SIZE: usize = 256 << 20;
+        const PAGE: usize = 4096;
+        // SAFETY: a fresh region of our own.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        for at in (0..SIZE).step_by(PAGE) {
+            // SAFETY: committed above.
+            unsafe { *((base + at) as *mut u8) = 1 };
+        }
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let spinners: Vec<_> = (0..16)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut x = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        x = x.wrapping_add(1);
+                        std::hint::black_box(x);
+                    }
+                })
+            })
+            .collect();
+        let mut found = vec![0usize; SIZE / PAGE];
+        let mut ask = |flags: u32| {
+            let mut count = found.len();
+            let mut granularity = 0;
+            // SAFETY: the answer buffer holds `count` entries.
+            let r = unsafe { GetWriteWatch(flags, base as *const _, SIZE, found.as_mut_ptr().cast(), &mut count, &mut granularity) };
+            assert_eq!(r, 0);
+            count
+        };
+        ask(1);
+        for (label, written, flags) in [("reset, none written", 0, 1), ("reset, 8 written", 8, 1), ("no reset, none written", 0, 0), ("no reset, 8 written", 8, 0)] {
+            let rounds = 200;
+            let mut took = std::time::Duration::ZERO;
+            for r in 0..rounds {
+                for k in 0..written {
+                    // SAFETY: inside the region.
+                    unsafe { *((base + ((r * 7919 + k * 104729) % (SIZE / PAGE)) * PAGE) as *mut u8) = 2 };
+                }
+                let started = std::time::Instant::now();
+                std::hint::black_box(ask(flags));
+                took += started.elapsed();
+                if flags == 0 {
+                    ask(1);
+                }
+            }
+            println!("{label}: {:.1} us an asking of {} MiB", took.as_secs_f64() * 1e6 / rounds as f64, SIZE >> 20);
+        }
+        // Small regions: the fixed cost.
+        for (label, flags) in [("reset", 1u32), ("no reset", 0)] {
+            let rounds = 2000;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                let mut count = 16;
+                let mut granularity = 0;
+                // SAFETY: as above, 16 pages.
+                unsafe { GetWriteWatch(flags, base as *const _, 16 * PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity) };
+            }
+            println!("{label}: {:.2} us an asking of 64 KiB", started.elapsed().as_secs_f64() * 1e6 / rounds as f64);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for s in spinners {
+            s.join().unwrap();
+        }
     }
 }

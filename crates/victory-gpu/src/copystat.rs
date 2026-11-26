@@ -201,8 +201,24 @@ pub(crate) enum C {
     /// kernel asking or a guard.
     UpdateCalls,
     UpdateJournal,
+    /// A submission's one asking (`watch::ask_once`): the bytes its ranges
+    /// cover (write-watched or not); the kernel askings it and the ahead
+    /// askings made, the bytes they walked and their time.
+    AskCoveredBytes,
+    AskKernelCalls,
+    AskKernelBytes,
+    AskKernelNs,
+    /// The relay's landings (`Host::relay_land`) by part: copies in the
+    /// card's memory (the fetch, its wait for the card and the merge); the
+    /// copies in the PC's memory, with each flight's ranges let go; the
+    /// rest (read-backs, bottom-of-pipe writes, signals, the line).
+    RelayCardNs,
+    RelayHandNs,
+    RelayRestNs,
 }
-const COUNTERS: usize = 112;
+const COUNTERS: usize = 128;
+// Every counter has its place (the last one named here).
+const _: () = assert!((C::RelayRestNs as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1287,6 +1303,20 @@ pub(crate) fn log(frames: f64) {
         c[C::UpdateNs as usize] / 1e6,
         c[C::UpdateWritesNs as usize] / 1e6,
         c[C::UpdateCopyNs as usize] / 1e6,
+    );
+    tracing::info!(
+        "kernel write-watch askings ahead per frame: {:.0} walking {:.0} MB in {:.1} ms; the ranges asked about cover {:.0} MB",
+        c[C::AskKernelCalls as usize],
+        mb(c[C::AskKernelBytes as usize]),
+        c[C::AskKernelNs as usize] / 1e6,
+        mb(c[C::AskCoveredBytes as usize]),
+    );
+    tracing::info!(
+        "the relay's landings per frame by part: copies in the card's memory {:.1} ms (fetch, its wait and the merge), \
+         copies in the PC's memory {:.1} ms, the rest {:.1} ms",
+        c[C::RelayCardNs as usize] / 1e6,
+        c[C::RelayHandNs as usize] / 1e6,
+        c[C::RelayRestNs as usize] / 1e6,
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
