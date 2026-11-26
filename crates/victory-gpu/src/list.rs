@@ -1883,7 +1883,8 @@ fn count_draw() {
 /// executions.
 static TOTALS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// See [`TOTALS`].
+/// See [`TOTALS`] (read by `crate::popwatch`, a diagnostics module).
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn totals() -> [u64; 3] {
     TOTALS.each_ref().map(|t| t.load(std::sync::atomic::Ordering::Relaxed))
 }
