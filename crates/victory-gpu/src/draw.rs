@@ -479,6 +479,9 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
+    /// Set at the leaf that refused preparation, including table and root views.
+    #[cfg(feature = "diagnostics")]
+    prepare_failure: crate::pipeline::PrepareFailure,
     /// View heap, sampler heap.
     heaps: [usize; 2],
     graphics: Vec<Root>,
@@ -939,6 +942,17 @@ macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
+    }};
+}
+
+// Ordinary builds retain the original boolean failure, with no trace state.
+macro_rules! prepare_failed {
+    ($state:expr, $why:ident) => {{
+        #[cfg(feature = "diagnostics")]
+        {
+            $state.prepare_failure = crate::pipeline::PrepareFailure::$why;
+        }
+        false
     }};
 }
 
@@ -1538,14 +1552,14 @@ impl State {
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            return false;
+            return prepare_failed!(self, SkippedPipeline);
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
+            return prepare_failed!(self, MissingHostPipeline);
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return prepare_failed!(self, PipelineKind);
         }
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
@@ -1585,7 +1599,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                return false;
+                return prepare_failed!(self, IndexBuffer);
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -1726,7 +1740,7 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
-                return false;
+                return prepare_failed!(self, DynamicDescriptorTable);
             }
             if stage.shader.ambient.is_some() || stage.shader.probe.is_some() {
                 self.ambient_tables.clear();
@@ -1747,7 +1761,7 @@ impl State {
                 };
                 let Some(ready) = self.memory_ready(list, t, compute, use_) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
-                    return false;
+                    return prepare_failed!(self, ShaderMemoryViews);
                 };
                 Some(ready)
             } else {
@@ -1972,7 +1986,7 @@ impl State {
         if !crate::pipeline::host::bounded_root_srvs() {
             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
                 once!("a root UAV with nothing to bind: the draw is dropped");
-                return false;
+                return prepare_failed!(self, RootUavBuffer);
             };
             ready(a, &s);
             // From the 16 bytes below: the shader adds the rest.
@@ -1995,7 +2009,7 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root UAV without a bound view heap: the draw is dropped");
-            return false;
+            return prepare_failed!(self, RootUavHeap);
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
         let (index, shadow) = match self.root_uav_slots.get(&key) {
@@ -2006,7 +2020,7 @@ impl State {
                     crate::host::settle_for_fence();
                     host.dynamic(1)
                 }) else {
-                    return false;
+                    return prepare_failed!(self, RootUavSlot);
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
@@ -2064,7 +2078,7 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root SRV without a bound view heap: the draw is dropped");
-            return false;
+            return prepare_failed!(self, RootSrvHeap);
         };
         // A view that begins early is another view than one that does not
         // (title addresses stay below bit 63).
@@ -2080,7 +2094,7 @@ impl State {
                     crate::host::settle_for_fence();
                     host.dynamic(1)
                 }) else {
-                    return false;
+                    return prepare_failed!(self, RootSrvSlot);
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
@@ -4577,9 +4591,17 @@ impl State {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => self.bind(list, p, true),
-            _ => false,
+            _ => prepare_failed!(self, PipelineKind),
         };
         if !ran {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_indirect_prepare(
+                self.pipeline as This,
+                std::mem::take(&mut self.prepare_failure),
+                (kind, stride, max),
+                (&args, arguments),
+                counter.as_ref(),
+            );
             why("prepare failed");
             return false;
         }
