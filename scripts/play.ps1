@@ -38,6 +38,11 @@ if ($Machine -eq '7900xtx') {
     # NVIDIA sets its clocks by the driver's power mode: no spinner on the
     # compute queue. 16 cores record and land, not 8.
     $settings.VICTORY_THIN_THREADS = '12'; $settings.VICTORY_UNDER_THREADS = '8'; $settings.VICTORY_LAND_THREADS = '6'
+    # A fifth of the ambient estimate, not 0.8: in the prologue's cell on this
+    # card 0.8 lit the wall and the dark right side 2-3 times as bright as the
+    # console-like picture of our earlier tree; 0.2 is the least tried without
+    # the purple probe blocks that no stand-in leaves, at the same frame time.
+    $settings.VICTORY_AMBIENT = '0.2'
     if (-not $Safe) {
         # Pages are mapped by several threads only while the title streams
         # (not the default: one run behind it).
