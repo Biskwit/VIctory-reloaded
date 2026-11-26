@@ -21,7 +21,7 @@ a release attachment, outside the repository: by the
 
 **Not playable yet: about 6 frames per second.** Tested on one machine:
 Windows 11, Intel i9-12900K, NVIDIA RTX 4090 24 GB, 64 GB RAM, Series X
-profile.
+and Series S profiles.
 
 | Stage | State |
 |-------|-------|
@@ -30,6 +30,7 @@ profile.
 | Prologue, first gameplay shot (the cell window) | renders like the console: lighting and shadows, hair, the orange jumpsuit, the frosted window with the fence and the yard behind it; the same look on every launch, first launch or not |
 | Frame rate in the world | about 6 fps (160-180 ms a frame), limited by the CPU side of the GPU emulation |
 | First launch after a translator change | slower to load: shaders are translated and pipelines compiled, and a few loading frames last several seconds; later launches load from the caches |
+| Series S profile | reaches the cell window and renders it, softer than Series X: FSR 4 is replaced by a plain upscale, without its temporal anti-aliasing; about 20% faster (125-137 ms a frame) |
 | Stability | no crash or device loss in the test runs |
 
 ### What this fork changes
@@ -44,6 +45,7 @@ Rendering:
   - stale views of textures in shared memory;
   - descriptor records the title copies as bytes;
   - translator gaps: 64-lane wave operations on 32-lane hosts, half-precision wave sums, lane masks used as numbers.
+- **Series S runs into the world.** Its packed-light render target (R9G9B9E5, which PC GPUs cannot render to) has a stand-in format, the two display planes it presents (game and interface) are composed, and since FSR 4's shaders are AMD-compiled code the translator cannot read, a plain upscale draws FSR's output.
 - **Ray tracing is still off by default.** The builder (`VICTORY_BVH_BUILDER=1`) runs, but its memory grows without bound.
 
 Speed:
@@ -132,7 +134,7 @@ What each part does today and what it still needs:
 | GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
 | Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
+| Series S mode | Runs into the world: two display planes composed, a plain upscale stands in for FSR 4 | No temporal anti-aliasing (FSR 4's shaders are not translated); the world, as above |
 
 ## Getting started
 
