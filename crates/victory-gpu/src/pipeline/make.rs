@@ -80,6 +80,10 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
+        // `VICTORY_DROP_NAMES=1`: which pipeline, for the drop lines.
+        None if std::env::var_os("VICTORY_DROP_NAMES").is_some() => {
+            Some(format!("being made {}", p.hashes().join("+")))
+        }
         None => Some("being made".into()),
         Some(None) => {
             let failed: Vec<String> = p

@@ -6808,7 +6808,9 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
-                for (why, n) in drops.iter().take(40) {
+                // `VICTORY_DROP_NAMES=1` names each pipeline being made: all of them.
+                let shown = if std::env::var_os("VICTORY_DROP_NAMES").is_some() { usize::MAX } else { 40 };
+                for (why, n) in drops.iter().take(shown) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
                         *n as f64 / frames
