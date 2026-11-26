@@ -6005,6 +6005,10 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    if len <= FILL_BATCHED {
+                        batch.fill(dst, src, len);
+                        continue;
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -6020,6 +6024,9 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                    } else {
+                        // It may write upload memory a fill goes to.
+                        batch.fills_done();
                     }
                     work();
                     // It wrote title memory, where is not known here: the
@@ -6099,9 +6106,73 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Fills of upload memory of [`FILL_BATCHED`] bytes or less not done
+    /// yet (destination, source, bytes), done before the next step that
+    /// writes title memory or host memory, and at the flush
+    /// ([`Batch::fills_done`]).
+    fills: Vec<(usize, usize, usize)>,
+    /// Room for the title memory those fills read.
+    fill_span: Vec<u8>,
 }
 
+/// Fills of upload memory this small wait in the [`Batch`]: one kernel read
+/// a submission's fills were each (some 14,000 a frame in the cell scene,
+/// constants of 480 bytes on average for draws' descriptor tables, 7.7 ms
+/// a frame on the submitting thread in run sp-base1). Read together, a
+/// span of title memory at a time ([`FILL_GAP`], [`FILL_SPAN`]), most of
+/// them are one read.
+const FILL_BATCHED: usize = 16 << 10;
+/// Fills whose sources lie this close are read together: reading the bytes
+/// between them costs less than another kernel call.
+const FILL_GAP: usize = 4 << 10;
+/// The most one read of fills' sources covers.
+const FILL_SPAN: usize = 1 << 20;
+
 impl Batch {
+    /// A fill of `len` bytes of title memory at `src` into upload memory at
+    /// `dst`, done by [`Batch::fills_done`].
+    fn fill(&mut self, dst: usize, src: usize, len: usize) {
+        self.fills.push((dst, src, len));
+    }
+
+    /// Does the waiting fills: their sources by address, a read of title
+    /// memory per span of them (as [`copy_mapped`] reads, zeros where a page
+    /// is not there), each fill's bytes from it.
+    fn fills_done(&mut self) {
+        if self.fills.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::copystat::Timed::new(crate::copystat::C::StepFillNs);
+        let mut fills = std::mem::take(&mut self.fills);
+        fills.sort_unstable_by_key(|f| f.1);
+        let mut copied = 0;
+        let mut i = 0;
+        while i < fills.len() {
+            let from = fills[i].1;
+            let mut to = from + fills[i].2;
+            let mut k = i + 1;
+            while k < fills.len() && fills[k].1 <= to + FILL_GAP && fills[k].1 + fills[k].2 - from <= FILL_SPAN {
+                to = to.max(fills[k].1 + fills[k].2);
+                k += 1;
+            }
+            self.fill_span.resize(to - from, 0);
+            copy_mapped(self.fill_span.as_mut_ptr(), from as *const u8, to - from, false);
+            for &(dst, src, len) in &fills[i..k] {
+                // SAFETY: the fill's upload memory, `len` bytes, and its
+                // bytes in the span just read.
+                unsafe { std::ptr::copy_nonoverlapping(self.fill_span.as_ptr().add(src - from), dst as *mut u8, len) };
+                copied += len;
+            }
+            i = k;
+        }
+        fills.clear();
+        self.fills = fills;
+        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -6158,6 +6229,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        self.fills_done();
         self.index.clear();
         let refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = self
             .refreshes
@@ -7437,6 +7509,47 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         assert!(!batch.texture_due(&a.clone()));
         assert!(!batch.texture_due(&b));
+    }
+
+    /// Fills done together give each destination what a read of its own
+    /// gives: its source's bytes, zeros where a page is not there, however
+    /// the sources lie (apart, close, overlapping, out of order).
+    #[test]
+    fn fills_done_together_read_what_each_alone_reads() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const PAGE: usize = 4096;
+        // Three pages, the middle one not there.
+        // SAFETY: a fresh reservation of our own, committed in part.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        for page in [0, 2] {
+            // SAFETY: inside the reservation.
+            let at = unsafe { VirtualAlloc((base + page * PAGE) as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) } as usize;
+            assert_eq!(at, base + page * PAGE);
+            for i in 0..PAGE {
+                // SAFETY: committed above.
+                unsafe { *((at + i) as *mut u8) = (i * 7 + page) as u8 };
+            }
+        }
+        let sources = [(base + 100, 200), (base + 120, 50), (base + 3000, 2000), (base + 2 * PAGE + 10, 300), (base + 40, 16), (base + PAGE + 5, 64)];
+        let mut alone: Vec<Vec<u8>> = sources.iter().map(|&(_, len)| vec![0xAA; len]).collect();
+        let mut together: Vec<Vec<u8>> = alone.clone();
+        for (&(src, len), dst) in sources.iter().zip(&mut alone) {
+            super::copy_mapped(dst.as_mut_ptr(), src as *const u8, len, false);
+        }
+        let mut batch = Batch::default();
+        for (&(src, len), dst) in sources.iter().zip(&mut together) {
+            batch.fill(dst.as_mut_ptr() as usize, src, len);
+        }
+        batch.fills_done();
+        assert!(batch.fills.is_empty());
+        assert_eq!(alone, together);
+        // The page that is not there read as zeros; the others as written.
+        assert!(together[5].iter().all(|&b| b == 0));
+        assert_eq!(together[4][0], (40 * 7) as u8);
+        assert_eq!(together[3][0], (10 * 7 + 2) as u8);
+        // SAFETY: our reservation, nothing points into it any more.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 
     #[test]
