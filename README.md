@@ -63,6 +63,9 @@ Every number is from the game's own once-a-second frame lines in the world
 part of a frame, are in [docs/measurements.md](docs/measurements.md).
 <!-- measurements:end -->
 
+What these runs found and fixed on this PC is in
+[docs/findings-rtx4090.md](docs/findings-rtx4090.md).
+
 ### Benchmark charts
 
 The charts show the current Series S measurement above, on an RTX 4090.
