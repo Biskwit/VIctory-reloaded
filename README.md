@@ -68,11 +68,11 @@ What these runs found and fixed on this PC is in
 ### Benchmark charts
 
 The charts show the latest completed Series S benchmark on an RTX 4090.
-[Open the interactive dashboard](https://taynangt.github.io/Vice-Tay/).
+Select a chart to open its interactive view.
 
-![Median FPS, 1% lows and percentile ranges by run, with a 30 fps target](docs/charts/profile-frame-rate.svg)
+[![Explore frame rate, 1% low and percentile range](docs/charts/profile-frame-rate.svg)](https://taynangt.github.io/Vice-Tay/#fps)
 
-![Median frame times, preparation times and copy counters by run](docs/charts/profile-frame-timing.svg)
+[![Explore frame timing and data transferred per frame](docs/charts/profile-frame-timing.svg)](https://taynangt.github.io/Vice-Tay/#timing)
 
 <!-- Refresh the charts with node scripts/generate-benchmark-charts.mjs after editing the source tables. -->
 
