@@ -720,8 +720,9 @@ fn card_clock_watch(clock: &'static CardClock) {
 }
 
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
-/// frame's time.
-fn card_clock_line(frames: f64, ms: f64) {
+/// frame's time. Returns the milliseconds a frame with nothing of ours
+/// queued (for the overlay).
+fn card_clock_line(frames: f64, ms: f64) -> f64 {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
@@ -729,6 +730,7 @@ fn card_clock_line(frames: f64, ms: f64) {
          had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
         if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
     );
+    idle
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -8801,6 +8803,9 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
+    /// What the overlay draws with (`crate::overlay`), once it first drew
+    /// (`None` inside: none could be made).
+    overlay: Option<Option<crate::overlay::Overlay>>,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
@@ -8816,6 +8821,14 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// Dispatches run so far at the last count, and the last second's
+    /// figures, for the overlay.
+    dispatched: u64,
+    line: crate::overlay::FrameLine,
+    /// The dynamic slots taken and tables refused them so far
+    /// (`crate::copystat`, which counts from 0 again at its line).
+    #[cfg(feature = "diagnostics")]
+    dynamic: [u64; 2],
 }
 
 impl Meter {
@@ -8829,6 +8842,10 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            dispatched: crate::draw::dispatched(),
+            line: Default::default(),
+            #[cfg(feature = "diagnostics")]
+            dynamic: [0; 2],
         }
     }
 
@@ -8883,7 +8900,32 @@ impl Meter {
         crate::descriptor::sync_line(frames);
         late_line(frames);
         crate::queue::behind_line(frames);
-        card_clock_line(frames, ms);
+        let idle = card_clock_line(frames, ms);
+        {
+            let dispatched = crate::draw::dispatched();
+            #[cfg(feature = "diagnostics")]
+            let dynamic = {
+                use crate::copystat::{C, peek};
+                let now = [peek(C::DynamicSlots), peek(C::DynamicRefused)];
+                let was = std::mem::replace(&mut self.dynamic, now);
+                [0, 1].map(|i| now[i].saturating_sub(was[i]) as f64 / frames)
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let dynamic = [0.0; 2];
+            self.line = crate::overlay::FrameLine {
+                fps,
+                ms,
+                cpu,
+                busy: (ms - idle).max(0.0),
+                wait: gpu,
+                back: back_ms,
+                draws,
+                dispatches: dispatched.saturating_sub(self.dispatched) as f64 / frames,
+                dropped,
+                dynamic,
+            };
+            self.dispatched = dispatched;
+        }
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
@@ -9075,6 +9117,7 @@ impl Meter {
                 );
                 traffic::line(self.copy_stats_frames as f64);
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                self.dynamic = [0; 2];
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -9357,6 +9400,8 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
+            // Over what the window shows, after what was read back of it.
+            crate::overlay::record(&mut p.overlay, self, copy, &back, &p.meter.line);
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
@@ -9465,6 +9510,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
+                overlay: None,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })

@@ -47,6 +47,8 @@ mod inplace;
 mod land;
 pub mod list;
 pub mod object;
+#[cfg(windows)]
+mod overlay;
 pub mod pipeline;
 #[cfg(windows)]
 mod picked;
