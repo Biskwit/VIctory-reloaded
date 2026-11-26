@@ -107,11 +107,13 @@ copy victory.example.toml victory.toml      # then set your paths, outside this 
 cargo build --locked --profile diag -p victory --features diagnostics
 ```
 
-Before the first run, translate the shaders and warm the pipelines (each can be
-stopped and resumed):
+From the repository root, translate the shaders and warm the pipelines (each can
+be stopped and resumed). With `game_dir` set in `victory.toml`, the shader
+command scans that directory. To scan one archive, pass its quoted path, for
+example `.\target\diag\victory.exe shaders "D:\My Game Dump\shaders.rpf"`.
 
 ```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader, takes minutes
+.\target\diag\victory.exe shaders                         # scans game_dir in victory.toml
 target\diag\victory.exe warm --used                     # pipelines earlier runs drew with
 ```
 
