@@ -254,6 +254,7 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static BY_ADDRESS_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Local-VRAM buffer breakdown for the HUD: `[card_buffers_and_windows, bvh_arenas]`.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn vram_breakdown() -> [u64; 2] {
     let bvh = BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed);
     let win = WINDOW_CARD_BYTES.load(Ordering::Relaxed).saturating_sub(bvh);
