@@ -1,3 +1,159 @@
+# VIctory-reloaded
+
+VIctory-reloaded runs the Xbox Series build of Grand Theft Auto VI natively on
+Windows, from files you supply. It is [Vice-Tay](https://github.com/TaynanGT/Vice-Tay)
+by TaynanGT, which carries [VIctory](https://github.com/Marvisak/VIctory) and
+the work of the forks credited below, with a thin layer of ours on top: an
+on-screen overlay in every build, and tools for looking into a running game in
+diagnostics builds. Vice-Tay's main branch is merged in as it moves.
+
+**No game files, code or assets are in this repository.** You need your own
+copy of the game. VIctory-reloaded is not affiliated with or endorsed by the
+game's developer or publisher.
+
+![The prologue's first gameplay shot](https://github.com/Biskwit/VIctory-reloaded/releases/download/v0.1.0-preview/prologue-cell-window.png)
+
+*The prologue's first gameplay shot on an RTX 4090. The picture is a release
+attachment, outside the repository: by the [asset policy](docs/asset-policy.md)
+nothing from the game goes in the tree.*
+
+## What this tree is
+
+- **Vice-Tay's tree, whole.** Its status, measurements, known problems, set-up
+  and `scripts\play.ps1` apply here as they are: they are in Vice-Tay's README
+  below the line, and its `docs` folder is unchanged.
+- **Our layer**, a few commits on top, each naming the commits of our earlier
+  tree it comes from:
+  - the overlay (below), in every build;
+  - pipelines with a static comparison sampler kept out of the pipeline
+    library, as our earlier tree did: the driver's stored copies sample
+    without the comparison (`VICTORY_LIBRARY_COMPARISON=1` stores them as
+    before);
+  - compute pipelines a dispatch asks for made first, and waited for within
+    a cap, instead of dropped behind the draws' (`VICTORY_COMPUTE_FIRST=0`,
+    `VICTORY_COMPUTE_WAIT`): cold launches kept the main character's head;
+  - the control file, live switches, the texture view and window shots
+    (diagnostics builds);
+  - PIX captures taken from inside the run (diagnostics builds).
+- **Not brought over (yet)** from our earlier tree (fxceless's fork with about
+  140 commits of ours): its FidelityFX SDK path for the Series S upscale
+  (Vice-Tay translates FSR 4's own code) and its other rendering fixes, which
+  are being checked one by one against Vice-Tay's picture. Nor its
+  `victory replay-dispatch` (one compute dispatch captured and run again with
+  other compiles, the pipeline library's stored binary, other samplers): it
+  reaches into the translator, the pipeline library and the recording paths
+  Vice-Tay changes most, its module name is taken by Vice-Tay's frame replay,
+  and Vice-Tay's `victory replay` ([docs/replay.md](docs/replay.md)) already
+  re-translates, swaps and skips shaders and finds what draws a pixel.
+
+## The overlay
+
+On in every build; `VICTORY_OVERLAY=0` hides it. A compact table at the top left
+of the window, in Consolas (our own small font where Windows has none), drawn
+over the window's picture just before it is presented: saved frames, shots and
+the frame recorder never show it.
+
+| Row | What it shows |
+|---|---|
+| VIctory-reloaded | and the console the title runs as (Series X or Series S) |
+| fps, ms | frames a second and time a frame over the last second: green from 15 fps, amber from 10, red below |
+| CPU prep | preparing the card's work on the CPU (title memory copies, texture refreshes), a frame, with a bar of its share of the frame |
+| GPU busy | the frame's time less the time the card had nothing of ours queued (the card's clock of the frame line); the card's work, at most |
+| Copy-back | comparing and copying what shaders wrote back into title memory |
+| Draws, Dropped | draws a frame, and those dropped for want of a host pipeline (one being made) |
+| VRAM | the card's memory in use, of the system's budget for the game |
+
+A diagnostics build adds a smaller block: **GPU wait** (the submitting thread
+standing for the card: the frame line's "on the GPU", near 0 on Series S, where
+submissions are sent ahead), dispatches, shaders from the cache and translated,
+pipelines loaded and made, pipelines being made, shared memory, the dynamic
+descriptor slots taken a frame (and tables refused them), the live switches set
+and the view's line. Vice-Tay's own panel (`VICTORY_PANEL=1`, **F3**) is
+unchanged and drawn over ours when shown.
+
+## Debugging tools (diagnostics builds)
+
+```powershell
+cargo build --locked --profile diag -p victory --features diagnostics   # target\diag\victory.exe
+```
+
+Vice-Tay's switches and tools (frame capture, dumps, the frame recorder) are
+described in [docs/README-fxceless.md](docs/README-fxceless.md),
+[docs/replay.md](docs/replay.md) and where the code reads each switch. Ours:
+
+| Variable | Effect |
+|---|---|
+| `VICTORY_OVERLAY=0` | hides the overlay (every build) |
+| `VICTORY_CONTROL=<file>` | the control file (default `D:\victory-control.txt`) |
+| `VICTORY_PIX=1` | loads PIX's GPU capturer at the start, for the control file's `pix` |
+| `VICTORY_PIX_CAPTURE=<frame>:<file.wpix>` | PIX captures that frame into the file |
+| `VICTORY_PIX_DLL=<path>` | PIX's capturer (default: the newest under `C:\Program Files\Microsoft PIX`) |
+
+A run with PIX's capturer never saves the pipeline library: the driver refuses
+the one on disk under PIX, and the empty one would replace it.
+
+### Steering a running game
+
+At each of the title's presents the control file is looked at; when it changed,
+its commands run once (one a line, `#` for comments) and the file is deleted.
+It may be UTF-8 or the UTF-16 that Windows PowerShell's `>` writes.
+
+| Command | Effect |
+|---|---|
+| `overlay on` / `overlay off` | shows or hides the overlay |
+| `view <n> [r\|g\|b\|a\|rgb]` / `view <0xaddress> [...]` / `view off` | presents the frame's `n`-th target (first-use order, as `dump` numbers them) or a texture by address instead of the frame; floats and depth brought to the screen as dumps are, the range found named under the overlay |
+| `targets` | logs the next frame's targets: number, address, size, format |
+| `shot [name]` | saves what the window shows (a view included, the overlay not) at full size as `<name>.png` in `VICTORY_CAPTURE`, else beside the control file |
+| `dump` | saves the next frame's targets, as `VICTORY_DUMP_TARGETS` does |
+| `pix <file.wpix>` | PIX captures the next frame (a run started with `VICTORY_PIX=1`) |
+| `set NAME=VALUE` / `unset NAME` | changes a live switch for the rest of the run: `VICTORY_HEAP_RECHECK`, `VICTORY_HEAP_SYNC`, `VICTORY_STALE_TEXTURES`, `VICTORY_TEXTURE_GUARD`, `VICTORY_SCISSOR_TEST`, `VICTORY_SKIP_PIPELINES`; other switches are read at the start |
+| `repair textures` / `repair aliases` / `repair heaps` | uploads every title-filled texture again and makes every placed texture slot due / redoes every alias copy / compares every descriptor heap record with its host slot again |
+
+## Credits
+
+This is other people's work with a little more on top.
+
+- **[Vice-Tay](https://github.com/TaynanGT/Vice-Tay)** by TaynanGT: the tree this
+  one is, with its own work and that of everyone below.
+- From Vice-Tay's credits ([docs/credits.md](docs/credits.md) lists everyone
+  with a commit):
+  - **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**:
+    list calls recorded on the title's threads and translated by workers,
+    submissions prepared on threads of their own, cheaper write guards, textures
+    on a copy queue, frame record and replay;
+  - **codec-d/cool_fox** (taken down by its author): two-plane composition,
+    fallback heaps, table plans, the residency guard, fence wakes on
+    `WaitOnAddress`, wave32 lowering for NVIDIA, movie-plane uploads and XMA
+    audio fixes;
+  - **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
+    cube gradients, sparse textures;
+  - **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
+    the ambient light idea, pipeline workers, and work by romainhedouin;
+  - **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**;
+  - **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard
+    over every view of a page (with Spexivus, joroyt and tightfall), and Joshua
+    Odom's reads into title memory;
+  - **Geckomacabre** and **cxy0072019-sketch**: the texture read-back;
+  - **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only), read for how the
+    same title behaves under another layer; no code of it is here.
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
+  contributors: the loader, the runtime services, the Direct3D 12 back end and
+  the shader recompiler.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** and the
+  people whose pull requests it carries: the tree our earlier work started from.
+- **VIctory-reloaded** (Biskwit): the overlay, the control file and live
+  switches, the texture view and shots, PIX captures from the run, and the
+  earlier tree's fixes and tools.
+
+## License
+
+GPL-3.0-or-later, as VIctory and Vice-Tay. See [LICENSE](LICENSE); the one file
+it does not cover is named in [docs/asset-policy.md](docs/asset-policy.md).
+
+Below this line is Vice-Tay's README as it is.
+
+---
+
 # Vice-Tay
 
 Vice-Tay runs an Xbox Series title natively on Windows, from files you supply,
