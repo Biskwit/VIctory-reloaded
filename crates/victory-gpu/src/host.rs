@@ -893,6 +893,8 @@ fn create() -> windows::core::Result<Host> {
                 tracing::warn!("crash tracing asked for and not there: no device-removed data settings");
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::pix::before_device();
         let mut device: Option<ID3D12Device> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the

@@ -5,6 +5,8 @@
 //! Blank lines and lines starting with `#` are skipped; what a command did,
 //! or why it did not, is logged.
 //!
+//! - `pix <file.wpix>`: PIX captures the next frame into the file (a run
+//!   started with `VICTORY_PIX=1`, `crate::pix`).
 //! - `shot [name]`: saves the frame presented next, as the window shows it
 //!   without the overlay, at full size as `<name>.png` (else
 //!   `shot-<frame>.png`).
@@ -42,6 +44,7 @@ use crate::resource::HostTexture;
 /// A line of the control file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
+    Pix(String),
     Shot(Option<String>),
     Dump,
     /// A switch and its value; `None` for `unset`.
@@ -107,6 +110,8 @@ fn parse(line: &str) -> Result<Option<Command>, String> {
     let rest = rest.trim();
     let args: Vec<&str> = rest.split_whitespace().collect();
     let command = match (word.to_ascii_lowercase().as_str(), &args[..]) {
+        ("pix", [_, ..]) => Command::Pix(rest.to_owned()),
+        ("pix", []) => return Err("pix needs a file name".to_owned()),
         ("shot", []) => Command::Shot(None),
         ("shot", [name]) => Command::Shot(Some(file_name(name)?)),
         ("dump", []) => Command::Dump,
@@ -248,6 +253,15 @@ pub(crate) fn presented(frame: u64) {
 
 fn run(command: Command, frame: u64) {
     match command {
+        Command::Pix(file) => {
+            let file = PathBuf::from(file);
+            let file = if file.is_absolute() {
+                file
+            } else {
+                folder().join(file)
+            };
+            crate::pix::capture_next(&file);
+        }
         Command::Shot(name) => {
             *SHOT.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(name.unwrap_or_else(|| format!("shot-{frame}")));
@@ -426,6 +440,10 @@ mod tests {
 
     #[test]
     fn commands_parse() {
+        assert_eq!(
+            ok("pix D:\\caps\\cell.wpix"),
+            Command::Pix("D:\\caps\\cell.wpix".to_owned())
+        );
         assert_eq!(ok("shot"), Command::Shot(None));
         assert_eq!(
             ok("shot cell-1.png"),
@@ -495,6 +513,7 @@ mod tests {
     #[test]
     fn bad_lines_are_refused() {
         for line in [
+            "pix",
             "shot ../x",
             "shot a b",
             "set NOVALUE",

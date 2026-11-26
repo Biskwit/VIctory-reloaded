@@ -958,6 +958,7 @@ extern "system" fn present(
     {
         crate::control::presented(frame);
         crate::capture::frame_drew(frame, crate::draw::drawn());
+        crate::pix::presented(frame);
         let dumped = crate::capture::dumped(frame) || crate::control::dumps(frame);
         // (Targets are noted as lists are translated: those in the line too.)
         if crate::capture::listed(frame) || crate::control::wants_targets(frame) {

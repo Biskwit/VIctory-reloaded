@@ -56,6 +56,8 @@ mod overlay;
 pub mod pipeline;
 #[cfg(windows)]
 mod picked;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod pix;
 #[cfg(windows)]
 mod pool;
 #[cfg(all(windows, feature = "diagnostics"))]
