@@ -259,6 +259,7 @@ h2 { font-size: 21px; font-weight: 700; letter-spacing: -.025em; }
   .bar-plot { padding-inline: 4px; }
   .bar-row, .bar-axis { grid-template-columns: minmax(69px, 84px) minmax(10px, 1fr) 53px; gap: 5px; padding-inline: 4px; }
   .bar-label, .bar-value { font-size: 11px; }
+  .bar-axis .axis span:nth-child(even) { visibility: hidden; }
   .hardware-overview { gap: 8px; }
   .ring-reading { width: 76px; height: 76px; }
   .ring-reading strong { font-size: 19px; }
