@@ -7,6 +7,9 @@
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -Machine      auto (the default: by the graphics card), 7900xtx or 4090
 # -More         other settings: -More @{VICTORY_PANEL='1'}
+# On a smaller NVIDIA PC, compare the same Series S scene after a fresh start
+# with one override at a time, e.g. -More @{VICTORY_LAND_THREADS='3'} for
+# copy-back work, or -More @{VICTORY_THIN_THREADS='6'} for list translation.
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -70,8 +73,12 @@ foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $ram = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory
 Write-Host "Settings for the $Machine$(if ($Safe) { ', safe' })$(if ($RayTracing) { ', with ray tracing' })."
+if ($Console -eq 'series-s' -and $Machine -eq '4090') {
+    Write-Host ("Series S requests {0} list translation threads, {1} for memory updates, and {2} for landing." -f
+        $settings.VICTORY_THIN_THREADS, $settings.VICTORY_UNDER_THREADS, $settings.VICTORY_LAND_THREADS)
+}
 if ($ram -and $ram -lt 60GB) {
-    Write-Host ("This PC has {0:N0} GB: private memory reaches 40-46 GB; keep a system-managed page file." -f ($ram / 1GB))
+    Write-Host ("Windows reports {0:N1} GiB of physical RAM. Keep a system-managed page file. See docs/measurements.md for measured Series S memory use." -f ($ram / 1GB))
 }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
