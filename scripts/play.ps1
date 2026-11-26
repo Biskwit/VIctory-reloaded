@@ -38,6 +38,15 @@ if ($Machine -eq '7900xtx') {
     # NVIDIA sets its clocks by the driver's power mode: no spinner on the
     # compute queue. 16 cores record and land, not 8.
     $settings.VICTORY_THIN_THREADS = '12'; $settings.VICTORY_UNDER_THREADS = '8'; $settings.VICTORY_LAND_THREADS = '6'
+    if ([Environment]::ProcessorCount -lt 32) {
+        # Fewer logical processors than the 9950X3D's 32: an i9-12900K has 24
+        # (8 fast cores of two threads, 8 slow ones), and 12/8/6 ran more of
+        # our threads beside the submitting one than its cores have. Series S
+        # cell, RTX 4090 with an i9-12900K: 8/6/3 took the frame 58.0-60.4 ->
+        # 54.3-56.1 ms (the submitting thread's own work 31 -> 27 ms of CPU);
+        # 6/4/3 with VICTORY_MAP_THREADS=1 gained nothing (59.2).
+        $settings.VICTORY_THIN_THREADS = '8'; $settings.VICTORY_UNDER_THREADS = '6'; $settings.VICTORY_LAND_THREADS = '3'
+    }
     # A fifth of the ambient estimate, not 0.8: in the prologue's cell on this
     # card 0.8 lit the wall and the dark right side 2-3 times as bright as the
     # console-like picture of our earlier tree; 0.2 is the least tried without
