@@ -29,6 +29,13 @@ nothing from the game goes in the tree.*
     library, as our earlier tree did: the driver's stored copies sample
     without the comparison (`VICTORY_LIBRARY_COMPARISON=1` stores them as
     before);
+  - on NVIDIA the pipeline library is not loaded at all: warm launches that
+    loaded it drew the flat bands of colour listed below in 5 of 6 launches,
+    and in 1 of 3 even with the rule above and a real shader hash; launches
+    that loaded none never did (0 of 6). Every pipeline is made fresh, and
+    the early list still starts the early ones while the title loads: the
+    cell scene comes about 14 s later (`VICTORY_LIBRARY_LOAD=1` loads it);
+  - translated shaders carry a real shader hash part instead of zeros;
   - compute pipelines a dispatch asks for made first, and waited for within
     a cap, instead of dropped behind the draws' (`VICTORY_COMPUTE_FIRST=0`,
     `VICTORY_COMPUTE_WAIT`): cold launches kept the main character's head;
