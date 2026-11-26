@@ -96,6 +96,10 @@ Ryzen 9 9950X3D, are below the line.
 | after, the gate: 1 cold launch on a fresh cache and 3 warm ones | 19.8 (18.8) | 50.5 | 40.7 / 31.0 / 25.8 |
 | after, the gate's 15-minute warm session | 20.9 (19.9) | 47.8 | 37.9 / 29.6 / 21.5 |
 
+The same settings on Series X, in the same cell: 73.0-80.7 ms a frame before
+(12.4-13.7 fps, 2 launches of 7d190fe), 57.6 ms after (17.4 fps, 1 launch);
+card busy 65-70 -> 47 ms.
+
 ## The overlay
 
 On in every build; `VICTORY_OVERLAY=0` hides it. A compact table at the top left
