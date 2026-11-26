@@ -9271,11 +9271,17 @@ impl Host {
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
             };
+            // What the control file asks of this present (`crate::control`).
+            #[cfg(feature = "diagnostics")]
+            let live = crate::control::at_present();
             // Sent ahead ([`late_free_present`]) unless the frame is to be
-            // read back at once (a saved or listed frame): then a list of
+            // read back at once (a saved or listed frame, a shot) or drawn
+            // with views of ours (a view, `crate::overlay`): then a list of
             // its own, one whose last flight has finished or a new one.
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now = crate::capture::wanted(frame)
+                || crate::capture::listed(frame)
+                || live.as_ref().is_some_and(|l| l.view.is_some() || l.shot.is_some());
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
             let slot = if late_free_present() && !read_now {
@@ -9401,6 +9407,9 @@ impl Host {
                 crate::popwatch::take(&self.device, list, texture)
             };
             // Over what the window shows, after what was read back of it.
+            #[cfg(feature = "diagnostics")]
+            let after = live.and_then(|live| crate::overlay::view::record(&mut p.overlay, self, copy, &back, &p.meter.line, live));
+            #[cfg(not(feature = "diagnostics"))]
             crate::overlay::record(&mut p.overlay, self, copy, &back, &p.meter.line);
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
@@ -9445,6 +9454,11 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
+            }
+            // A view or shot ran its list at once (`read_now`).
+            #[cfg(feature = "diagnostics")]
+            if let Some(after) = after {
+                crate::overlay::view::finish(&mut p.overlay, after);
             }
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);

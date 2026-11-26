@@ -2412,6 +2412,18 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Diagnostics (`view <address>` in the control file): the host copy of
+/// the title texture at `at`, if a texture alive is there and its copy is
+/// made. Under the table's lock, which a texture leaves before it is freed.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn texture_alive(at: usize) -> Option<std::sync::Arc<HostTexture>> {
+    let all = textures();
+    if !all.contains(&at) {
+        return None;
+    }
+    made_copy(at as This)
+}
+
 /// A title texture's host copy if it is made; not made here.
 #[cfg(windows)]
 pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {

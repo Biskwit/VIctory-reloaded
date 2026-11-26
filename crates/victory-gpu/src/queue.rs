@@ -956,11 +956,19 @@ extern "system" fn present(
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
+        crate::control::presented(frame);
         crate::capture::frame_drew(frame, crate::draw::drawn());
-        if crate::capture::listed(frame) {
+        let dumped = crate::capture::dumped(frame) || crate::control::dumps(frame);
+        // (Targets are noted as lists are translated: those in the line too.)
+        if crate::capture::listed(frame) || crate::control::wants_targets(frame) {
             before_sync();
-            crate::capture::dump_targets(frame);
         }
+        let targets = crate::capture::take_targets();
+        if dumped {
+            crate::capture::dump_targets(frame, &targets);
+        }
+        // For a view of one of them, at the host's present (`crate::overlay`).
+        crate::control::frame_targets(frame, targets);
     }
     #[cfg(windows)]
     if behind::on() && !this.is_null() {

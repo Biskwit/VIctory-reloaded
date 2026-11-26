@@ -830,12 +830,32 @@ pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
 /// `VICTORY_STALE_TEXTURES=overlap`: wherever their spans overlap, the rule
 /// until run 188.
 fn stale_rule() -> Rule {
-    static RULE: std::sync::OnceLock<Rule> = std::sync::OnceLock::new();
-    *RULE.get_or_init(|| match std::env::var("VICTORY_STALE_TEXTURES").as_deref() {
-        Ok("0") => Rule::Never,
-        Ok("overlap") => Rule::Overlap,
+    static RULE: crate::live::Switch = crate::live::Switch::new("VICTORY_STALE_TEXTURES", |v| match v {
+        Some("0") => 2,
+        Some("overlap") => 1,
+        _ => 0,
+    });
+    match RULE.value() {
+        2 => Rule::Never,
+        1 => Rule::Overlap,
         _ => Rule::Start,
-    })
+    }
+}
+
+/// Diagnostics (`repair textures` in the control file): every slot that
+/// shows a placed texture is due again from the next frame, as if the
+/// runtime had remapped all their memory ([`remapped`]): the pass over the
+/// heap's texture slots uploads each again from title memory, within its
+/// budget per frame. False if no slot shows one.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn repair_textures() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (start, end) = (SPANNED[0].load(Relaxed), SPANNED[1].load(Relaxed));
+    if start >= end {
+        return false;
+    }
+    REMAPPED.lock().unwrap_or_else(|e| e.into_inner()).push((start, end));
+    true
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`, or is
@@ -3149,6 +3169,13 @@ impl HostHeap {
         }
     }
 
+    /// Diagnostics (`crate::descriptor::repair_heaps`): forgets the records
+    /// [`HostHeap::copied_begin`] last saw, so that every one is looked at.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn forget_copied(&self) {
+        self.copied.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
     /// The records last seen of the title's heap, `step` bytes each, held for
     /// threads that compare what they read of its changed pages beside one
     /// another ([`Copied::changes`]; `super::sync_heaps`: the title copies
@@ -3181,8 +3208,9 @@ impl HostHeap {
     /// 1.4 more in the buffer pass they were all handed to, 120 to 600 ms
     /// of every frame, and the draws make what they read of them anyway.
     pub(crate) fn copied_waits(&self) -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "all"))
+        static ON: crate::live::Switch =
+            crate::live::Switch::new("VICTORY_HEAP_SYNC", |v| u32::from(v.is_none_or(|v| v != "all")));
+        ON.value() != 0
     }
 
     /// Whether a draw read title slot `index` through a table within the

@@ -13,7 +13,9 @@
 //! card's memory, a grey label on the left and its value in white against
 //! the right edge. Diagnostics builds add a block in smaller type: the
 //! submitting thread's waits for the card, dispatches, the shader and
-//! pipeline caches, shared memory and dynamic descriptor slots.
+//! pipeline caches, shared memory, dynamic descriptor slots, the live
+//! switches set (`crate::live`) and the view's line ([`view`]); there
+//! `overlay on|off` of `crate::control` shows and hides it too.
 //!
 //! Text is Consolas, which ships with Windows, drawn by GDI with grey
 //! anti-aliasing into an atlas when the overlay first draws (and again when
@@ -36,7 +38,12 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{PCSTR, s};
 
-use crate::host::{Host, HostList};
+use crate::host::Host;
+#[cfg(not(feature = "diagnostics"))]
+use crate::host::HostList;
+
+#[cfg(feature = "diagnostics")]
+pub(crate) mod view;
 
 const SOURCE: &str = include_str!("overlay.hlsl");
 
@@ -131,6 +138,12 @@ pub(crate) fn on() -> bool {
         }
         state => state == 2,
     }
+}
+
+/// Shows or hides the overlay (`overlay on|off`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn set_on(on: bool) {
+    ON.store(if on { 2 } else { 1 }, Relaxed);
 }
 
 /// The glyphs of characters 32 (space) to 126 (`~`), drawn for this
@@ -503,9 +516,9 @@ impl Counts {
     }
 }
 
-/// The table's rows: `line`'s figures and `counts`; with `details`, the
-/// diagnostics block.
-fn rows(line: &FrameLine, counts: &Counts, details: bool) -> Vec<Row> {
+/// The table's rows: `line`'s figures and `counts`; with `details` (the
+/// live switches set), the diagnostics block.
+fn rows(line: &FrameLine, counts: &Counts, details: Option<&[(&'static str, String)]>) -> Vec<Row> {
     const GB: f64 = (1u64 << 30) as f64;
     let gb = |bytes: u64| bytes as f64 / GB;
     let ms = |ms: f64| format!("{ms:.1} ms");
@@ -536,7 +549,7 @@ fn rows(line: &FrameLine, counts: &Counts, details: bool) -> Vec<Row> {
             None,
         ),
     ];
-    if details {
+    if let Some(live) = details {
         let (cached, translated) = counts.shaders;
         let [loaded, made] = counts.pipelines;
         let [slots, refused] = line.dynamic;
@@ -562,6 +575,10 @@ fn rows(line: &FrameLine, counts: &Counts, details: bool) -> Vec<Row> {
                 format!("{slots:.0}")
             },
         ));
+        rows.extend(
+            live.iter()
+                .map(|(name, value)| Row::Detail(name, value.clone())),
+        );
     }
     rows
 }
@@ -724,7 +741,15 @@ fn draws(
     note: Option<&str>,
 ) -> Vec<Constants> {
     let mut table = match line {
-        Some(line) => rows(line, &Counts::now(host), cfg!(feature = "diagnostics")),
+        Some(line) => {
+            #[cfg(feature = "diagnostics")]
+            let live = crate::live::active();
+            #[cfg(feature = "diagnostics")]
+            let details = Some(&live[..]);
+            #[cfg(not(feature = "diagnostics"))]
+            let details = None;
+            rows(line, &Counts::now(host), details)
+        }
         None => Vec::new(),
     };
     if let Some(note) = note {
@@ -883,6 +908,10 @@ pub(crate) struct Overlay {
     retired: Vec<ID3D12Resource>,
     /// The panel's draws as last made.
     drawn: Option<Drawn>,
+    /// The view's objects, made at the first view (`None` inside: none
+    /// could be made).
+    #[cfg(feature = "diagnostics")]
+    view: Option<Option<view::View>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the presenter's lock guards the
@@ -908,6 +937,8 @@ impl Overlay {
                     font: None,
                     retired: Vec::new(),
                     drawn: None,
+                    #[cfg(feature = "diagnostics")]
+                    view: None,
                 })
             }
             Err(e) => {
@@ -1031,7 +1062,10 @@ fn bytecode(code: &[u8]) -> D3D12_SHADER_BYTECODE {
 
 /// At a present: records into `list`, after the frame's copy into the
 /// window buffer `back` (in the copy destination state, where it is left),
-/// the overlay of `line` if it is on. `made` holds its objects.
+/// the overlay of `line` if it is on. `made` holds its objects. (In
+/// diagnostics builds [`view::record`] does this, with the control file's
+/// asks.)
+#[cfg(not(feature = "diagnostics"))]
 pub(crate) fn record(
     made: &mut Option<Option<Overlay>>,
     host: &Host,
@@ -1042,9 +1076,6 @@ pub(crate) fn record(
     if !on() {
         return;
     }
-    // Not the title's: the frame recorder leaves it out.
-    #[cfg(feature = "diagnostics")]
-    let _ours = crate::replay::record::unrecorded();
     let Some(o) = made.get_or_insert_with(|| Overlay::new(host)) else {
         return;
     };
@@ -1216,10 +1247,118 @@ mod tests {
         );
     }
 
-    /// The shaders compile.
+    /// The panel is drawn on the card over what the window buffer holds, at
+    /// the top left, and nothing else is: in a small window and at 1080p,
+    /// where each face has a size of its own.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn the_panel_is_drawn_on_the_card() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping the overlay's draw: no D3D12 device");
+            return;
+        };
+        // A pixel in the panel's padding, left of its text.
+        drawn_on_the_card(host, [256, 128], [7, 7]);
+        drawn_on_the_card(host, [1920, 1080], [10, 10]);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn drawn_on_the_card(host: &Host, [width, height]: [u32; 2], [x, y]: [usize; 2]) {
+        let mut back: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; the out pointer is ours.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: u64::from(width),
+                        Height: height,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut back,
+                )
+                .unwrap();
+        }
+        let back = back.unwrap();
+        let list = host.new_list().unwrap();
+        let cmds = &list.list;
+        let (target, copy, read) = (
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+        // SAFETY: an open list and a live texture.
+        unsafe {
+            cmds.ClearRenderTargetView(host.rtv(Some(&back), None), &[1.0; 4], None);
+            cmds.ResourceBarrier(&[crate::host::transition(&back, target, copy)]);
+        }
+        let line = FrameLine {
+            fps: 30.0,
+            ms: 33.3,
+            ..Default::default()
+        };
+        let at = crate::control::AtPresent {
+            overlay: true,
+            view: None,
+            shot: None,
+        };
+        let mut made = None;
+        assert!(view::record(&mut made, host, &list, &back, &line, at).is_none());
+        assert!(matches!(made, Some(Some(_))), "the overlay was made");
+        // SAFETY: as above.
+        unsafe { cmds.ResourceBarrier(&[crate::host::transition(&back, copy, read)]) };
+        let (buffer, footprint) = crate::capture::read_back(&host.device, cmds, &back).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: a readback buffer of ours.
+        unsafe { buffer.Map(0, None, Some(&mut data)).unwrap() };
+        // SAFETY: the list ran; the mapping spans the footprint's rows.
+        let pixel = |x: usize, y: usize| unsafe {
+            let at = data
+                .cast::<u8>()
+                .add(y * footprint.Footprint.RowPitch as usize + x * 4);
+            std::slice::from_raw_parts(at, 4).to_vec()
+        };
+        let (panel, away) = (pixel(x, y), pixel(width as usize - 6, height as usize - 8));
+        // SAFETY: as above.
+        unsafe { buffer.Unmap(0, None) };
+        assert!(
+            panel[..3].iter().all(|&c| c < 80),
+            "{width}x{height}: the panel is dark: {panel:?}"
+        );
+        assert_eq!(
+            away, [255; 4],
+            "{width}x{height}: away from it the buffer is as it was"
+        );
+    }
+
+    /// The shaders compile, the view's too.
     #[test]
     fn the_shaders_compile() {
-        for (entry, target) in [(s!("corners"), s!("vs_5_1")), (s!("panel"), s!("ps_5_1"))] {
+        for (entry, target) in [
+            (s!("corners"), s!("vs_5_1")),
+            (s!("panel"), s!("ps_5_1")),
+            (s!("view_corners"), s!("vs_5_1")),
+            (s!("view"), s!("ps_5_1")),
+            (s!("reset"), s!("cs_5_1")),
+            (s!("reduce"), s!("cs_5_1")),
+        ] {
             if let Err(e) = compile(entry, target) {
                 panic!("{e}");
             }
@@ -1280,11 +1419,12 @@ mod tests {
     /// The table names the console and the essential figures in a player's
     /// words, with their units; the times have bars of their share of the
     /// frame. Diagnostics builds add the waits for the card, the caches,
-    /// shared memory and dynamic slots (with refused tables when there are).
+    /// shared memory, dynamic slots (with refused tables when there are) and
+    /// the live switches set.
     #[test]
     fn rows_name_the_figures_with_their_units() {
         let (mut line, mut counts) = sample();
-        let table = rows(&line, &counts, false);
+        let table = rows(&line, &counts, None);
         assert_eq!(table[0], Row::Title("Series X"));
         assert_eq!(table[1], Row::Big("5.7 fps".into(), "176 ms".into(), RED));
         assert_eq!(
@@ -1304,7 +1444,8 @@ mod tests {
         };
         assert!((share - 102.6 / 176.0).abs() < 1e-9);
 
-        let more = rows(&line, &counts, true);
+        let live = [("VICTORY_SCISSOR_TEST", "full".to_owned())];
+        let more = rows(&line, &counts, Some(&live));
         assert_eq!(more[..table.len()], table[..]);
         assert_eq!(more[table.len()], Row::Rule);
         assert_eq!(
@@ -1317,15 +1458,17 @@ mod tests {
                 ("Compiling", "0"),
                 ("Shared memory", "5.50 GB"),
                 ("Dynamic slots", "61234"),
+                ("VICTORY_SCISSOR_TEST", "full"),
             ]
         );
         line.dynamic[1] = 12.0;
         assert!(
-            items(&rows(&line, &counts, true)).contains(&("Dynamic slots", "61234, 12 refused"))
+            items(&rows(&line, &counts, Some(&[])))
+                .contains(&("Dynamic slots", "61234, 12 refused"))
         );
 
         counts.memory = None;
-        assert!(items(&rows(&line, &counts, false)).contains(&("VRAM", "unknown")));
+        assert!(items(&rows(&line, &counts, None)).contains(&("VRAM", "unknown")));
     }
 
     /// Each text shape's bounds in pixels.
@@ -1356,18 +1499,14 @@ mod tests {
     #[test]
     fn labels_and_values_line_up_in_every_face() {
         let (line, counts) = sample();
-        let mut table = rows(&line, &counts, true);
-        table.push(Row::Detail(
-            "VICTORY_SKIP_PIPELINES",
-            "0000000000000000".to_owned(),
-        ));
-        let shapes = layout(&table, &FACES, 1000);
+        let live = [("VICTORY_SKIP_PIPELINES", "0000000000000000".to_owned())];
+        let shapes = layout(&rows(&line, &counts, Some(&live)), &FACES, 1000);
         let Shape::Fill(panel, BACKGROUND) = shapes[0] else {
             panic!("{:?}", shapes[0]);
         };
         let [cw, ch] = FACES[MAIN].cell;
         let (left, right) = (panel[0] + cw, panel[2] - cw);
-        // The last detail is the widest row, in the small face.
+        // The live switch is the widest row, in the small face.
         assert_eq!(right - left, 7 * (22 + 2 + 16));
         let placed = texts(&shapes);
         for label in ["VIctory-reloaded", "5.7 fps", "CPU prep", "VRAM", "Shaders"] {
@@ -1385,7 +1524,7 @@ mod tests {
             assert_eq!(at[2], right, "{value}");
         }
         // Without it, the bars' rows: "Copy-back", a bar, "102.6 ms".
-        let shapes = layout(&rows(&line, &counts, false), &FACES, 1000);
+        let shapes = layout(&rows(&line, &counts, None), &FACES, 1000);
         let Shape::Fill(panel, _) = shapes[0] else {
             unreachable!()
         };
@@ -1473,7 +1612,7 @@ mod tests {
     #[test]
     fn the_table_is_compact() {
         let (line, counts) = sample();
-        let shapes = layout(&rows(&line, &counts, false), &FACES, 1900);
+        let shapes = layout(&rows(&line, &counts, None), &FACES, 1900);
         let Shape::Fill(panel, _) = shapes[0] else {
             unreachable!()
         };

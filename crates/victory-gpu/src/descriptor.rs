@@ -164,8 +164,9 @@ fn mirror(handle: u64) {
 /// Whether [`sync_heaps`] is done (`VICTORY_HEAP_SYNC=0`: not).
 #[cfg(windows)]
 fn sync_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0"))
+    static ON: crate::live::Switch =
+        crate::live::Switch::new("VICTORY_HEAP_SYNC", |v| u32::from(v.is_none_or(|v| v != "0")));
+    ON.value() != 0
 }
 
 /// Whether a submission's [`sync_heaps`] is done by a thread of its own
@@ -295,10 +296,26 @@ impl Drop for SyncedHeaps {
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    use std::sync::atomic::Ordering::Relaxed;
-    if !sync_on() {
-        return;
+    if sync_on() {
+        sync(false);
     }
+}
+
+/// Diagnostics (`repair heaps` in the control file): [`sync_heaps`] over
+/// every page of every placed shader-visible heap, as if all of it were
+/// written, with the records last seen forgotten: every slot whose record
+/// is not what the host slot was made from is made again. Returns the
+/// records looked at and those mirrored.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn repair_heaps() -> [u64; 2] {
+    sync(true)
+}
+
+/// [`sync_heaps`]; with `all`, over the heaps' whole ranges
+/// ([`repair_heaps`]). Returns the records looked at and those mirrored.
+#[cfg(windows)]
+fn sync(all: bool) -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
@@ -340,7 +357,13 @@ pub(crate) fn sync_heaps() {
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
         let began = std::time::Instant::now();
-        let taken = written.take(start as usize, end as usize);
+        let taken = if all {
+            #[cfg(feature = "diagnostics")]
+            host.forget_copied();
+            vec![(start as usize, end as usize)]
+        } else {
+            written.take(start as usize, end as usize)
+        };
         spent[0] += since(began);
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
@@ -473,6 +496,7 @@ pub(crate) fn sync_heaps() {
     for (count, n) in SYNCED_KINDS.iter().zip(kinds) {
         count.fetch_add(n, Relaxed);
     }
+    [looked, mirrored]
 }
 
 /// Of those mirrored, since the last frame line: no view, a view of an object,

@@ -501,14 +501,23 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+    // Live (`crate::live`): with no hash named, a draw pays the switch's
+    // atomic loads alone; with some, the hashes parsed under the settings'
+    // generation.
+    static ANY: crate::live::Switch = crate::live::Switch::new("VICTORY_SKIP_PIPELINES", |v| {
+        u32::from(!parse_skip_hashes(v.unwrap_or_default()).is_empty())
     });
-    if hashes.is_empty() {
+    static HASHES: Mutex<(u64, Vec<String>)> = Mutex::new((0, Vec::new()));
+    if ANY.value() == 0 {
         return None;
     }
+    let mut hashes = HASHES.lock().unwrap_or_else(|e| e.into_inner());
+    let generation = crate::live::generation();
+    if hashes.0 != generation {
+        let value = crate::live::get("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+        *hashes = (generation, parse_skip_hashes(&value));
+    }
+    let hashes = &hashes.1;
     p.shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))

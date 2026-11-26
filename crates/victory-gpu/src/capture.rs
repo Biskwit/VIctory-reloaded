@@ -157,20 +157,23 @@ pub(crate) fn wanted(n: u64) -> bool {
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows, 2);
 }
 
-/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
-fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    let Some(folder) = folder() else { return };
-    let (w, h) = ((width / 2).max(1), (height / 2).max(1));
-    // Filter byte 0 per row, then RGB of every other pixel of every other row.
+/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, every `step`-th pixel of
+/// every `step`-th row (2: at half size), in `VICTORY_CAPTURE` (else where
+/// the control file says, `crate::control::folder`).
+fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8], step: u32) {
+    let folder = crate::control::folder();
+    let (w, h) = ((width / step).max(1), (height / step).max(1));
+    let step = step as usize;
+    // Filter byte 0 per row, then RGB of the pixels taken.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
     for y in 0..h as usize {
         raw.push(0);
-        let row = &rows[(2 * y).min(height as usize - 1) * pitch..];
+        let row = &rows[(step * y).min(height as usize - 1) * pitch..];
         for x in 0..w as usize {
-            let p = &row[(2 * x).min(width as usize - 1) * 4..][..3];
+            let p = &row[(step * x).min(width as usize - 1) * 4..][..3];
             if bgra {
                 raw.extend([p[2], p[1], p[0]]);
             } else {
@@ -317,6 +320,28 @@ fn read_back_of(
     }
 }
 
+/// Saves a texture read back by [`read_back`] as `<name>.png` at full size
+/// (`shot` in the control file): 8-bit colour as it is, other formats as
+/// dumps show them.
+pub(crate) fn save_shot(name: &str, buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT) {
+    let f = footprint.Footprint;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copy finished (its list was waited for); the mapping
+    // spans the footprint's rows.
+    unsafe {
+        if buffer.Map(0, None, Some(&mut data)).is_err() {
+            return;
+        }
+        let pitch = f.RowPitch as usize;
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        match to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+            Some(rgba) => save_as(name, f.Width, f.Height, f.Width as usize * 4, false, &rgba, 1),
+            None => tracing::warn!(format = f.Format.0, "shot not saved: format"),
+        }
+        buffer.Unmap(0, None);
+    }
+}
+
 /// Saves a frame read back by [`read_back`] (8-bit color only).
 pub(crate) fn save_read_back(
     frame: u64,
@@ -361,9 +386,15 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
-/// Notes a title texture the frame being built renders to or writes.
+/// Notes a title texture the frame being built renders to or writes: for
+/// the frames listed, and those the control file asks for (a view, `dump`,
+/// `targets`).
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() {
+        return;
+    }
+    let frame = crate::queue::presented() + 1;
+    if !crate::control::wants_targets(frame) && !(dump_on() && listed(frame)) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
@@ -374,10 +405,22 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
-/// At the present of frame `frame`: saves the noted targets.
-pub(crate) fn dump_targets(frame: u64) {
+/// Whether frame `n`'s targets are dumped (`VICTORY_DUMP_TARGETS`).
+pub(crate) fn dumped(n: u64) -> bool {
+    dump_on() && listed(n)
+}
+
+/// A frame's targets in first-use order: title resource, host copy.
+pub(crate) type Targets = Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>;
+
+/// At a present: the targets noted for the frame presented.
+pub(crate) fn take_targets() -> Targets {
+    std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// At the present of frame `frame`: saves its noted targets ([`take_targets`]).
+pub(crate) fn dump_targets(frame: u64, targets: &[(usize, std::sync::Arc<crate::resource::HostTexture>)]) {
     use std::sync::atomic::Ordering::Relaxed;
-    let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
@@ -467,7 +510,7 @@ fn dump_one(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
             );
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba, 2);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }

@@ -23,6 +23,8 @@ mod capture;
 mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod control;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
@@ -46,6 +48,8 @@ mod inplace;
 #[cfg(windows)]
 mod land;
 pub mod list;
+#[cfg(windows)]
+mod live;
 pub mod object;
 #[cfg(windows)]
 mod overlay;
