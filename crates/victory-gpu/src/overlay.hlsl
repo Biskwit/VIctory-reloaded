@@ -16,8 +16,9 @@ cbuffer Draw : register(b0) {
     float4 rect;
     // The target's size in pixels.
     float2 target;
-    // Text: pixels per font pixel, and the line's characters. View: the
-    // channel shown (0-3; 4: red, green and blue), and how (SHOW_*).
+    // Text: pixels per font pixel (low byte) and the text's colour (the
+    // byte above, COLOURS), and the line's characters. View: the channel
+    // shown (0-3; 4: red, green and blue), and how (SHOW_*).
     uint2 head;
     // Text: the characters, four a word, the first in the low byte. View:
     // words[0] = the texture's width and height, 1 if it holds integers,
@@ -51,10 +52,18 @@ float4 corners(uint i : SV_VertexID) : SV_Position {
     return float4(at / target * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 
+// Text colours: white, green, amber, red, grey.
+static const float4 COLOURS[5] = {
+    float4(1, 1, 1, 1), float4(0.35, 1, 0.45, 1), float4(1, 0.78, 0.25, 1),
+    float4(1, 0.35, 0.3, 1), float4(0.7, 0.7, 0.7, 1),
+};
+
 [RootSignature(RS)]
 float4 text(float4 p : SV_Position) : SV_Target {
-    float4 background = float4(0, 0, 0, 0.65);
-    uint2 at = uint2(p.xy - rect.xy) / max(head.x, 1u);
+    float4 background = float4(0, 0, 0, 0.72);
+    uint scale = max(head.x & 0xffu, 1u);
+    float4 ink = COLOURS[min(head.x >> 8, 4u)];
+    uint2 at = uint2(p.xy - rect.xy) / scale;
     uint column = at.x / CELL_WIDTH;
     uint x = at.x % CELL_WIDTH;
     uint y = at.y % CELL_HEIGHT;
@@ -64,7 +73,7 @@ float4 text(float4 p : SV_Position) : SV_Target {
     uint c = (words[column / 16][(column / 4) % 4] >> ((column % 4) * 8)) & 0xff;
     uint row = y - 1;
     uint bits = (font.Load((c - 32) * 8 + (row & ~3u)) >> ((row & 3) * 8)) & 0x1f;
-    return ((bits >> (4 - x)) & 1) != 0 ? float4(1, 1, 1, 1) : background;
+    return ((bits >> (4 - x)) & 1) != 0 ? ink : background;
 }
 
 float4 fetch(int2 at) {

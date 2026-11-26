@@ -1,7 +1,9 @@
 //! Diagnostics: what the host draws over the presented frame, after the
 //! title's frame is copied into the window's buffer and before it is
 //! presented (`crate::host::Host::present`), as `crate::control` asks:
-//! - the overlay (`overlay on`, or `VICTORY_OVERLAY=1`): lines of counters
+//! - the overlay (on unless `VICTORY_OVERLAY=0`; `overlay on|off`): a big
+//!   headline of frames a second and time a frame, green from the 15 a
+//!   second aimed at, amber from 10, red below; then lines of counters
 //!   in a bitmap font of our own: the frame line's times (`crate::host`),
 //!   draws, dispatches and drops, the shader cache and pipelines, the
 //!   card's memory, the live switches that have a value (`crate::live`);
@@ -689,7 +691,7 @@ impl Overlay {
     }
 
     /// Records `lines` at the window buffer's top left (`rtv`, `size`,
-    /// `format`; in the render target state), on a dark band.
+    /// `format`; in the render target state), each on a dark band.
     fn text(
         &mut self,
         host: &Host,
@@ -697,16 +699,21 @@ impl Overlay {
         rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
         format: DXGI_FORMAT,
         size: [u32; 2],
-        lines: &[String],
+        lines: &[Line],
     ) {
         let Some([text, _]) = self.pipelines(host, format) else {
             return;
         };
-        let scale = (size[1] / 540).max(1);
-        let [cell_w, cell_h] = CELL.map(|c| (c * scale) as f32);
-        let margin = (4 * scale) as f32;
-        let longest = lines.iter().map(String::len).max().unwrap_or(0).min(LINE);
-        let width = longest as f32 * cell_w + scale as f32;
+        let base = (size[1] / 540).max(1);
+        let margin = (4 * base) as f32;
+        // The detail lines share one width; a big line is as wide as it is.
+        let longest = lines
+            .iter()
+            .filter(|l| !l.big)
+            .map(|l| l.text.len())
+            .max()
+            .unwrap_or(0)
+            .min(LINE);
         let mut constants = Constants {
             target: [size[0] as f32, size[1] as f32],
             ..Default::default()
@@ -716,11 +723,16 @@ impl Overlay {
         unsafe {
             target(list, rtv, size);
             list.SetPipelineState(&text);
-            for (i, line) in lines.iter().enumerate() {
-                let top = margin + i as f32 * cell_h;
-                let (words, count) = pack(line);
+            let mut top = margin;
+            for line in lines {
+                let scale = if line.big { 2 * base } else { base };
+                let [cell_w, cell_h] = CELL.map(|c| (c * scale) as f32);
+                let chars = if line.big { line.text.len().min(LINE) } else { longest };
+                let width = chars as f32 * cell_w + scale as f32;
+                let (words, count) = pack(&line.text);
                 constants.rect = [margin, top, margin + width, top + cell_h];
-                constants.head = [scale, count];
+                top += cell_h;
+                constants.head = [scale | (line.colour << 8), count];
                 constants.words = words;
                 list.SetGraphicsRoot32BitConstants(
                     DRAW,
@@ -824,9 +836,65 @@ fn readback(host: &Host, bytes: u64) -> Option<ID3D12Resource> {
     buffer
 }
 
+/// One line of the overlay: its text, drawn twice as big or not, in one of
+/// the shader's colours (`COLOURS` in overlay.hlsl).
+struct Line {
+    text: String,
+    big: bool,
+    colour: u32,
+}
+
+const WHITE: u32 = 0;
+const GREEN: u32 = 1;
+const AMBER: u32 = 2;
+const RED: u32 = 3;
+const GREY: u32 = 4;
+
+/// The headline's colour for `fps` against the 15 to 20 frames a second
+/// aimed at: green from 15, amber from 10, red below.
+fn fps_colour(fps: f64) -> u32 {
+    if fps >= 15.0 {
+        GREEN
+    } else if fps >= 10.0 {
+        AMBER
+    } else {
+        RED
+    }
+}
+
 /// The overlay's lines at the present of `frame`, at most `max` characters
-/// long: the counters if it is on, then the view's line.
+/// long: a big headline (frames a second and time a frame) and the counters
+/// if it is on, then the view's line.
 fn lines(
+    frame: u64,
+    line: &FrameLine,
+    host: &Host,
+    overlay: bool,
+    view: Option<&str>,
+    max: usize,
+) -> Vec<Line> {
+    let plain = |text: String| Line {
+        text,
+        big: false,
+        colour: WHITE,
+    };
+    let mut out = Vec::new();
+    if overlay {
+        out.push(Line {
+            text: format!("{:.1} fps  {:.0} ms", line.fps, line.ms),
+            big: true,
+            colour: fps_colour(line.fps),
+        });
+    }
+    out.extend(details(frame, line, host, overlay, view, max).into_iter().map(plain));
+    if let Some(last) = out.last_mut().filter(|_| view.is_some()) {
+        last.colour = GREY;
+    }
+    out
+}
+
+/// The overlay's detail lines (see [`lines`]).
+fn details(
     frame: u64,
     line: &FrameLine,
     host: &Host,
@@ -986,6 +1054,17 @@ pub(crate) fn finish(made: &mut Option<Option<Overlay>>, after: After) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The headline is green from 15 frames a second, amber from 10, red
+    /// below.
+    #[test]
+    fn the_headline_colour_follows_the_target() {
+        assert_eq!(fps_colour(5.8), RED);
+        assert_eq!(fps_colour(10.0), AMBER);
+        assert_eq!(fps_colour(14.9), AMBER);
+        assert_eq!(fps_colour(15.0), GREEN);
+        assert_eq!(fps_colour(60.0), GREEN);
+    }
 
     /// The glyphs fit five columns, the space is empty and every other
     /// character shows something.

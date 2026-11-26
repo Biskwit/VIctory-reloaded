@@ -20,8 +20,8 @@
 //!   (`crate::texture::alias`); `repair heaps`: every slot of the title's
 //!   descriptor heaps is compared with its host slot and made again if they
 //!   differ. Each runs once, now.
-//! - `overlay on|off`: counters drawn over the frame (`crate::overlay`);
-//!   `VICTORY_OVERLAY=1` starts with it on.
+//! - `overlay on|off`: counters drawn over the frame (`crate::overlay`); on
+//!   from the start unless `VICTORY_OVERLAY=0`.
 //! - `view <n> [r|g|b|a|rgb]`, `view <0xaddress> [...]`, `view off`: presents
 //!   one texture of the frame instead of the frame: the `n`-th the frame
 //!   rendered to or wrote, in first-use order as `dump` numbers them, or
@@ -239,7 +239,7 @@ static TARGETS: Mutex<(u64, crate::capture::Targets)> = Mutex::new((0, Vec::new(
 pub(crate) fn overlay_on() -> bool {
     match OVERLAY.load(Relaxed) {
         0 => {
-            let on = std::env::var_os("VICTORY_OVERLAY").is_some_and(|v| v == "1");
+            let on = std::env::var_os("VICTORY_OVERLAY").is_none_or(|v| v != "0");
             let _ = OVERLAY.compare_exchange(0, if on { 2 } else { 1 }, Relaxed, Relaxed);
             OVERLAY.load(Relaxed) == 2
         }
