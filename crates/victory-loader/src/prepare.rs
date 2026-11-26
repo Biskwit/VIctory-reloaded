@@ -338,16 +338,20 @@ mod tests {
         assert!(parse_dir64_blocks(&bytes).is_err());
     }
 
-    #[test]
-    fn relocation_directory_must_be_file_backed() {
-        let mut bytes = vec![0u8; 0x210];
+    fn relocation_directory_fixture(
+        file_size: u32,
+        virtual_size: u32,
+        directory_offset: u32,
+    ) -> (Vec<u8>, ImageInfo, usize) {
+        let mut bytes = vec![0u8; 0x200 + file_size as usize];
         bytes[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
         let opt = 0x58;
         write_u32(&mut bytes, opt + layout::OPT_NUMBER_OF_RVA_AND_SIZES, 16).unwrap();
         let d = layout::data_directory_offset(&bytes, dir::BASERELOC).unwrap();
-        write_u32(&mut bytes, d, 0x1000).unwrap();
+        write_u32(&mut bytes, d, 0x1000 + directory_offset).unwrap();
         write_u32(&mut bytes, d + 4, 12).unwrap();
-        bytes[0x200..0x20c].copy_from_slice(&relocation_block(0x1000, 12, &[0xa008, 0]));
+        let start = 0x200 + directory_offset as usize;
+        bytes[start..start + 12].copy_from_slice(&relocation_block(0x1000, 12, &[0xa008, 0]));
         let info = ImageInfo {
             machine: 0x8664,
             characteristics: 0,
@@ -362,9 +366,9 @@ mod tests {
             sections: vec![victory_pe::SectionInfo {
                 name: ".reloc".into(),
                 rva: 0x1000,
-                virtual_size: 16,
+                virtual_size,
                 file_offset: 0x200,
-                file_size: 16,
+                file_size,
                 characteristics: 0,
             }],
             imports: Vec::new(),
@@ -376,6 +380,26 @@ mod tests {
             has_load_config: false,
             codeview: None,
         };
+        (bytes, info, d)
+    }
+
+    #[test]
+    fn relocation_directory_may_end_at_the_file_backed_section_boundary() {
+        // The final ABSOLUTE entry pads the block to 12 bytes. Exercise both
+        // a section with raw file padding and one whose data ends at EOF.
+        for (virtual_size, entry_offset) in [(0x1fc, 0x3f8), (0x200, 0x3fc)] {
+            let (bytes, info, _) =
+                relocation_directory_fixture(0x200, virtual_size, virtual_size - 12);
+            assert_eq!(
+                dir64_relocations(&bytes, &info).unwrap(),
+                vec![(entry_offset, 0x1008)]
+            );
+        }
+    }
+
+    #[test]
+    fn relocation_directory_must_be_file_backed() {
+        let (mut bytes, info, d) = relocation_directory_fixture(16, 16, 0);
         assert_eq!(dir64_relocations(&bytes, &info).unwrap(), vec![(0x208, 0x1008)]);
         assert!(dir64_relocations(&bytes[..0x20b], &info).is_err());
         write_u32(&mut bytes, d + 4, 20).unwrap();
