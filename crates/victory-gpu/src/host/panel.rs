@@ -2,7 +2,7 @@
 //! default; F3 shows and hides it while our window has the focus): a sleek
 //! dark HUD in the upper left corner with large coloured FPS, live frame-time
 //! graph, GPU/VRAM/RAM stats and per-core CPU bars, so that a screenshot
-//! carries them. Made again twice a second from the counters of the frame-rate
+//! carries them. Refreshed up to four times a second from the frame-rate
 //! line, memory and textures; a frame itself only copies the box out of a
 //! buffer in the card's memory onto the swap chain's buffer.
 
@@ -18,6 +18,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindow
 
 use super::{Host, HostList, transition};
 
+mod gpu_load;
+
 /// How often the overlay redraws its buffer.
 const EVERY: Duration = Duration::from_millis(250);
 
@@ -31,8 +33,7 @@ const BASE_H: u32 = 334;
 /// How many recent frames the live frame-time graph keeps.
 const HISTORY: usize = 172;
 
-/// The texts are put into one of these in turn: the card reads the others,
-/// at most a second old.
+/// Mapped buffers rotated as the queue finishes reading them.
 const UPLOADS: usize = 4;
 
 // Palette (sRGB 0..255).
@@ -405,9 +406,9 @@ impl CpuMeter {
             self.cores_pct.clear();
             let mut sum = 0.0f32;
             for (&(pi, pt), &(ni, nt)) in self.prev.iter().zip(&now) {
-                let dt = (nt - pt).max(1) as f32;
-                let di = (ni - pi).clamp(0, nt - pt) as f32;
-                let busy = ((1.0 - di / dt) * 100.0).clamp(0.0, 100.0);
+                let dt = (nt - pt).max(1);
+                let di = (ni - pi).clamp(0, dt);
+                let busy = ((1.0 - di as f32 / dt as f32) * 100.0).clamp(0.0, 100.0);
                 self.cores_pct.push(busy);
                 sum += busy;
             }
@@ -464,6 +465,7 @@ struct Snapshot {
     frame_ms: f64,
     gpu_ms: f64,
     gpu_pct: u32,
+    gpu_measured: bool,
     submit_ms: f64,
     low1_fps: f64,
     max_ms: f64,
@@ -529,7 +531,7 @@ fn paint_hud(s: &Snapshot) -> Canvas {
     c.text(BASE_W - 14 - badge.len() as u32 * 12, 24, 2, MUTED, &badge);
 
     // 2. Resolution | draws | GPU ms.
-    let row2 = format!("{}X{} | {} DRAWS | GPU {:.1}MS", s.width, s.height, s.draws, s.gpu_ms);
+    let row2 = format!("{}X{} | {} DRAWS | GPU EST {:.1}MS", s.width, s.height, s.draws, s.gpu_ms);
     c.text_sep(14, 48, 2, WHITE, &trunc(&row2, 43));
 
     // 3. Frame | submit | 1% low | max.
@@ -582,7 +584,9 @@ fn paint_hud(s: &Snapshot) -> Canvas {
 
     // GPU
     c.text(14, 176, 2, LABEL, "GPU");
-    let gpu_line = format!("{} {}%", trunc(&s.gpu_name, max_chars.saturating_sub(5)), s.gpu_pct);
+    let source = if s.gpu_measured { "APP" } else { "EST" };
+    let load = format!("{source} {}%", s.gpu_pct);
+    let gpu_line = format!("{} {load}", trunc(&s.gpu_name, max_chars.saturating_sub(load.len() + 1)));
     c.text(val_x, 176, 2, WHITE, &trunc(&gpu_line, max_chars));
 
     // VRAM
@@ -652,8 +656,10 @@ struct Buffers {
     card: ID3D12Resource,
     /// The upload written last.
     turn: usize,
-    /// It is not in the card's buffer yet.
-    fresh: bool,
+    /// Queue fence values covering the last reads from the mapped uploads.
+    upload_fences: [u64; UPLOADS],
+    /// Covers the last use of the card buffer, even if its contents were unchanged.
+    card_fence: u64,
     /// `card` has already been copied into once and now sits in `COPY_SOURCE`.
     uploaded: bool,
 }
@@ -688,16 +694,26 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, uploaded: false })
+        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, upload_fences: [0; UPLOADS], card_fence: 0, uploaded: false })
     }
 
-    fn write(&mut self, snap: &Snapshot) {
+    fn write(&mut self, snap: &Snapshot, completed: u64) -> Option<usize> {
+        let slot = free_upload(&self.upload_fences, self.turn, completed)?;
         let picture = paint_hud(snap).pack(self.scale, self.format, self.pitch as usize);
-        self.turn = (self.turn + 1) % UPLOADS;
-        // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
-        unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
-        self.fresh = true;
+        self.turn = slot;
+        // SAFETY: the mapping holds the picture and its previous GPU read has finished.
+        unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[slot].1, picture.len()) };
+        Some(slot)
     }
+}
+
+fn free_upload(fences: &[u64; UPLOADS], turn: usize, completed: u64) -> Option<usize> {
+    (1..=UPLOADS).map(|offset| (turn + offset) % UPLOADS).find(|&slot| fences[slot] <= completed)
+}
+
+/// The present list reads the card buffer, and on a refresh one upload too.
+pub(super) struct PanelCopy {
+    upload: Option<usize>,
 }
 
 /// The panel of a presenter.
@@ -778,7 +794,8 @@ impl Panel {
         let fps = 1e3 / ms.max(0.001);
         let idle = (c[1] / 1e3).min(ms);
         let gpu_ms = (ms - idle).max(0.0);
-        let gpu_pct = ((gpu_ms / ms.max(0.001)) * 100.0).clamp(0.0, 100.0).round() as u32;
+        let measured = gpu_load::latest(&host.device);
+        let gpu_pct = measured.unwrap_or_else(|| ((gpu_ms / ms.max(0.001)) * 100.0).clamp(0.0, 100.0).round() as u32);
         let submit_ms = c[0] / 1e3;
 
         // 1% low FPS from recent history.
@@ -810,6 +827,7 @@ impl Panel {
             frame_ms: ms,
             gpu_ms,
             gpu_pct,
+            gpu_measured: measured.is_some(),
             submit_ms,
             low1_fps,
             max_ms: self.worst,
@@ -849,35 +867,45 @@ impl Panel {
         back: &ID3D12Resource,
         (width, height): (u32, u32),
         format: DXGI_FORMAT,
-    ) {
+    ) -> Option<PanelCopy> {
         self.last_size = (width, height);
         if !shown().load(Ordering::Relaxed) || self.failed {
-            return;
+            return None;
         }
-        let Some(snap) = self.snap.as_ref() else {
-            return;
-        };
+        let snap = self.snap.as_ref()?;
         let began = Instant::now();
         // Not the title's: the frame recorder leaves it out.
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
-        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
-            // (What the card may still read stays: a picture's size changes once or twice in a run.)
-            std::mem::forget(self.buffers.take());
+        let replace = self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale));
+        // SAFETY: a nonblocking query on the same queue fence used by Host::submit.
+        let completed = if replace || self.changed { unsafe { host.fence.GetCompletedValue() } } else { 0 };
+        if completed == u64::MAX {
+            // Device removal signals every fence. Stop using this device's resources.
+            self.buffers = None;
+            self.failed = true;
+            return None;
+        }
+        if replace {
+            // Resize normally settled the queue already. Keep the old buffer
+            // if the wait failed; the next present can try the replacement.
+            if self.buffers.as_ref().is_some_and(|b| b.card_fence > completed) {
+                return None;
+            }
+            drop(self.buffers.take());
             self.buffers = Buffers::new(host, format, scale);
             self.failed = self.buffers.is_none();
             self.changed = true;
         }
-        let Some(buffers) = &mut self.buffers else { return };
-        if std::mem::take(&mut self.changed) {
-            buffers.write(snap);
-        }
+        let buffers = self.buffers.as_mut()?;
+        let upload = if self.changed { buffers.write(snap, completed) } else { None };
+        if upload.is_some() { self.changed = false; }
         let (w, h) = size(scale);
         let list = &list.list;
         // SAFETY: an open list and live resources; the box lies within both.
         unsafe {
-            if std::mem::take(&mut buffers.fresh) {
+            if let Some(slot) = upload {
                 if buffers.uploaded {
                     list.ResourceBarrier(&[transition(
                         &buffers.card,
@@ -885,7 +913,7 @@ impl Panel {
                         D3D12_RESOURCE_STATE_COPY_DEST,
                     )]);
                 }
-                list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
+                list.CopyResource(&buffers.card, &buffers.uploads[slot].0);
                 list.ResourceBarrier(&[transition(
                     &buffers.card,
                     D3D12_RESOURCE_STATE_COPY_DEST,
@@ -925,12 +953,31 @@ impl Panel {
             list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
         }
         self.cost += began.elapsed();
+        Some(PanelCopy { upload })
+    }
+
+    pub(super) fn submitted(&mut self, copied: Option<PanelCopy>, fence: u64) {
+        if let (Some(copied), Some(buffers)) = (copied, self.buffers.as_mut()) {
+            buffers.card_fence = fence;
+            if let Some(slot) = copied.upload {
+                buffers.upload_fences[slot] = fence;
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uploads_are_reused_only_after_their_fence_completes() {
+        let fences = [40, 41, 38, 39];
+        assert_eq!(free_upload(&fences, 1, 37), None);
+        assert_eq!(free_upload(&fences, 1, 38), Some(2));
+        assert_eq!(free_upload(&fences, 3, 40), Some(0));
+        assert_eq!(free_upload(&[0; UPLOADS], 0, 0), Some(1));
+    }
 
     /// Every character the HUD uses has its own picture, and no two look alike.
     #[test]
@@ -952,6 +999,7 @@ mod tests {
             frame_ms: 31.2,
             gpu_ms: 28.7,
             gpu_pct: 92,
+            gpu_measured: true,
             submit_ms: 19.8,
             low1_fps: 14.0,
             max_ms: 95.0,
