@@ -20,8 +20,9 @@
 //!   (`crate::texture::alias`); `repair heaps`: every slot of the title's
 //!   descriptor heaps is compared with its host slot and made again if they
 //!   differ. Each runs once, now.
-//! - `overlay on|off`: counters drawn over the frame (`crate::overlay`); on
-//!   from the start unless `VICTORY_OVERLAY=0`.
+//! - `overlay on|off`: the table of counters drawn over the frame
+//!   (`crate::overlay`, in every build); on from the start unless
+//!   `VICTORY_OVERLAY=0`.
 //! - `view <n> [r|g|b|a|rgb]`, `view <0xaddress> [...]`, `view off`: presents
 //!   one texture of the frame instead of the frame: the `n`-th the frame
 //!   rendered to or wrote, in first-use order as `dump` numbers them, or
@@ -34,7 +35,7 @@
 //! Files go to `VICTORY_CAPTURE`, else to the control file's folder.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use crate::resource::HostTexture;
@@ -221,8 +222,6 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes)).into_owned()
 }
 
-/// The overlay: 0 not looked at yet, 1 off, 2 on.
-static OVERLAY: AtomicU8 = AtomicU8::new(0);
 /// Whether a view is on ([`VIEW`]), for the cheap checks.
 static VIEWING: AtomicBool = AtomicBool::new(false);
 static VIEW: Mutex<Option<Wanted>> = Mutex::new(None);
@@ -235,17 +234,6 @@ static SHOT: Mutex<Option<String>> = Mutex::new(None);
 /// The targets of the frame presented last ([`frame_targets`]): its number
 /// and the targets, in first-use order.
 static TARGETS: Mutex<(u64, crate::capture::Targets)> = Mutex::new((0, Vec::new()));
-
-pub(crate) fn overlay_on() -> bool {
-    match OVERLAY.load(Relaxed) {
-        0 => {
-            let on = std::env::var_os("VICTORY_OVERLAY").is_none_or(|v| v != "0");
-            let _ = OVERLAY.compare_exchange(0, if on { 2 } else { 1 }, Relaxed, Relaxed);
-            OVERLAY.load(Relaxed) == 2
-        }
-        state => state == 2,
-    }
-}
 
 /// At the present of `frame`: runs the control file's commands if it changed.
 pub(crate) fn presented(frame: u64) {
@@ -311,11 +299,7 @@ fn run(command: Command, frame: u64) {
                 "repair: descriptor heap records compared with their host slots (those made from another record made again)"
             );
         }
-        Command::Overlay(on) => {
-            if overlay_on() != on {
-                OVERLAY.store(if on { 2 } else { 1 }, Relaxed);
-            }
-        }
+        Command::Overlay(on) => crate::overlay::set_on(on),
         Command::View(wanted) => {
             *VIEW.lock().unwrap_or_else(|e| e.into_inner()) = wanted;
             VIEWING.store(wanted.is_some(), Relaxed);
@@ -384,7 +368,7 @@ pub(crate) struct Viewed {
 /// At the present of `frame` (after [`frame_targets`]): what to do beyond
 /// showing it; `None` when nothing (two atomic loads and a lock).
 pub(crate) fn at_present(frame: u64) -> Option<AtPresent> {
-    let overlay = overlay_on();
+    let overlay = crate::overlay::on();
     let viewing = VIEWING.load(Relaxed);
     let shot = SHOT.lock().unwrap_or_else(|e| e.into_inner()).take();
     if !overlay && !viewing && shot.is_none() {

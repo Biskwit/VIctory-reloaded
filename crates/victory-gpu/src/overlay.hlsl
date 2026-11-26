@@ -1,14 +1,15 @@
-// What diagnostics builds draw over the presented frame (`crate::overlay`):
-// lines of text in a bitmap font, and the view of one texture of the frame
-// in place of the frame. Compiled with the Windows SDK's compiler by the
-// crate's build script (build.rs), entry point by entry point; nothing
-// compiled is kept in the repository.
+// What the host draws over the presented frame (`crate::overlay`): a panel
+// of filled rectangles and text in a bitmap font, and in diagnostics builds
+// the view of one texture of the frame in place of the frame. Compiled with
+// the Windows SDK's compiler by the crate's build script (build.rs), entry
+// point by entry point; nothing compiled is kept in the repository.
 //
-// One root signature for every entry point: the draw's 40 constants, the
-// font as a root view, the viewed texture's range of values as a root
-// unordered view, and a table of the viewed texture read as floats and as
-// integers (whichever does not fit its format is a null view).
-#define RS "RootConstants(num32BitConstants = 40, b0), SRV(t0), UAV(u0), " \
+// The panel's root signature: the draw's 44 constants and the font as a
+// root view. The view's: the same constants, the viewed texture's range of
+// values as a root unordered view, and a table of the viewed texture read as
+// floats and as integers (whichever does not fit its format is a null view).
+#define PANEL_RS "RootConstants(num32BitConstants = 44, b0), SRV(t0)"
+#define VIEW_RS "RootConstants(num32BitConstants = 44, b0), UAV(u0), " \
     "DescriptorTable(SRV(t1, numDescriptors = 2, flags = DESCRIPTORS_VOLATILE))"
 
 cbuffer Draw : register(b0) {
@@ -16,11 +17,15 @@ cbuffer Draw : register(b0) {
     float4 rect;
     // The target's size in pixels.
     float2 target;
-    // Text: pixels per font pixel (low byte) and the text's colour (the
-    // byte above, COLOURS), and the line's characters. View: the channel
-    // shown (0-3; 4: red, green and blue), and how (SHOW_*).
-    uint2 head;
-    // Text: the characters, four a word, the first in the low byte. View:
+    // Panel: the colour of the text's first columns and of the rest, or a
+    // filled rectangle's (the first); 8 bits a channel, red lowest, alpha
+    // highest.
+    uint2 colours;
+    // Panel: pixels per font pixel (0: the rectangle is filled), the text's
+    // characters, and the first column in the second colour. View: the
+    // channel shown (0-3; 4: red, green and blue), and how (SHOW_*).
+    uint4 head;
+    // Panel: the characters, four a word, the first in the low byte. View:
     // words[0] = the texture's width and height, 1 if it holds integers,
     // and the step between the texels the range pass reads.
     uint4 words[8];
@@ -41,39 +46,49 @@ static const uint SHOW_RANGE = 1;
 static const uint SHOW_HIGHEST = 2;
 static const uint SHOW_CURVE = 4;
 
-// A character's cell in font pixels: the glyph's 5x8 with a column and two
-// rows between cells.
+// A character's width in font pixels: the glyph's 5 and a column between.
 static const uint CELL_WIDTH = 6;
-static const uint CELL_HEIGHT = 10;
 
-[RootSignature(RS)]
-float4 corners(uint i : SV_VertexID) : SV_Position {
+float4 place(uint i) {
     float2 at = lerp(rect.xy, rect.zw, float2(i & 1, i >> 1));
     return float4(at / target * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 
-// Text colours: white, green, amber, red, grey.
-static const float4 COLOURS[5] = {
-    float4(1, 1, 1, 1), float4(0.35, 1, 0.45, 1), float4(1, 0.78, 0.25, 1),
-    float4(1, 0.35, 0.3, 1), float4(0.7, 0.7, 0.7, 1),
-};
+[RootSignature(PANEL_RS)]
+float4 corners(uint i : SV_VertexID) : SV_Position {
+    return place(i);
+}
 
-[RootSignature(RS)]
-float4 text(float4 p : SV_Position) : SV_Target {
-    float4 background = float4(0, 0, 0, 0.72);
-    uint scale = max(head.x & 0xffu, 1u);
-    float4 ink = COLOURS[min(head.x >> 8, 4u)];
+float4 colour(uint c) {
+    return float4(c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff, c >> 24) / 255.0;
+}
+
+// A filled rectangle, or a line of text whose rectangle starts at its
+// glyphs' top left; what is not a glyph's pixel is left as it is.
+[RootSignature(PANEL_RS)]
+float4 panel(float4 p : SV_Position) : SV_Target {
+    uint scale = head.x;
+    if (scale == 0) {
+        return colour(colours.x);
+    }
     uint2 at = uint2(p.xy - rect.xy) / scale;
     uint column = at.x / CELL_WIDTH;
     uint x = at.x % CELL_WIDTH;
-    uint y = at.y % CELL_HEIGHT;
-    if (column >= head.y || x >= 5 || y < 1 || y > 8) {
-        return background;
+    if (column >= head.y || x >= 5 || at.y >= 8) {
+        discard;
     }
     uint c = (words[column / 16][(column / 4) % 4] >> ((column % 4) * 8)) & 0xff;
-    uint row = y - 1;
+    uint row = at.y;
     uint bits = (font.Load((c - 32) * 8 + (row & ~3u)) >> ((row & 3) * 8)) & 0x1f;
-    return ((bits >> (4 - x)) & 1) != 0 ? ink : background;
+    if (((bits >> (4 - x)) & 1) == 0) {
+        discard;
+    }
+    return colour(column < head.z ? colours.x : colours.y);
+}
+
+[RootSignature(VIEW_RS)]
+float4 view_corners(uint i : SV_VertexID) : SV_Position {
+    return place(i);
 }
 
 float4 fetch(int2 at) {
@@ -93,7 +108,7 @@ float unkey(uint k) {
     return asfloat((k & 0x80000000u) != 0 ? k & 0x7fffffffu : ~k);
 }
 
-[RootSignature(RS)]
+[RootSignature(VIEW_RS)]
 [numthreads(1, 1, 1)]
 void reset() {
     range.Store2(0, uint2(0xffffffffu, 0));
@@ -101,7 +116,7 @@ void reset() {
 
 // The lowest and highest finite value of the channels shown, over a grid
 // of the texture's texels.
-[RootSignature(RS)]
+[RootSignature(VIEW_RS)]
 [numthreads(8, 8, 1)]
 void reduce(uint3 id : SV_DispatchThreadID) {
     uint2 size = words[0].xy;
@@ -128,7 +143,7 @@ void reduce(uint3 id : SV_DispatchThreadID) {
     }
 }
 
-[RootSignature(RS)]
+[RootSignature(VIEW_RS)]
 float4 view(float4 p : SV_Position) : SV_Target {
     uint2 size = words[0].xy;
     float2 uv = (p.xy - rect.xy) / (rect.zw - rect.xy);

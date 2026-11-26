@@ -41,7 +41,7 @@ pub mod list;
 #[cfg(windows)]
 mod live;
 pub mod object;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 mod overlay;
 pub mod pipeline;
 #[cfg(all(windows, feature = "diagnostics"))]

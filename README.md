@@ -52,8 +52,10 @@ Speed:
 - Mesh draws go through an amplification stage instead of a clamp pass of ours.
 - Translated shaders are keyed by the translator's sources, so a rebuild of the rest keeps the shader cache.
 
+On screen:
+- **Overlay on the game, in every build.** On by default (`VICTORY_OVERLAY=0` hides it): a table at the top left with frames per second and time per frame (green from 15 fps, amber from 10, red below), where the frame's time goes (CPU prep, GPU, copy-back), draws, dispatches, dropped draws, the shader and pipeline caches, and VRAM.
+
 Debugging (diagnostics builds, see below):
-- **Overlay on the game.** It is on by default and shows frames per second (green from 15, amber from 10, red below), CPU, GPU and copy-back times, draws, dropped draws, pipelines being made, caches and VRAM.
 - **Control file to steer a running game:** live switches, screenshots, render-target dumps, viewing any render target on screen, repairs, PIX captures.
 - **PIX captures from inside the run:** `VICTORY_PIX_CAPTURE` or the control file.
 - **Capture one compute dispatch and replay it offline** (`victory replay-dispatch`). It can rerun the dispatch with other compiles, with the exact binary a launch stored, with other samplers, or with re-translated code, and report which inputs a difference comes from. This is how the lighting bug was found.
@@ -157,7 +159,8 @@ cargo build --release -p victory
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
-The window caption shows the framerate. Saves, settings and `crashes.log`
+The window caption and the overlay show the framerate (`VICTORY_OVERLAY=0`
+hides the overlay). Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
@@ -221,7 +224,6 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_PIX_CAPTURE=<frame>:<file.wpix>` | PIX captures that frame (a run with the capturer never saves the pipeline library) |
 | `VICTORY_DISPATCH_CAPTURE=<hash>[+<hash>...]:<frame\|w<n>>:<dir>` | saves what one compute dispatch needs to run again offline (`w<n>`: n frames into the world, with `VICTORY_CAPTURE_WORLD=1`); see `replay-dispatch` |
 | `VICTORY_DROP_NAMES=1` | names the pipelines whose draws were dropped while they were made |
-| `VICTORY_OVERLAY=0` | starts with the overlay off (see below; it is on by default) |
 | `VICTORY_CONTROL=<file>` | the control file (default `D:\victory-control.txt`) |
 
 ### Steering a running game
@@ -232,7 +234,7 @@ is deleted:
 
 | Command | Effect |
 |---------|--------|
-| `overlay on` / `overlay off` | frames per second in large type (green from 15, amber from 10, red below), then frame times, draws, dispatches, drops, shader cache, pipelines, VRAM and live switches, drawn over the frame; on by default |
+| `overlay on` / `overlay off` | shows or hides the overlay (on by default); in these builds it also lists the live switches set |
 | `view <n> [r\|g\|b\|a\|rgb]` / `view <0xaddress> [...]` / `view off` | presents the frame's `n`-th target (first-use order, as `dump` numbers them) or a texture by address instead of the frame; floats and depth normalized as dumps are |
 | `targets` | logs the next frame's targets: number, address, size, format |
 | `shot [name]` | saves what the window shows (without the overlay) as `<name>.png` in `VICTORY_CAPTURE`, else beside the control file |

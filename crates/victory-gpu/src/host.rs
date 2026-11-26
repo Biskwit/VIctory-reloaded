@@ -6565,7 +6565,6 @@ struct Presenter {
     meter: Meter,
     /// What the overlay and views draw with (`crate::overlay`), once one
     /// was asked for (`None` inside: none could be made).
-    #[cfg(feature = "diagnostics")]
     overlay: Option<Option<crate::overlay::Overlay>>,
 }
 
@@ -6582,9 +6581,7 @@ struct Meter {
     caption: Option<Vec<u16>>,
     /// Dispatches run so far at the last count, and the last second's
     /// figures, for the overlay.
-    #[cfg(feature = "diagnostics")]
     dispatched: u64,
-    #[cfg(feature = "diagnostics")]
     line: crate::overlay::FrameLine,
 }
 
@@ -6599,9 +6596,7 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
-            #[cfg(feature = "diagnostics")]
             dispatched: crate::draw::dispatched(),
-            #[cfg(feature = "diagnostics")]
             line: Default::default(),
         }
     }
@@ -6640,7 +6635,6 @@ impl Meter {
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
-        #[cfg(feature = "diagnostics")]
         {
             let dispatched = crate::draw::dispatched();
             self.line = crate::overlay::FrameLine {
@@ -6947,7 +6941,9 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(feature = "diagnostics")]
-            let after = live.and_then(|live| crate::overlay::record(&mut p.overlay, self, copy, &back, frame, &p.meter.line, live));
+            let after = live.and_then(|live| crate::overlay::view::record(&mut p.overlay, self, copy, &back, &p.meter.line, live));
+            #[cfg(not(feature = "diagnostics"))]
+            crate::overlay::record(&mut p.overlay, self, copy, &back, &p.meter.line);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&[
@@ -6973,7 +6969,7 @@ impl Host {
             // A view or shot ran its list at once (`read_now`).
             #[cfg(feature = "diagnostics")]
             if let Some(after) = after {
-                crate::overlay::finish(&mut p.overlay, after);
+                crate::overlay::view::finish(&mut p.overlay, after);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
@@ -7025,7 +7021,6 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
-                #[cfg(feature = "diagnostics")]
                 overlay: None,
             })
         }
