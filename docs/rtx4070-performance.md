@@ -1,7 +1,8 @@
 # RTX 4070 performance work
 
-The `4070` launcher profile targets the RTX 4070 / Ryzen 7 7800X3D / 32 GB
-machine. Auto selection recognizes RTX 4070 adapters. It keeps the console
+Select `-Machine 4070` for the RTX 4070 / Ryzen 7 7800X3D / 32 GB
+machine. Automatic selection uses the existing vendor profiles. The 4070
+profile keeps the console
 selection (Series X by default), output mode, texture mip policy, and the
 four-shader wave64 allowlist unchanged.
 
@@ -11,7 +12,8 @@ Changes:
   pipeline compilation workers instead of the 16-core 4090 machine's counts.
 - A 64 KiB minimum for GPU-resident title buffers, a 1536 MiB buffer budget,
   and a separate 1024 MiB budget for memory windows read by shaders.
-- Texture admission reserves explicit buffer budgets in full and includes
+- With `VICTORY_CARD_RESERVE_BUDGETS=1`, texture admission reserves explicit
+  buffer budgets in full and includes
   unused window budgets. Windows may use that reserved room under the same
   97% limit as buffers. Previously, a larger buffer setting reserved at most
   1 GiB, and windows were refused at 80% occupancy without any reservation.
@@ -19,8 +21,9 @@ Changes:
 This trades some texture admission headroom for fewer shader accesses over
 PCIe and fewer CPU snapshots. It does not remove rendering passes, change
 wave64 semantics, lower loop limits, or enable changed-word-only uploads.
-`-Machine 4090` restores the original launcher profile; `-Safe` leaves out
-the new memory settings. `-More` can override individual settings.
+The 4070 profile enables the reservation outside `-Safe`. With the switch unset
+or set to `0`, the texture reservation is capped at 1 GiB for buffers and
+the window occupancy threshold stays at 80%. `-More` can override individual settings.
 
 ## Shader research
 

@@ -30,9 +30,9 @@ $settings = @{
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
 }
 if ($Machine -eq 'auto') {
-    $cards = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue)
-    $Machine = if ($cards.Name -match 'RTX 4070') { '4070' }
-        elseif ($cards.PNPDeviceID -match 'VEN_10DE') { '4090' } else { '7900xtx' }
+    # Use the existing vendor defaults. The 4070 / 7800X3D profile is explicit.
+    $cards = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { $_.PNPDeviceID })
+    $Machine = if ($cards -match 'VEN_10DE') { '4090' } else { '7900xtx' }
 }
 if ($Machine -eq '7900xtx') {
     # i9-12900K, RX 7900 XTX, 64 GB: the page-mapping lock was fastest with one
@@ -66,6 +66,7 @@ if ($Machine -eq '4070') {
     $settings.VICTORY_THIN_THREADS = '8'; $settings.VICTORY_UNDER_THREADS = '6'; $settings.VICTORY_LAND_THREADS = '4'
     $settings.VICTORY_MAP_THREADS = '1'; $settings.VICTORY_PIPELINE_WORKERS = '3'
     if (-not $Safe) {
+        $settings.VICTORY_CARD_RESERVE_BUDGETS = '1'
         $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $settings.VICTORY_CARD_BUFFERS_MB = '1536'
         $settings.VICTORY_CARD_WINDOWS_MB = '1024'
     }
