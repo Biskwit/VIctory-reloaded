@@ -18,18 +18,14 @@ developer or publisher.
 
 ## At a glance
 
-- **It plays.** A 70-minute session on the Series S profile went from the prison
-  through a playable flashback, a boat, a camp, a fist fight and two shoot-outs,
-  with menus, the map, checkpoints, deaths and retries, and never crashed or hung.
+- **It plays.** On the Series S profile the game goes from the prison through a
+  playable flashback, a boat, a camp, a fist fight and two shoot-outs, with menus,
+  the map, checkpoints, deaths and retries.
 - **It is not fast enough yet.** Vice-Tay is measured on the Series S profile. On
   the current build the world runs at **21.5 fps** (median; 18.4-24.0 for most
   frames), short of the 30 fps goal.
-- **It no longer slows down over time.** The 70-minute session above grew from
-  33 GB to 52 GB of memory and fell from about 20 fps to under 10. Since the
-  placed-view leak was fixed ([#27](https://github.com/TaynanGT/Vice-Tay/pull/27))
-  and small textures went back to 4 KiB placement
-  ([#45](https://github.com/TaynanGT/Vice-Tay/pull/45)), 30-minute Series S runs
-  hold 27-29 GB and 22-23 fps from start to end.
+- **Memory holds steady.** The game holds 26.4 GB (median, 27.9 GB at most) through
+  the measured session, with no slowdown over time.
 
 ## Test PC
 
@@ -67,22 +63,13 @@ Every number is from the game's own once-a-second frame lines in the world
 part of a frame, are in [docs/measurements.md](docs/measurements.md).
 <!-- measurements:end -->
 
-The [play log](docs/play-log.md) records the 70-minute session in detail.
-
 ### Benchmark charts
 
-The first two charts show the current Series S measurement above; the third
-follows the 70-minute Series S playtest, on an earlier build, minute by minute.
-All on an RTX 4090. [Open the interactive benchmark dashboard](https://taynangt.github.io/Vice-Tay/).
+The charts show the current Series S measurement above, on an RTX 4090.
 
 ![Median FPS, 1% lows and percentile ranges by run, with a 30 fps target](docs/charts/profile-frame-rate.svg)
 
 ![Median frame times, preparation times and copy counters by run](docs/charts/profile-frame-timing.svg)
-
-The chart below tracks the long Series S session minute by minute.
-[Explore the recorded minutes](https://taynangt.github.io/Vice-Tay/#session).
-
-![Series S FPS by minute, with the peak, lowest and final readings](docs/charts/session-frame-rate.svg)
 
 <!-- Refresh the charts with node scripts/generate-benchmark-charts.mjs after editing the source tables. -->
 
