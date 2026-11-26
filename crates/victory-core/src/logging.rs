@@ -23,6 +23,15 @@ pub fn init(default_level: &str) {
         .ok()
         .and_then(|v| EnvFilter::try_new(v).ok())
         .unwrap_or_else(|| EnvFilter::new(default_level));
+    let file_layer = std::env::var_os("VICTORY_LOG_FILE")
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::fs::File::create(p).ok())
+        .map(|f| {
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(f))
+        });
     let _ = tracing_subscriber::registry()
         .with(CAP)
         .with(filter)
@@ -31,5 +40,6 @@ pub fn init(default_level: &str) {
                 .with_target(true)
                 .with_writer(std::io::stderr),
         )
+        .with(file_layer)
         .try_init();
 }
