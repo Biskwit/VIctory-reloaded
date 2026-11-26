@@ -452,8 +452,14 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
+/// The debug layer's last errors, oldest first. Whichever thread moves the
+/// messages into the log keeps them here: the command that removed the
+/// device may have been logged by another thread before the failure is.
+static LAST_ERRORS: Mutex<std::collections::VecDeque<String>> =
+    Mutex::new(std::collections::VecDeque::new());
+
 /// Ends the run on a host GPU failure: what failed, the removal reason and
-/// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
+/// the debug layer's last errors, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
@@ -463,12 +469,13 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
             text.push_str(&format!("; device removed: {e}"));
             log_removal_context();
         }
-        match host.log_messages() {
-            Some(first) => text.push_str(&format!("; debug layer: {first}")),
-            None if host.messages.is_none() => text.push_str(
-                "; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command",
-            ),
-            None => {}
+        host.log_messages();
+        let last = LAST_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+        if !last.is_empty() {
+            let last: Vec<&str> = last.iter().map(String::as_str).collect();
+            text.push_str(&format!("; the debug layer's last errors: {}", last.join(" | ")));
+        } else if host.messages.is_none() {
+            text.push_str("; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command");
         }
     }
     tracing::error!("{text}");
@@ -5076,13 +5083,12 @@ impl Host {
         text
     }
 
-    /// Moves the debug layer's messages into our log; returns the first
-    /// error among them.
-    pub(crate) fn log_messages(&self) -> Option<String> {
+    /// Moves the debug layer's messages into our log, keeping the last
+    /// errors among them for a failure's report ([`LAST_ERRORS`]).
+    pub(crate) fn log_messages(&self) {
         let Some(queue) = &self.messages else {
-            return None;
+            return;
         };
-        let mut first_error = None;
         // SAFETY: each message is read into a buffer of the size the queue
         // reports, then the queue is emptied.
         unsafe {
@@ -5099,14 +5105,17 @@ impl Host {
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
-                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
-                        first_error = Some(text.to_owned());
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                        let mut last = LAST_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+                        if last.len() == 4 {
+                            last.pop_front();
+                        }
+                        last.push_back(text.to_owned());
                     }
                 }
             }
             queue.ClearStoredMessages();
         }
-        first_error
     }
 
     /// A host render target view of `resource`, valid until it is recorded.
