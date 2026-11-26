@@ -256,9 +256,27 @@ mod tests {
     /// window buffer gives half red, half blue.
     #[test]
     fn a_plane_is_blended_over_the_first() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
-        };
+        let near = |a: u8, b: u8| a.abs_diff(b) <= 2;
+        if let Some(texel) = drawn(false) {
+            assert!(near(texel[0], 128) && texel[1] == 0 && near(texel[2], 128) && texel[3] == 255, "{texel:?}");
+        }
+    }
+
+    /// Cleared first (the FSR 4 stand-in), the target holds the plane's
+    /// colour alone: nothing of what it held stays under it.
+    #[test]
+    fn a_cleared_target_holds_the_plane_alone() {
+        let near = |a: u8, b: u8| a.abs_diff(b) <= 2;
+        if let Some(texel) = drawn(true) {
+            assert!(near(texel[0], 128) && texel[1] == 0 && texel[2] == 0 && texel[3] == 255, "{texel:?}");
+        }
+    }
+
+    /// The first texel of a blue 4x4 target with a half-transparent red
+    /// plane drawn over it (cleared to black first with `clear`); `None`
+    /// without a host GPU.
+    fn drawn(clear: bool) -> Option<[u8; 4]> {
+        let host = crate::host::host()?;
         let target = |state| {
             let desc = D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -332,7 +350,7 @@ mod tests {
                 to: [0.0, 0.0, 1.0, 1.0],
                 from: [0.0, 0.0, 1.0, 1.0],
             };
-            composer.draw(host, l, &back, D3D12_RESOURCE_STATE_COPY_DEST, (4, 4), false, &[over]);
+            composer.draw(host, l, &back, D3D12_RESOURCE_STATE_COPY_DEST, (4, 4), clear, &[over]);
             l.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
             l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
         }
@@ -348,7 +366,6 @@ mod tests {
         unsafe { readback.Unmap(0, None) };
         drop(std::mem::ManuallyDrop::into_inner(to.pResource));
         drop(std::mem::ManuallyDrop::into_inner(from.pResource));
-        let near = |a: u8, b: u8| a.abs_diff(b) <= 2;
-        assert!(near(texel[0], 128) && texel[1] == 0 && near(texel[2], 128) && texel[3] == 255, "{texel:?}");
+        Some(texel)
     }
 }

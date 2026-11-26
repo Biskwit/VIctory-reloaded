@@ -1483,7 +1483,11 @@ pub unsafe fn upscale_stand_in(this: *const u8, color: *const u8, render: [u32; 
             from: [0.0, 0.0, render[0] as f32 / f.Width as f32, render[1] as f32 / f.Height as f32],
         };
         let size = (t.Width as u32, t.Height);
-        composer.draw(host, &list.list, to, D3D12_RESOURCE_STATE_RENDER_TARGET, size, false, &[over]);
+        // Cleared first: the stretch replaces the output. Blended over it,
+        // the output kept each frame's under the next by the colour's
+        // alpha, and grew from frame to frame (haze, smears, then bands;
+        // to black and white with a float16 stand-in: ss-7, ss-8).
+        composer.draw(host, &list.list, to, D3D12_RESOURCE_STATE_RENDER_TARGET, size, true, &[over]);
         // Our pipeline, root signature, heaps, target, viewport and
         // scissor: the title's are set again.
         state.replay(list);
