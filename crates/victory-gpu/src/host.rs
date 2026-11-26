@@ -4061,14 +4061,56 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
-        }
+        let apart = || {
+            pieces_apart(
+                pieces
+                    .iter()
+                    .map(|(shadow, lo, hi, _)| {
+                        let start = shadow.span().0 as usize;
+                        (start + lo, start + hi)
+                    })
+                    .collect(),
+            )
+        };
+        let written = if wide_merge() && pieces.len() >= 8 && apart() {
+            // As `card_back` merges: the pieces are apart from one another
+            // in title memory, several at a time. This loop, on the relay's
+            // thread alone, was most of its landings: 49 ms a frame of
+            // 57 in the cell scene (run sp-cp2a), while the submitting
+            // thread waited on it for 27-29 ms a frame.
+            let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let each = pieces.len().div_ceil(8);
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
+                .chunks(each)
+                .map(|chunk| {
+                    let (chunk, written) = (chunk.to_vec(), written.clone());
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let mut n = 0;
+                        for (shadow, lo, hi, at) in chunk {
+                            // SAFETY: the mapping of the fetched bytes; the
+                            // copy into it has run, and the caller waits for
+                            // this job.
+                            let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
+                            n += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                        }
+                        written.fetch_add(n, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            written.load(Ordering::Relaxed)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            }
+            written
+        };
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
