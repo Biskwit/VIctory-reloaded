@@ -11,10 +11,13 @@ const ui = {
   slider: byId('fps-target'),
   profile: byId('profile'),
   replay: byId('replay'),
+  projectionToggle: byId('projection-toggle'),
+  projectionControls: byId('projection-controls'),
+  reduction: byId('frame-reduction'),
 };
 const view = {
   chart: 'fps', mode: 'time', target: 30, benchmark: null,
-  profile: null, selected: '', limit: 60,
+  profile: null, selected: '', limit: 60, projectionOpen: false,
 };
 const readings = new Map();
 const formatters = [0, 1].map(digits => new Intl.NumberFormat('en', {
@@ -89,7 +92,9 @@ function mark(key, value, title, delay) {
 
 function makeFrameRate() {
   const { median, p10, p90, low } = view.profile.fps;
-  view.limit = Math.max(60, Math.ceil(p90 / 20) * 20);
+  const projectedMax = ui.projectionControls.hidden ? 0 :
+    1000 / (view.profile.timing.frame * (1 - Number(ui.reduction.max) / 100));
+  view.limit = Math.max(60, Math.ceil(Math.max(p90, projectedMax) / 20) * 20);
   const fps = element('section', 'fps-plot');
   fps.setAttribute('aria-label', 'In-world frame rate scale');
   const track = element('div', 'plot-track');
@@ -111,7 +116,18 @@ function makeFrameRate() {
     mark('median', median, 'Median ' + number(median) + ' fps', 370),
     mark('band', (p10 + p90) / 2, '10th to 90th percentile', 560),
   );
+  const projected = mark('projection', 0, 'Projected frame rate', 0);
+  projected.hidden = true;
+  track.append(projected);
   fps.append(track, axis(view.limit, 'fps'));
+
+  readings.set('projection', () => {
+    const { reduction, frameTime, fps } = projectionReading();
+    return {
+      title: 'Projected frame rate', value: number(fps) + ' fps',
+      description: reduction + '% less frame time gives ' + number(frameTime) + ' ms per frame.',
+    };
+  });
 
   readings.set('median', () => ({
     title: 'Median', value: number(median) + ' fps',
@@ -174,6 +190,12 @@ function makeBars(rows, unit, limit = view.limit) {
       budget.dataset.limit = limit;
       budget.setAttribute('aria-hidden', 'true');
       rail.append(budget);
+    }
+    if (key === 'frame' && !ui.projectionControls.hidden) {
+      const marker = element('span', 'projection-timing-marker');
+      marker.setAttribute('aria-hidden', 'true');
+      marker.hidden = true;
+      rail.append(marker);
     }
     row.append(element('span', 'bar-label', title), rail, element('strong', 'bar-value', label));
     plot.append(row);
@@ -294,6 +316,50 @@ function setDifference(labelId, valueId, label, difference, unit) {
   node.dataset.tone = difference > 0 ? 'warm' : 'cool';
 }
 
+function requiredReduction() {
+  const ratio = 1 - (1000 / view.target) / view.profile.timing.frame;
+  return Math.max(0, Math.ceil(ratio * 100 - 1e-9));
+}
+
+function projectionReading() {
+  const reduction = ui.reduction.valueAsNumber;
+  const frameTime = view.profile.timing.frame * (1 - reduction / 100);
+  return { reduction, frameTime, fps: 1000 / frameTime };
+}
+
+function updateProjection() {
+  if (ui.projectionControls.hidden) return;
+  const { reduction, frameTime, fps } = projectionReading();
+  const goal = requiredReduction();
+  const reached = fps + 1e-9 >= view.target;
+  byId('reduction-value').textContent = reduction + '%';
+  ui.reduction.setAttribute('aria-valuetext', reduction + '% less frame time');
+  showValue('projected-fps', fps, 'fps');
+  showValue('projected-time', frameTime, 'ms');
+  byId('projection-match').disabled = goal > Number(ui.reduction.max) || reduction === goal;
+  byId('projection-reset').disabled = reduction === 0;
+  const status = byId('projection-status');
+  status.dataset.met = String(reached);
+  status.textContent = reached
+    ? 'Projection reaches the ' + view.target + ' fps target.'
+    : goal > Number(ui.reduction.max)
+      ? 'The ' + view.target + ' fps target requires ' + goal + '% less frame time.'
+      : number(Math.max(.1, view.target - fps)) + ' fps to the target at this reduction.';
+
+  const fpsMarker = ui.plot.querySelector('.pin-projection');
+  if (fpsMarker) {
+    fpsMarker.hidden = reduction === 0;
+    fpsMarker.style.setProperty('--x', position(fps));
+    fpsMarker.setAttribute('aria-label', 'Projected frame rate ' + number(fps) + ' fps');
+  }
+  const timeMarker = ui.plot.querySelector('.projection-timing-marker');
+  if (timeMarker) {
+    timeMarker.hidden = reduction === 0;
+    timeMarker.style.setProperty('--x', position(frameTime));
+  }
+  if (view.selected === 'projection') inspect(reduction > 0 ? 'projection' : 'median');
+}
+
 function updateTarget(value) {
   value = Math.min(Number(ui.slider.max), Math.max(Number(ui.slider.min), value));
   view.target = value;
@@ -304,8 +370,11 @@ function updateTarget(value) {
   const fpsDelta = value - view.profile.fps.median;
   const frameDelta = view.profile.timing.frame - frameBudget;
   byId('budget-value').textContent = number(frameBudget) + ' ms';
-  setDifference('fps-difference-label', 'fps-difference', fpsDelta >= 0 ? 'FPS to target' : 'FPS above target', fpsDelta, 'fps');
-  setDifference('time-difference-label', 'time-difference', frameDelta >= 0 ? 'Over frame budget' : 'Under frame budget', frameDelta, 'ms');
+  const projectionNote = ui.projectionControls.hidden ? '' : ' (measured)';
+  setDifference('fps-difference-label', 'fps-difference',
+    (fpsDelta >= 0 ? 'FPS to target' : 'FPS above target') + projectionNote, fpsDelta, 'fps');
+  setDifference('time-difference-label', 'time-difference',
+    (frameDelta >= 0 ? 'Over budget' : 'Under budget') + projectionNote, frameDelta, 'ms');
   for (const preset of ui.presets) {
     preset.setAttribute('aria-pressed', String(Number(preset.dataset.target) === value));
   }
@@ -346,6 +415,7 @@ function updateTarget(value) {
     targetMetric.setAttribute('aria-label', 'FPS target ' + label);
   }
   if (view.selected === 'goal') inspect('goal');
+  updateProjection();
 }
 
 function animateChart() {
@@ -389,6 +459,11 @@ function renderChart() {
   byId('chart-title').textContent = title;
   byId('chart-caption').textContent = caption;
   ui.modes.hidden = view.chart !== 'timing';
+  const canProject = view.profile.timing.frame > 0 &&
+    (view.chart === 'fps' || (view.chart === 'timing' && view.mode === 'time'));
+  ui.projectionToggle.hidden = !canProject;
+  ui.projectionControls.hidden = !canProject || !view.projectionOpen;
+  ui.projectionToggle.setAttribute('aria-expanded', String(!ui.projectionControls.hidden));
   ui.plot.replaceChildren(makePlot());
   const reading = ui.plot.nextElementSibling;
   reading.hidden = !readings.size;
@@ -523,6 +598,21 @@ async function start() {
   });
   ui.slider.addEventListener('input', () => updateTarget(ui.slider.valueAsNumber));
   for (const preset of ui.presets) preset.addEventListener('click', () => updateTarget(Number(preset.dataset.target)));
+  ui.projectionToggle.addEventListener('click', () => {
+    view.projectionOpen = !view.projectionOpen;
+    renderChart();
+  });
+  ui.reduction.addEventListener('input', updateProjection);
+  byId('projection-match').addEventListener('click', () => {
+    ui.reduction.valueAsNumber = requiredReduction();
+    updateProjection();
+    ui.reduction.focus();
+  });
+  byId('projection-reset').addEventListener('click', () => {
+    ui.reduction.valueAsNumber = 0;
+    updateProjection();
+    ui.reduction.focus();
+  });
   ui.replay.addEventListener('click', animateChart);
   motion.addEventListener('change', () => {
     ui.replay.hidden = !readings.size || motion.matches;
