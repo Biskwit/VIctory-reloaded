@@ -86,6 +86,9 @@ Select a chart to explore the readings, adjust the FPS target and project a redu
   (tanks, tarps, plants, a skylight) glow in flat purple, pink or blue; some faces
   show scrambled colour patches and some eyes are lit white; clouds and reflections
   break into square blocks; a few shapes render as flat black.
+  For banding that varies between launches, pass `-More @{VICTORY_RTV_FORMAT_LOG='1'}`
+  to `scripts\play.ps1` on a diagnostic build. Compare the `RTV format check`
+  totals and `RTV format mismatch` examples at the same checkpoint in a clean and a banded run.
 - **Ray tracing.** The ray-traced structures are not built by default (`-RayTracing`
   turns the builder on), so a few hundred dispatches a frame are skipped and some
   light is missing.
