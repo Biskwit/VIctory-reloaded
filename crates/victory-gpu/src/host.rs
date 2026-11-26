@@ -5977,6 +5977,15 @@ impl HostList {
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::copystat::Timed::new(match step {
+                Step::Copy(..) => C::StepCopyNs,
+                Step::Fill(..) => C::StepFillNs,
+                Step::Refresh(..) => C::StepRefreshNs,
+                Step::Run(_) | Step::Host(_) => C::StepRunNs,
+                Step::GpuWrite(..) => C::StepGpuWriteNs,
+                Step::Texture(_) => C::StepTextureNs,
+            });
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]

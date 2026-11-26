@@ -392,6 +392,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::UpdateJournal, 1);
         return Some((
             j.ahead_asked,
             j.written

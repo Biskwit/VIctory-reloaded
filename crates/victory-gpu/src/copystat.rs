@@ -181,12 +181,47 @@ pub(crate) enum C {
     /// Questions about unmapped view memory answered from an earlier one
     /// in the same submission (`watch::uncommitted_end_asked`).
     GuardQueriesSpared,
+    /// A submission's steps by kind (`HostList::run_deferred`), in
+    /// nanoseconds, the refreshes they flush included: title copies,
+    /// fills of upload memory, refreshes noted, runs, ranges given to
+    /// shaders, textures.
+    StepCopyNs,
+    StepFillNs,
+    StepRefreshNs,
+    StepRunNs,
+    StepGpuWriteNs,
+    StepTextureNs,
+    /// Refreshes of host copies (`Shadow::update`), all of each, and of
+    /// that: asking which pages were written (`watch::writes`), and the
+    /// copies of the written pages (`Shadow::copy`).
+    UpdateNs,
+    UpdateWritesNs,
+    UpdateCopyNs,
+    /// Refreshes of host copies, and those the journal answered without a
+    /// kernel asking or a guard.
+    UpdateCalls,
+    UpdateJournal,
 }
-const COUNTERS: usize = 96;
+const COUNTERS: usize = 112;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// Adds the nanoseconds from its making to its drop to a counter.
+pub(crate) struct Timed(usize, std::time::Instant);
+
+impl Timed {
+    pub(crate) fn new(c: C) -> Self {
+        Timed(c as usize, std::time::Instant::now())
+    }
+}
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        COUNT[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Relaxed);
+    }
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -1236,6 +1271,22 @@ pub(crate) fn log(frames: f64) {
         c[C::PrepSnapNs as usize] / 1e6,
         c[C::PrepCardNs as usize] / 1e6,
         c[C::PrepSendNs as usize] / 1e6,
+    );
+    tracing::info!(
+        "submission steps by kind per frame: title copies {:.1} ms, fills {:.1} ms, refreshes noted {:.1} ms, runs {:.1} ms, \
+         ranges given to shaders {:.1} ms, textures {:.1} ms; refreshes of host copies: {:.0} ({:.0} answered by the journal) \
+         {:.1} ms, of it asking which pages were written {:.1} ms, copying them {:.1} ms",
+        c[C::StepCopyNs as usize] / 1e6,
+        c[C::StepFillNs as usize] / 1e6,
+        c[C::StepRefreshNs as usize] / 1e6,
+        c[C::StepRunNs as usize] / 1e6,
+        c[C::StepGpuWriteNs as usize] / 1e6,
+        c[C::StepTextureNs as usize] / 1e6,
+        c[C::UpdateCalls as usize],
+        c[C::UpdateJournal as usize],
+        c[C::UpdateNs as usize] / 1e6,
+        c[C::UpdateWritesNs as usize] / 1e6,
+        c[C::UpdateCopyNs as usize] / 1e6,
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();

@@ -2438,6 +2438,10 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::copystat::Timed::new(crate::copystat::C::UpdateNs);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::UpdateCalls, 1);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -2475,7 +2479,12 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            #[cfg(feature = "diagnostics")]
+            let asking = crate::copystat::Timed::new(crate::copystat::C::UpdateWritesNs);
+            let writes = crate::watch::writes(from, to, true);
+            #[cfg(feature = "diagnostics")]
+            drop(asking);
+            if let Some((now, written)) = writes {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
@@ -2537,6 +2546,8 @@ impl Shadow {
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::copystat::Timed::new(crate::copystat::C::UpdateCopyNs);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         #[cfg(feature = "diagnostics")]
