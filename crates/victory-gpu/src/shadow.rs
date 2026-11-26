@@ -266,13 +266,13 @@ pub(crate) fn vram_breakdown() -> [u64; 2] {
 }
 
 /// Whether the texture queue leaves room on the card for the card copies
-/// of title buffers that are not made yet
-/// (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`; off by default).
+/// of title buffers that are not made yet. The reservation is enabled by
+/// default. `VICTORY_CARD_ROOM_FOR_BUFFERS=0` disables it.
 ///
 /// The copies are made in one burst when the world loads (run 189: 94 of
-/// its 95 within two seconds, right before the first world frame), and
-/// [`card_for`] makes one only while the card is under eight tenths of its
-/// budget. That held as long as the textures picked by index filled the
+/// its 95 within two seconds, right before the first world frame). Without
+/// the reservation, [`card_for`] allows copies up to 80% of the reported
+/// local budget. That held as long as the textures picked by index filled the
 /// card after the burst. Since the texture queue keeps packed neighbours
 /// (52b8060) it fills the card while the world loads: 85% and more at the
 /// burst in runs 190 to 192, so one copy of 95 was made, the CPU looked
@@ -281,9 +281,8 @@ pub(crate) fn vram_breakdown() -> [u64; 2] {
 ///
 /// With the switch, the texture queue's rule (`resource::room`) counts the
 /// part of [`card_limits`]' second number that no copy has taken yet as
-/// used, and a copy may be made up to nine tenths of the budget: the room
-/// it takes was kept for it. After the burst what is kept is what the
-/// burst left of the limit (87 MB of 1,024 in run 189).
+/// used. After the burst, only the unused part of that limit is reserved
+/// (87 MB of 1,024 in run 189).
 ///
 /// On by default from the build after run 199
 /// (`VICTORY_CARD_ROOM_FOR_BUFFERS=0`: off, as before). Run 193 had it on and still made 31 copies of 95: the copies
@@ -403,14 +402,12 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    // Only while the card has room: with this copy on it, a fifth of the
-    // budget the system gives us must still be free. Copies are made when
-    // the world loads, before the textures fill the card; the texture
-    // queue's own rule (`resource::room`: nine tenths of the budget) counts
+    // Copies are made when the world loads, before the textures fill the
+    // card. The texture queue's own rule (`resource::room`) counts
     // them, so the card's use stays where it was and the textures' share
     // shrinks by the copies' bytes, at most `card_limits`' second number.
-    // (With `card_room_kept_on` the texture queue kept this copy's room
-    // free, and the copy may go up to the queue's own line.)
+    // With room reserved for buffers, local usage including the new copy
+    // may reach 97% of the reported budget. Disabling the reservation uses 80%.
     let hundredths = if card_room_kept_on() { 97 } else { 80 };
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * hundredths
@@ -2060,7 +2057,8 @@ pub(crate) fn back_line(frames: f64) {
     tracing::info!(
         "shader writes looked for on the CPU per frame: {:.1} MB compared in {:.0} ranges of windows outside buffers ({:.1} MB \
          snapshotted), {:.1} MB in {:.0} ranges of title buffers' copies ({:.1} MB snapshotted), of them {:.1} MB in copies \
-         of 1 MiB or more (VICTORY_CARD_BUFFERS_MIN_MB=1 would have the card look there)",
+         of 1 MiB or more. VICTORY_CARD_BUFFERS_MIN_MB=1 sets only the lower size limit. Local copies must also be below \
+         1 GiB and fit the buffer cap and the allowed share of any reported VRAM budget",
         mb(c[2]),
         c[5],
         mb(c[0]),
