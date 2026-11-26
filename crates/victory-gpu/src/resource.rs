@@ -1184,6 +1184,13 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether `this` is a title texture alive (any other pointer is not
+/// looked at).
+#[cfg(windows)]
+pub(crate) fn is_texture(this: This) -> bool {
+    textures().contains(&(this as usize))
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A

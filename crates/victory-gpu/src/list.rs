@@ -1409,6 +1409,87 @@ fn clear_uav(
     let _ = (this, gpu, handle, values, count, rects, float);
 }
 
+/// What FSR 4 would have written, when its passes cannot run: AMD's
+/// shaders carry AMD code, not a console program, so every dispatch of
+/// them is dropped (`victory_hle`'s `fsr` calls this after FSR's own
+/// dispatch). Records into the title's list `this` a bilinear upscale of
+/// the `render` part (width, height) of `color` into all of `output`
+/// (`upscale` in size, a target), with the list's state set again after.
+///
+/// shortcut: a stretch stands in for FSR 4, without its temporal
+/// accumulation, anti-aliasing or sharpening.
+///
+/// # Safety
+/// `this` is the title's command list of the upscale description that
+/// names `color` and `output`.
+#[cfg(windows)]
+pub unsafe fn upscale_stand_in(this: *const u8, color: *const u8, render: [u32; 2], output: *const u8, upscale: [u32; 2]) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let (color, output) = (color as This, output as This);
+    let warn = |why: &str| {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(?color, ?output, ?render, ?upscale, why, "no FSR 4 stand-in"));
+    };
+    if !crate::resource::is_texture(color) || !crate::resource::is_texture(output) {
+        return warn("not textures");
+    }
+    let (Some(from), Some(to), Some(host)) = (
+        crate::resource::host_resource(color),
+        crate::resource::host_resource(output),
+        crate::host::host(),
+    ) else {
+        return warn("no host copies");
+    };
+    // SAFETY: live resources.
+    let (f, t) = unsafe { (from.GetDesc(), to.GetDesc()) };
+    let Some(format) = crate::planes::typed(t.Format).filter(|_| t.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0)
+    else {
+        return warn("an output the host cannot render to");
+    };
+    if (t.Width, t.Height) != (u64::from(upscale[0]), upscale[1])
+        || render[0] == 0
+        || render[1] == 0
+        || u64::from(render[0]) > f.Width
+        || render[1] > f.Height
+    {
+        return warn("sizes that disagree with the textures");
+    }
+    static COMPOSERS: std::sync::Mutex<Vec<crate::planes::Composer>> = std::sync::Mutex::new(Vec::new());
+    let mut composers = COMPOSERS.lock().unwrap_or_else(|e| e.into_inner());
+    let i = match composers.iter().position(|c| c.draws_into(format)) {
+        Some(i) => i,
+        None => match crate::planes::Composer::new(host, format) {
+            Ok(c) => {
+                tracing::info!(?render, ?upscale, format = format.0, "a bilinear upscale stands in for FSR 4");
+                composers.push(c);
+                composers.len() - 1
+            }
+            Err(_) => return warn("no pipeline"),
+        },
+    };
+    let composer = &mut composers[i];
+    with_state(this.cast_mut().cast(), |list, state| {
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+        const RENDER_TARGET: u32 = 0x4;
+        ensure_state(list, color, PIXEL_SHADER_RESOURCE);
+        ensure_state(list, output, RENDER_TARGET);
+        crate::texture::host_written(output);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("FSR 4 stand-in: {color:?} {render:?} to {output:?} {upscale:?}"));
+        let over = crate::planes::Over {
+            texture: from,
+            state: PIXEL_SHADER_RESOURCE,
+            to: [0.0, 0.0, 1.0, 1.0],
+            from: [0.0, 0.0, render[0] as f32 / f.Width as f32, render[1] as f32 / f.Height as f32],
+        };
+        let size = (t.Width as u32, t.Height);
+        composer.draw(host, &list.list, to, D3D12_RESOURCE_STATE_RENDER_TARGET, size, false, &[over]);
+        // Our pipeline, root signature, heaps, target, viewport and
+        // scissor: the title's are set again.
+        state.replay(list);
+    });
+}
+
 /// `ClearDepthStencilView(handle, flags, depth, stencil, count, rects)`;
 /// flags: 1 depth, 2 stencil.
 extern "system" fn clear_dsv(
