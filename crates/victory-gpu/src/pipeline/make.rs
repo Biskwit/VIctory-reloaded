@@ -34,6 +34,8 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     key: String,
     used: AtomicBool,
+    /// Whether a draw or dispatch has asked for it ([`ready`]).
+    asked: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -62,7 +64,24 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            asked: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the library keeps it out (`library::kept_out`): it is
+    /// compiled at every launch.
+    fn kept_out(&self) -> bool {
+        let samplers: Vec<_> = self
+            .shaders
+            .iter()
+            .filter_map(|s| s.translated())
+            .flat_map(|t| &t.host.static_samplers)
+            .map(|s| windows::Win32::Graphics::Direct3D12::D3D12_STATIC_SAMPLER_DESC {
+                Filter: windows::Win32::Graphics::Direct3D12::D3D12_FILTER(s.filter as i32),
+                ..Default::default()
+            })
+            .collect();
+        super::library::kept_out(&samplers)
     }
 
     fn make(&self) {
@@ -119,8 +138,9 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
-        let priority = if urgent_compute() && is_compute(p) { URGENT } else { REQUESTED };
-        start(p, priority);
+        // Before it is queued: see `left_for_first_use`.
+        p.asked.store(true, Ordering::SeqCst);
+        start(p, asked_priority(p));
         let frame = crate::frame::current();
         if !(is_compute(p) && wait_compute(p, frame)) {
             wait(p, frame);
@@ -135,6 +155,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     made
+}
+
+/// The queue a draw's or dispatch's first use puts `p` in.
+fn asked_priority(p: &Pending) -> u8 {
+    if urgent_compute() && is_compute(p) { URGENT } else { REQUESTED }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -342,27 +367,62 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
+    /// The next pipeline to make, and the queue it was taken from.
+    fn pop(&mut self) -> Option<(Arc<Pending>, u8)> {
         // An entry can have been promoted (and claimed from the queue it
         // was promoted to) since it was queued: only taken at its state.
         let at = |q: &mut VecDeque<Arc<Pending>>, state: u8| {
-            std::iter::from_fn(|| q.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == state)
+            std::iter::from_fn(|| q.pop_front())
+                .find(|p| p.queue_state.load(Ordering::Relaxed) == state)
+                .map(|p| (p, state))
         };
-        let p = at(&mut self.urgent, URGENT)
+        let (p, state) = at(&mut self.urgent, URGENT)
             .or_else(|| at(&mut self.requested, REQUESTED))
             .or_else(|| at(&mut self.early, EARLY))?;
-        p.queue_state.store(MAKING, Ordering::Relaxed);
-        Some(p)
+        p.queue_state.store(MAKING, Ordering::SeqCst);
+        Some((p, state))
     }
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
 
+/// Whether an early start of `p`, just taken by a worker, is left for its
+/// first use instead: `p` is one the library keeps out, compiled at every
+/// launch (some 290 compute programs at ~5 s each), and nothing asked for
+/// it yet. Started early, those compiles held the workers from the loading
+/// screen until minutes into the world, while the pipelines its first frames
+/// asked for, loaded from the library in milliseconds, waited behind them;
+/// such warm launches kept the dark jumpsuit of the cell (fxhead-warm1-3,
+/// cfirst-warm1/3, shirt-noskip1), and one without the early list did not
+/// (shirt-noearly1). Left, it is compiled when first asked
+/// for, as in a cold launch. `VICTORY_EARLY_KEPT_OUT=1`: started early, as
+/// before.
+fn left_for_first_use(p: &Arc<Pending>) -> bool {
+    static EARLY_KEPT_OUT: OnceLock<bool> = OnceLock::new();
+    !*EARLY_KEPT_OUT.get_or_init(|| std::env::var_os("VICTORY_EARLY_KEPT_OUT").is_some_and(|v| v == "1"))
+        && left_if(p, || p.kept_out())
+}
+
+/// [`left_for_first_use`], for a pipeline `kept_out` tells about.
+fn left_if(p: &Arc<Pending>, kept_out: impl FnOnce() -> bool) -> bool {
+    if p.asked.load(Ordering::SeqCst) || !kept_out() {
+        return false;
+    }
+    p.queue_state.store(NOT_QUEUED, Ordering::SeqCst);
+    // A first use while it was taken found it being made and did not queue
+    // it: queued now as that use would have.
+    if p.asked.load(Ordering::SeqCst) {
+        start(p, asked_priority(p));
+    }
+    true
+}
+
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
 fn start(p: &Arc<Pending>, priority: u8) {
-    if p.queue_state.load(Ordering::Relaxed) >= priority {
+    // After `asked` is set (`left_for_first_use`).
+    if p.queue_state.load(Ordering::SeqCst) >= priority {
         return;
     }
     if !workers() {
@@ -380,11 +440,11 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
 }
 
-fn next() -> Arc<Pending> {
+fn next() -> (Arc<Pending>, u8) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
-            return p;
+        if let Some(taken) = queue.pop() {
+            return taken;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
@@ -407,7 +467,10 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        let (p, taken_from) = next();
+                        if !(taken_from == EARLY && left_for_first_use(&p)) {
+                            p.make();
+                        }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -474,11 +537,32 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap().0, &requested));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap().0, &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap().0, &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    /// An early start of a pipeline the library keeps out is left for its
+    /// first use, unless one came first; other early starts are made.
+    #[test]
+    fn kept_out_early_starts_wait_for_their_first_use() {
+        let mut queue = Queue::new();
+        let kept_out = Arc::new(Pending::new(Vec::new(), None));
+        assert_eq!(queue.push(&kept_out, EARLY), Some(true));
+        let (taken, from) = queue.pop().unwrap();
+        assert_eq!(from, EARLY);
+        assert!(left_if(&taken, || true));
+        assert_eq!(kept_out.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        // Its first use queues it as any other.
+        assert_eq!(queue.push(&kept_out, REQUESTED), Some(true));
+
+        let stored = Arc::new(Pending::new(Vec::new(), None));
+        assert!(!left_if(&stored, || false));
+        let asked = Arc::new(Pending::new(Vec::new(), None));
+        asked.asked.store(true, Ordering::SeqCst);
+        assert!(!left_if(&asked, || true));
     }
 
     /// A compute pipeline a dispatch asks for is made before every draw's
@@ -497,9 +581,9 @@ mod tests {
         // The dispatch asks: promoted ahead of the draw queued before it.
         assert_eq!(queue.push(&chain, URGENT), Some(false));
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &chain));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &drawn));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &early));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap().0, &chain));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap().0, &drawn));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap().0, &early));
         assert!(queue.pop().is_none());
     }
 }
