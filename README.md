@@ -77,9 +77,8 @@ The charts show the current Series S measurement above, on an RTX 4090.
 
 - **Frame rate.** Below 30 fps in the world. Most of a frame goes to preparing the
   GPU's work on the CPU and copying data back, not to the GPU itself.
-- **Memory.** The game holds 27-29 GB on the Series S profile, steady over 30
-  minutes. On a PC with less free RAM than that, Windows pages part of it out and
-  frames stall.
+- **Memory.** The game holds 26-28 GB on the Series S profile. On a PC with less
+  free RAM than that, Windows pages part of it out and frames stall.
 - **Picture.** Skin, hair and some walls show flat bands of colour; some objects
   (tanks, tarps, plants, a skylight) glow in flat purple, pink or blue; some faces
   show scrambled colour patches and some eyes are lit white; clouds and reflections
