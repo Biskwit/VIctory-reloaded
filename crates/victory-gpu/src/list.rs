@@ -1089,6 +1089,11 @@ fn read_back(
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+    // shortcut: a stand-in's texels are not the title's bits
+    // (`crate::resource::target_format`).
+    if crate::resource::stands_in(src.resource) {
+        return Err("a target in a stand-in format");
+    }
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
@@ -1254,6 +1259,239 @@ extern "system" fn clear_rtv(
     }
     #[cfg(not(windows))]
     let _ = (this, handle, color, count, rects);
+}
+
+/// `ClearUnorderedAccessViewUint(gpu handle, handle, resource, values,
+/// count, rects)`: AMD FidelityFX (the Series S profile's FSR 4) clears its
+/// textures so.
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    handle: u64,
+    _resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, gpu, handle, values, count, rects, false);
+}
+
+/// `ClearUnorderedAccessViewFloat`, as [`clear_uav_uint`].
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    handle: u64,
+    _resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, gpu, handle, values.cast(), count, rects, true);
+}
+
+/// A host unordered access view to clear: its slot in a heap of ours that
+/// shaders do not see, and in one they do, which the clear sets on the
+/// list. A ring, as the host's render target views: a slot is valid until
+/// the ring comes round, long after its list has run.
+#[cfg(windows)]
+struct ClearViews {
+    cpu: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap,
+    visible: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap,
+    step: u32,
+    next: std::sync::atomic::AtomicU32,
+}
+
+/// The view described at the title's `handle` (or its `gpu` handle),
+/// cleared to `values` (bits, or floats with `float`).
+/// shortcut: views of buffers are not cleared (logged once); FidelityFX
+/// clears textures.
+fn clear_uav(
+    this: This,
+    gpu: u64,
+    handle: u64,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+    float: bool,
+) {
+    #[cfg(windows)]
+    with_state(this, |list, state| {
+        use windows::Win32::Graphics::Direct3D12::*;
+        const SLOTS: u32 = 1024;
+        // SAFETY: the title passes four values (null is tolerated).
+        let Some(values) = (unsafe { values.as_ref() }) else {
+            return;
+        };
+        let Some(view) = crate::descriptor::view(handle).or_else(|| crate::descriptor::view(gpu))
+        else {
+            return;
+        };
+        let crate::descriptor::View::Unordered(resource, ..) = view else {
+            return;
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        static VIEWS: std::sync::OnceLock<Option<ClearViews>> = std::sync::OnceLock::new();
+        let Some(views) = VIEWS.get_or_init(|| {
+            let heap = |flags| {
+                // SAFETY: a plain heap creation.
+                unsafe {
+                    host.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: SLOTS,
+                        Flags: flags,
+                        NodeMask: 0,
+                    })
+                }
+                .ok()
+            };
+            Some(ClearViews {
+                cpu: heap(D3D12_DESCRIPTOR_HEAP_FLAG_NONE)?,
+                visible: heap(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?,
+                // SAFETY: a plain query.
+                step: unsafe {
+                    host.device
+                        .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                },
+                next: std::sync::atomic::AtomicU32::new(0),
+            })
+        }) else {
+            return;
+        };
+        let slot = views.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % SLOTS;
+        // SAFETY: slots of our heaps.
+        let (cpu, visible, gpu) = unsafe {
+            let mut cpu = views.cpu.GetCPUDescriptorHandleForHeapStart();
+            cpu.ptr += (slot * views.step) as usize;
+            let mut visible = views.visible.GetCPUDescriptorHandleForHeapStart();
+            visible.ptr += (slot * views.step) as usize;
+            let mut gpu = views.visible.GetGPUDescriptorHandleForHeapStart();
+            gpu.ptr += u64::from(slot * views.step);
+            (cpu, visible, gpu)
+        };
+        let Some(texture) = crate::descriptor::host::texture_uav(&view, cpu) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(?view, "unordered access clear of a buffer skipped"));
+            return;
+        };
+        let resource = resource as This;
+        // A depth texture's unordered access is its colour twin's.
+        if !list.twin_use(resource, true, true) {
+            const UNORDERED_ACCESS: u32 = 0x8;
+            ensure_state(list, resource, UNORDERED_ACCESS);
+        }
+        crate::texture::host_written(resource);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("clear unordered access of {resource:?} to {values:#x?}"));
+        let rects = (count > 0 && !rects.is_null()).then(|| {
+            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        });
+        // SAFETY: an open list; slots of our heaps, the view made just now
+        // of a live texture.
+        unsafe {
+            host.device
+                .CopyDescriptorsSimple(1, visible, cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            list.list.SetDescriptorHeaps(&[Some(views.visible.clone())]);
+            if float {
+                let floats = values.map(f32::from_bits);
+                list.list
+                    .ClearUnorderedAccessViewFloat(gpu, cpu, &texture, &floats, rects.unwrap_or(&[]));
+            } else {
+                list.list
+                    .ClearUnorderedAccessViewUint(gpu, cpu, &texture, values, rects.unwrap_or(&[]));
+            }
+        }
+        state.heaps_changed();
+    });
+    #[cfg(not(windows))]
+    let _ = (this, gpu, handle, values, count, rects, float);
+}
+
+/// What FSR 4 would have written, when its passes cannot run: AMD's
+/// shaders carry AMD code, not a console program, so every dispatch of
+/// them is dropped (`victory_hle`'s `fsr` calls this after FSR's own
+/// dispatch). Records into the title's list `this` a bilinear upscale of
+/// the `render` part (width, height) of `color` into all of `output`
+/// (`upscale` in size, a target), with the list's state set again after.
+///
+/// shortcut: a stretch stands in for FSR 4, without its temporal
+/// accumulation, anti-aliasing or sharpening.
+///
+/// # Safety
+/// `this` is the title's command list of the upscale description that
+/// names `color` and `output`.
+#[cfg(windows)]
+pub unsafe fn upscale_stand_in(this: *const u8, color: *const u8, render: [u32; 2], output: *const u8, upscale: [u32; 2]) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let (color, output) = (color as This, output as This);
+    let warn = |why: &str| {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(?color, ?output, ?render, ?upscale, why, "no FSR 4 stand-in"));
+    };
+    if !crate::resource::is_texture(color) || !crate::resource::is_texture(output) {
+        return warn("not textures");
+    }
+    let (Some(from), Some(to), Some(host)) = (
+        crate::resource::host_resource(color),
+        crate::resource::host_resource(output),
+        crate::host::host(),
+    ) else {
+        return warn("no host copies");
+    };
+    // SAFETY: live resources.
+    let (f, t) = unsafe { (from.GetDesc(), to.GetDesc()) };
+    let Some(format) = crate::planes::typed(t.Format).filter(|_| t.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0)
+    else {
+        return warn("an output the host cannot render to");
+    };
+    if (t.Width, t.Height) != (u64::from(upscale[0]), upscale[1])
+        || render[0] == 0
+        || render[1] == 0
+        || u64::from(render[0]) > f.Width
+        || render[1] > f.Height
+    {
+        return warn("sizes that disagree with the textures");
+    }
+    static COMPOSERS: std::sync::Mutex<Vec<crate::planes::Composer>> = std::sync::Mutex::new(Vec::new());
+    let mut composers = COMPOSERS.lock().unwrap_or_else(|e| e.into_inner());
+    let i = match composers.iter().position(|c| c.draws_into(format)) {
+        Some(i) => i,
+        None => match crate::planes::Composer::new(host, format) {
+            Ok(c) => {
+                tracing::info!(?render, ?upscale, format = format.0, "a bilinear upscale stands in for FSR 4");
+                composers.push(c);
+                composers.len() - 1
+            }
+            Err(_) => return warn("no pipeline"),
+        },
+    };
+    let composer = &mut composers[i];
+    with_state(this.cast_mut().cast(), |list, state| {
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+        const RENDER_TARGET: u32 = 0x4;
+        ensure_state(list, color, PIXEL_SHADER_RESOURCE);
+        ensure_state(list, output, RENDER_TARGET);
+        crate::texture::host_written(output);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("FSR 4 stand-in: {color:?} {render:?} to {output:?} {upscale:?}"));
+        let over = crate::planes::Over {
+            texture: from,
+            state: PIXEL_SHADER_RESOURCE,
+            to: [0.0, 0.0, 1.0, 1.0],
+            from: [0.0, 0.0, render[0] as f32 / f.Width as f32, render[1] as f32 / f.Height as f32],
+        };
+        let size = (t.Width as u32, t.Height);
+        // Cleared first: the stretch replaces the output. Blended over it,
+        // the output kept each frame's under the next by the colour's
+        // alpha, and grew from frame to frame (haze, smears, then bands;
+        // to black and white with a float16 stand-in: ss-7, ss-8).
+        composer.draw(host, &list.list, to, D3D12_RESOURCE_STATE_RENDER_TARGET, size, true, &[over]);
+        // Our pipeline, root signature, heaps, target, viewport and
+        // scissor: the title's are set again.
+        state.replay(list);
+    });
 }
 
 /// `ClearDepthStencilView(handle, flags, depth, stencil, count, rects)`;
@@ -2134,10 +2372,12 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
+const MORE_METHODS: [(usize, *const ()); 11] = [
     (28, query_mark as *const ()),             // 0xe0 BeginQuery
     (29, query_mark as *const ()),             // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
+    (53, clear_uav_uint as *const ()),         // 0x1a8
+    (54, clear_uav_float as *const ()),        // 0x1b0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
     (99, driver_hint as *const ()),            // 0x318

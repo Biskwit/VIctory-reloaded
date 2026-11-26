@@ -2256,6 +2256,18 @@ fn twin_uav(
     Some(desc)
 }
 
+/// Makes the host unordered access view of a texture `view` at `at`: the
+/// texture it views (the host copy, or its colour twin), or `None` for a
+/// view of a buffer or one the host cannot make.
+pub(crate) fn texture_uav(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    match view {
+        View::Unordered(r, ..) if crate::resource::host_resource(*r as crate::object::This).is_some() => {
+            make(view, at).flatten()
+        }
+        _ => None,
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {

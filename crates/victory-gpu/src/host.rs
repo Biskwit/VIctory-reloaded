@@ -452,8 +452,14 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
+/// The debug layer's last errors, oldest first. Whichever thread moves the
+/// messages into the log keeps them here: the command that removed the
+/// device may have been logged by another thread before the failure is.
+static LAST_ERRORS: Mutex<std::collections::VecDeque<String>> =
+    Mutex::new(std::collections::VecDeque::new());
+
 /// Ends the run on a host GPU failure: what failed, the removal reason and
-/// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
+/// the debug layer's last errors, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
@@ -463,12 +469,13 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
             text.push_str(&format!("; device removed: {e}"));
             log_removal_context();
         }
-        match host.log_messages() {
-            Some(first) => text.push_str(&format!("; debug layer: {first}")),
-            None if host.messages.is_none() => text.push_str(
-                "; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command",
-            ),
-            None => {}
+        host.log_messages();
+        let last = LAST_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+        if !last.is_empty() {
+            let last: Vec<&str> = last.iter().map(String::as_str).collect();
+            text.push_str(&format!("; the debug layer's last errors: {}", last.join(" | ")));
+        } else if host.messages.is_none() {
+            text.push_str("; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command");
         }
     }
     tracing::error!("{text}");
@@ -5126,13 +5133,12 @@ impl Host {
         text
     }
 
-    /// Moves the debug layer's messages into our log; returns the first
-    /// error among them.
-    pub(crate) fn log_messages(&self) -> Option<String> {
+    /// Moves the debug layer's messages into our log, keeping the last
+    /// errors among them for a failure's report ([`LAST_ERRORS`]).
+    pub(crate) fn log_messages(&self) {
         let Some(queue) = &self.messages else {
-            return None;
+            return;
         };
-        let mut first_error = None;
         // SAFETY: each message is read into a buffer of the size the queue
         // reports, then the queue is emptied.
         unsafe {
@@ -5149,14 +5155,17 @@ impl Host {
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
-                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
-                        first_error = Some(text.to_owned());
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                        let mut last = LAST_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+                        if last.len() == 4 {
+                            last.pop_front();
+                        }
+                        last.push_back(text.to_owned());
                     }
                 }
             }
             queue.ClearStoredMessages();
         }
-        first_error
     }
 
     /// A host render target view of `resource`, valid until it is recorded.
@@ -6708,7 +6717,7 @@ impl Host {
 
 /// The swap chain formats a presented texture can be copied into: its own
 /// family's.
-fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+pub(crate) fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
         27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
         87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -6732,6 +6741,10 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// What display planes after the first are drawn with
+    /// (`crate::planes`), once a present had some (`None` inside: none
+    /// could be made).
+    composer: Option<Option<crate::planes::Composer>>,
     /// What the overlay and views draw with (`crate::overlay`), once one
     /// was asked for (`None` inside: none could be made).
     #[cfg(feature = "diagnostics")]
@@ -7026,16 +7039,23 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// with `planes` drawn over it, as frame `frame` (saved if captures are
+    /// on). `None` if nothing was shown; else, in diagnostics builds,
+    /// whether the frame was black.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        planes: &[crate::planes::Over],
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let (mut width, mut height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -7047,6 +7067,32 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        // Planes over the first are drawn by the composer, if it can be made.
+        let composer = if planes.is_empty() {
+            None
+        } else {
+            if p.composer.as_ref().is_some_and(|c| c.as_ref().is_some_and(|c| !c.draws_into(format))) {
+                p.composer = None;
+            }
+            p.composer
+                .get_or_insert_with(|| {
+                    crate::planes::Composer::new(self, format)
+                        .inspect_err(|e| tracing::warn!(error = %e, "display planes after the first are not shown"))
+                        .ok()
+                })
+                .as_mut()
+        };
+        // The window takes the largest plane's size, the screen's: the first
+        // plane is scaled to it (Grand Theft Auto VI's Series S profile draws
+        // its game at 1920x1080 and its interface at 3840x2160).
+        if composer.is_some() {
+            for plane in planes {
+                // SAFETY: a live resource.
+                let d = unsafe { plane.texture.GetDesc() };
+                (width, height) = (width.max(d.Width as u32), height.max(d.Height));
+            }
+        }
+        let scaled = (width, height) != (desc.Width as u32, desc.Height);
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
@@ -7108,13 +7154,45 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
+            #[cfg(feature = "diagnostics")]
+            let composed = composer.is_some();
+            match composer {
+                // The first plane scaled to the window, then the others.
+                Some(c) if scaled => {
+                    let first = crate::planes::Over {
+                        texture,
+                        state: D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
+                        to: [0.0, 0.0, 1.0, 1.0],
+                        from: [0.0, 0.0, 1.0, 1.0],
+                    };
+                    let all: Vec<_> = std::iter::once(first).chain(planes.iter().copied()).collect();
+                    c.draw(self, list, &back, D3D12_RESOURCE_STATE_COPY_DEST, (width, height), true, &all);
+                }
+                Some(c) => {
+                    list.CopyResource(&back, texture);
+                    c.draw(self, list, &back, D3D12_RESOURCE_STATE_COPY_DEST, (width, height), false, planes);
+                }
+                None => list.CopyResource(&back, texture),
+            }
+            // Captures read what the window shows: with planes drawn over
+            // the first, the window buffer.
+            #[cfg(feature = "diagnostics")]
+            let shown = if composed {
+                list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                &back
+            } else {
+                texture
+            };
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::capture::read_back(&self.device, list, shown))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, shown) };
+            #[cfg(feature = "diagnostics")]
+            if composed {
+                list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            }
             #[cfg(feature = "diagnostics")]
             let after = live.and_then(|live| crate::overlay::record(&mut p.overlay, self, copy, &back, frame, &p.meter.line, live));
             #[cfg(not(feature = "diagnostics"))]
@@ -7194,6 +7272,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                composer: None,
                 #[cfg(feature = "diagnostics")]
                 overlay: None,
             })

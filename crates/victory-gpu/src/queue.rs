@@ -585,13 +585,22 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A present plane, 72 bytes: frame token, the plane's resources, the part
+/// of each shown and where it goes, then words zero in Grand Theft Auto VI
+/// (its Series S profile presents two planes: the game's at 1920x1080 and
+/// its interface's at 3840x2160, each showing all of itself; run ss-5).
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    /// The part of each resource shown, in its pixels, or null: all.
+    source: *const [i32; 4],
+    /// Where each resource goes on the screen, or null: all of it.
+    destination: *const [f32; 4],
+    rest: [u64; 4],
 }
+const _: () = assert!(size_of::<Plane>() == 72);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -761,10 +770,12 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows the first plane's first resource in our window, with the first
+/// resource of each plane after it drawn over it in order
+/// (`crate::planes`).
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: the first plane is not scaled or placed, and is expected in
+/// the common state; a plane's other resources are not shown.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -832,6 +843,32 @@ extern "system" fn present(
         // For a view of one of them, at this present (`crate::overlay`).
         crate::control::frame_targets(frame, targets);
     }
+    // Diagnostics: the first presents of more than one plane, as words, and
+    // the textures their resource pointers name.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if planes > 1 && !plane_parameters.is_null() {
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 3 {
+            // SAFETY: the title passes `planes` descriptions of at least the
+            // three fields of `Plane` (24 bytes); 16 words are read, which
+            // the second plane's description covers whatever its size.
+            let words = unsafe { std::slice::from_raw_parts(plane_parameters.cast::<u64>(), 16) };
+            let textures: Vec<String> = words
+                .iter()
+                .filter(|&&w| w > 0x10000 && w % 8 == 0 && crate::texture::committed(w as *const u8, 8))
+                .filter_map(|&w| {
+                    // SAFETY: 8 committed bytes: a candidate array of
+                    // resource pointers.
+                    let first = unsafe { *(w as *const usize) };
+                    let texture = crate::resource::texture_alive(first)?;
+                    // SAFETY: a live resource.
+                    let d = unsafe { texture.texture.GetDesc() };
+                    Some(format!("{w:#x} -> {first:#x} {}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0))
+                })
+                .collect();
+            tracing::info!(frame, planes, ?words, ?textures, "a present of several planes");
+        }
+    }
     #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
@@ -844,9 +881,48 @@ extern "system" fn present(
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
+        // The planes after the first, each's first resource, drawn over it.
+        // SAFETY: the title passes `planes` plane descriptions.
+        let rest = unsafe { std::slice::from_raw_parts(plane_parameters, planes as usize) };
+        let over: Vec<_> = rest[1..]
+            .iter()
+            .filter(|p| p.count > 0 && !p.resources.is_null())
+            .filter_map(|p| {
+                // SAFETY: the plane lists `count` resources.
+                let resource = unsafe { *p.resources };
+                let texture = crate::resource::host_copy(resource)?;
+                // SAFETY: a live resource.
+                let d = unsafe { texture.texture.GetDesc() };
+                // SAFETY: the plane's rectangles, one per resource, if any.
+                let (source, destination) = unsafe { (p.source.as_ref(), p.destination.as_ref()) };
+                let (w, h) = (d.Width as i32, d.Height as i32);
+                let from = source
+                    .copied()
+                    .filter(|&[l, t, r, b]| 0 <= l && l < r && r <= w && 0 <= t && t < b && b <= h)
+                    .map_or([0.0, 0.0, 1.0, 1.0], |[l, t, r, b]| {
+                        [l as f32 / w as f32, t as f32 / h as f32, r as f32 / w as f32, b as f32 / h as f32]
+                    });
+                // shortcut: a placement is taken as fractions of the screen
+                // (left, top, right, bottom); any other is the whole screen.
+                let to = destination
+                    .copied()
+                    .filter(|&[l, t, r, b]| (0.0..=1.0).contains(&l) && (0.0..=1.0).contains(&t) && l < r && t < b && r <= 1.0 && b <= 1.0)
+                    .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+                Some((texture, from, to))
+            })
+            .collect();
+        let over: Vec<_> = over
+            .iter()
+            .map(|(t, from, to)| crate::planes::Over {
+                texture: &t.texture,
+                state: t.state.load(Ordering::Relaxed),
+                to: *to,
+                from: *from,
+            })
+            .collect();
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        let shown = host.present(texture, state, &over, frame);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

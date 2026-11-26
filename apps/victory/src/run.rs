@@ -101,8 +101,10 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    // The structure builder's calls say what its dispatches will touch.
-    let interposed = victory_hle::modules::bvhbuilder::Interposed(&with_dlls);
+    // The structure builder's calls say what its dispatches will touch;
+    // FidelityFX's upscales get a stand-in for FSR 4's output.
+    let fsr = victory_hle::modules::fsr::Interposed(&with_dlls);
+    let interposed = victory_hle::modules::bvhbuilder::Interposed(&fsr);
     show(&exe_name, image.bind_imports(&interposed, policy)?);
     if !execute {
         println!("not executing (pass --execute to start the title)");

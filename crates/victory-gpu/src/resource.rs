@@ -244,22 +244,30 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// (NVIDIA) refused the whole texture, so every pass that wrote it drew
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
+/// The same for the shared-exponent R9G9B9E5 (67), a full-screen target of
+/// the title's Series S profile that no PC GPU renders to (the typed null
+/// view standing for the refused texture removed the device): R11G11B10
+/// float stands in, 32 bits, unsigned and without alpha like it, with
+/// 6/6/5-bit mantissas for its shared 9.
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
-/// shortcut: copies between such a target and a texture the title fills
-/// itself in the 16-bit format are skipped ([`stands_in`]); convert them
-/// if a pass turns out to need one.
+/// shortcut: a stand-in's texels are not the title's bits, so nothing moves
+/// them as bytes: copies between such a target and a texture in the
+/// console format are skipped ([`stands_in`]), read backs of it into title
+/// memory are refused, and a view placed in its memory in another format
+/// reads title memory ([`alias_of`]); each is logged. Convert them if a
+/// pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 26)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
-            STAND_INS.map(|(f, _)| {
+            STAND_INS.map(|(f, stand_in)| {
                 let Some(host) = crate::host::host() else {
                     return false;
                 };
@@ -279,7 +287,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                    tracing::info!(format = f, stand_in, "the host does not render to this format");
                 }
                 refused
             })
@@ -1176,6 +1184,13 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether `this` is a title texture alive (any other pointer is not
+/// looked at).
+#[cfg(windows)]
+pub(crate) fn is_texture(this: This) -> bool {
+    textures().contains(&(this as usize))
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1232,6 +1247,15 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
     let other = *targets.get(&(r.data() as u64))? as This;
     let o = resource(other);
+    // A stand-in target's texels are not the title's bits ([`target_format`]).
+    if target_format(o.desc.format) != o.desc.format {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(view = ?this, target = ?other, format = r.desc.format, target_format = o.desc.format,
+                "a view placed in a stand-in target's memory reads title memory")
+        });
+        return None;
+    }
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
         && o.desc.dimension == r.desc.dimension
@@ -1240,7 +1264,6 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.mip_levels == r.desc.mip_levels
         && o.desc.depth_or_array_size == r.desc.depth_or_array_size
         && o.desc.flags & DEPTH == 0
-        && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
     same.then_some(other)
 }
@@ -2699,6 +2722,152 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
+    }
+
+    /// A shared-exponent (R9G9B9E5) target, which the Series S profile
+    /// renders to and PC GPUs do not, has a host copy, and the title's
+    /// target views in its format, of it and of no texture (a typed null
+    /// view), leave the device be. The null view in the console format
+    /// removed the device.
+    #[cfg(windows)]
+    #[test]
+    fn a_shared_exponent_target_has_a_host_copy() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        const TARGET_AND_UNORDERED: u32 = 5;
+        let desc = ResourceDesc {
+            flags: TARGET_AND_UNORDERED,
+            ..texture(64, 64, 67, 1)
+        };
+        let mut image = null;
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut image),
+            S_OK
+        );
+        let copy = host_resource(image).expect("a host copy of the target");
+        // SAFETY: a live resource.
+        assert_eq!(unsafe { copy.GetDesc() }.Format.0 as u32, target_format(67));
+        let view = [67u32, 4, 0, 0, 0, 0];
+        for resource in [image, null] {
+            let mut slot = [0u8; 112];
+            crate::descriptor::create_rtv(null, resource, &view, slot.as_mut_ptr() as u64);
+            let record = crate::descriptor::rtv_record(slot.as_ptr() as u64).unwrap();
+            host.rtv(host_resource(record.resource), record.desc().as_ref());
+        }
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// An unordered access clear (list slot 0x1a8, as FidelityFX clears its
+    /// textures) reaches the host texture.
+    #[cfg(windows)]
+    #[test]
+    fn an_unordered_access_clear_reaches_the_host_texture() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        const UNORDERED: u32 = 4;
+        // R32_UINT, 16 texels of 4 bytes: rows of 256 bytes once read back.
+        let desc = ResourceDesc {
+            flags: UNORDERED,
+            ..texture(16, 4, 42, 1)
+        };
+        let mut image = null;
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut image),
+            S_OK
+        );
+        // The title's view, in a descriptor slot of its memory.
+        let mut view = [0u8; 32];
+        let handle = view.as_mut_ptr() as u64;
+        crate::descriptor::create_uav(null, image, null, null.cast(), handle);
+
+        let queue_iid = guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]);
+        let allocator_iid = guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+        let list_iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        assert_eq!(crate::queue::create(null, [0u32; 4].as_ptr().cast(), &queue_iid, &mut queue), S_OK);
+        assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
+        assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK);
+        type Clear = extern "system" fn(This, u64, u64, This, *const [u32; 4], u32, *const u8);
+        slot::<Clear>(list, 0x1a8)(list, handle, handle, image, &[7; 4], 0, null.cast());
+        slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let rows = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 1024,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rows, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback)
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let texture = host_resource(image).unwrap();
+        let (_, before) = host_transition(image, 0x800).unwrap();
+        let back = host.new_list().unwrap();
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::ManuallyDrop::new(Some(readback.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(42),
+                        Width: 16,
+                        Height: 4,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::ManuallyDrop::new(Some(texture.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        // SAFETY: an open list, live resources.
+        unsafe {
+            back.list.ResourceBarrier(&[crate::host::transition(
+                texture,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            back.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+        back.close();
+        host.execute(&[&back]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy has run (`execute` waits); 1024 bytes are mapped.
+        let texels = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u32>(), 256)
+        };
+        for row in 0..4 {
+            assert_eq!(texels[row * 64..row * 64 + 16], [7; 16], "row {row}");
+        }
+        // SAFETY: mapped above.
+        unsafe { readback.Unmap(0, None) };
+        drop(std::mem::ManuallyDrop::into_inner(to.pResource));
+        drop(std::mem::ManuallyDrop::into_inner(from.pResource));
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets
