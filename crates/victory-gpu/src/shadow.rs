@@ -2434,10 +2434,49 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        self.update_into(address, len, &mut None)
+    }
+
+    /// [`Shadow::update`] without its copies: what it asks of the journal
+    /// and the guards is asked, and the copy is taken as up to date, but
+    /// the ranges to copy go into `plan` (offsets as title addresses), for
+    /// [`Shadow::copy_planned`] before anything reads the copy. Returns the
+    /// bytes to copy.
+    pub(crate) fn plan(&self, address: usize, len: usize, plan: &mut Vec<(usize, usize)>) -> usize {
+        self.update_into(address, len, &mut Some(plan))
+    }
+
+    /// Copies a range [`Shadow::plan`] gave. Ranges of one plan may be
+    /// copied on different threads. Returns the bytes copied.
+    pub(crate) fn copy_planned(&self, from: usize, to: usize) -> usize {
+        self.copy(from, to)
+    }
+
+    /// Copies `[from, to)` now, or notes it in `plan`.
+    fn copy_or_plan(&self, from: usize, to: usize, plan: &mut Option<&mut Vec<(usize, usize)>>) -> usize {
+        match plan {
+            None => self.copy(from, to),
+            Some(plan) => {
+                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                let (from, to) = (from.max(start), to.min(end));
+                if from >= to {
+                    return 0;
+                }
+                plan.push((from, to));
+                to - from
+            }
+        }
+    }
+
+    fn update_into(&self, address: usize, len: usize, plan: &mut Option<&mut Vec<(usize, usize)>>) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
         }
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::copystat::Timed::new(crate::copystat::C::UpdateNs);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::UpdateCalls, 1);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -2459,25 +2498,30 @@ impl Shadow {
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(at, a, plan);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(at, to, plan);
             }
             return bytes;
         }
-        self.update_free(from, to)
+        self.update_free(from, to, plan)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    fn update_free(&self, from: usize, to: usize, plan: &mut Option<&mut Vec<(usize, usize)>>) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            #[cfg(feature = "diagnostics")]
+            let asking = crate::copystat::Timed::new(crate::copystat::C::UpdateWritesNs);
+            let writes = crate::watch::writes(from, to, true);
+            #[cfg(feature = "diagnostics")]
+            drop(asking);
+            if let Some((now, written)) = writes {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, &written, plan);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -2490,6 +2534,9 @@ impl Shadow {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
+        if plan.is_some() {
+            return self.copy_or_plan(from, to, plan);
+        }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
@@ -2501,7 +2548,14 @@ impl Shadow {
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(
+        &self,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        plan: &mut Option<&mut Vec<(usize, usize)>>,
+    ) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -2525,18 +2579,20 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                bytes += self.copy_or_plan((first * PAGE).max(from), (page * PAGE).min(to), plan);
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            bytes += self.copy_or_plan((first * PAGE).max(from), ((last + 1) * PAGE).min(to), plan);
         }
         bytes
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::copystat::Timed::new(crate::copystat::C::UpdateCopyNs);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         #[cfg(feature = "diagnostics")]

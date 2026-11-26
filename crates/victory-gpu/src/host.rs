@@ -4061,14 +4061,56 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
-        }
+        let apart = || {
+            pieces_apart(
+                pieces
+                    .iter()
+                    .map(|(shadow, lo, hi, _)| {
+                        let start = shadow.span().0 as usize;
+                        (start + lo, start + hi)
+                    })
+                    .collect(),
+            )
+        };
+        let written = if wide_merge() && pieces.len() >= 8 && apart() {
+            // As `card_back` merges: the pieces are apart from one another
+            // in title memory, several at a time. This loop, on the relay's
+            // thread alone, was most of its landings: 49 ms a frame of
+            // 57 in the cell scene (run sp-cp2a), while the submitting
+            // thread waited on it for 27-29 ms a frame.
+            let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let each = pieces.len().div_ceil(8);
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
+                .chunks(each)
+                .map(|chunk| {
+                    let (chunk, written) = (chunk.to_vec(), written.clone());
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let mut n = 0;
+                        for (shadow, lo, hi, at) in chunk {
+                            // SAFETY: the mapping of the fetched bytes; the
+                            // copy into it has run, and the caller waits for
+                            // this job.
+                            let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
+                            n += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                        }
+                        written.fetch_add(n, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            written.load(Ordering::Relaxed)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            }
+            written
+        };
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
@@ -4106,7 +4148,13 @@ impl Host {
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 let sends = flights.iter().map(|f| f.sends).max().unwrap_or(0);
+                #[cfg(feature = "diagnostics")]
+                let timed = crate::copystat::Timed::new(crate::copystat::C::RelayCardNs);
                 self.relay_card_back(&plans, sends, fetch);
+                #[cfg(feature = "diagnostics")]
+                drop(timed);
+                #[cfg(feature = "diagnostics")]
+                let _timed = crate::copystat::Timed::new(crate::copystat::C::RelayHandNs);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -4136,6 +4184,8 @@ impl Host {
             }
         }
         // In the order given: what tells the title the card is done.
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::copystat::Timed::new(crate::copystat::C::RelayRestNs);
         let mut last = 0;
         let mut landed = Vec::new();
         for item in items {
@@ -5977,6 +6027,15 @@ impl HostList {
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::copystat::Timed::new(match step {
+                Step::Copy(..) => C::StepCopyNs,
+                Step::Fill(..) => C::StepFillNs,
+                Step::Refresh(..) => C::StepRefreshNs,
+                Step::Run(_) | Step::Host(_) => C::StepRunNs,
+                Step::GpuWrite(..) => C::StepGpuWriteNs,
+                Step::Texture(_) => C::StepTextureNs,
+            });
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -5996,6 +6055,10 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    if len <= FILL_BATCHED {
+                        batch.fill(dst, src, len);
+                        continue;
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -6011,6 +6074,9 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                    } else {
+                        // It may write upload memory a fill goes to.
+                        batch.fills_done();
                     }
                     work();
                     // It wrote title memory, where is not known here: the
@@ -6055,22 +6121,30 @@ impl HostList {
     }
 }
 
-/// Whether a submission's refreshes of host copies run on several threads,
-/// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
+/// Whether the copying of a flush's refreshes of host copies runs on
+/// several threads (`VICTORY_WIDE_REFRESH=0`: all of it on the submitting
+/// thread, as before).
 ///
 /// A submission brings some sixty copies up to date, one after the other
 /// on the submitting thread: for each, the pages the title wrote are asked
-/// for and read through the kernel into the copy. That is the frame line's
-/// "copies", 45-50 ms a frame, and the copies have nothing to do with one
-/// another: each refresh writes its own copy and its own notes, and reads
-/// title memory. With the switch the copies of a flush (four or more) are
-/// spread over the threads kept for the snapshots (`crate::shadow::wide`).
-/// The write-watch journal and the guards are behind their own locks, as
-/// they are for the title's threads.
+/// for and read into the copy. In the cell scene that was 48 ms a frame,
+/// half asking (the write-watch journal and the guards) and half copying
+/// (run sp-base1). The asking takes the journal's and the guards' locks
+/// and stays on the submitting thread, copy after copy, as before; only
+/// the copying of the pages it found written goes to the threads kept for
+/// the snapshots (`crate::shadow::wide`), in pieces of
+/// [`WIDE_REFRESH_JOB`] bytes. (Each copy's asking and copying on a thread
+/// of their own, this switch's first form, was no faster: the threads
+/// waited for the journal's lock, which the guards' work holds, 197 ms a
+/// frame summed over them in run sp-wide1.)
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_none_or(|v| v != "0"))
 }
+
+/// About this many bytes of pages to copy to a piece of work in
+/// [`Batch::update_wide`].
+const WIDE_REFRESH_JOB: usize = 1 << 20;
 
 /// A submission's refreshes not done yet, per buffer copy ([`refresh_runs`]):
 /// done before a step that writes title memory or gives a range to shaders,
@@ -6090,9 +6164,73 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Fills of upload memory of [`FILL_BATCHED`] bytes or less not done
+    /// yet (destination, source, bytes), done before the next step that
+    /// writes title memory or host memory, and at the flush
+    /// ([`Batch::fills_done`]).
+    fills: Vec<(usize, usize, usize)>,
+    /// Room for the title memory those fills read.
+    fill_span: Vec<u8>,
 }
 
+/// Fills of upload memory this small wait in the [`Batch`]: one kernel read
+/// a submission's fills were each (some 14,000 a frame in the cell scene,
+/// constants of 480 bytes on average for draws' descriptor tables, 7.7 ms
+/// a frame on the submitting thread in run sp-base1). Read together, a
+/// span of title memory at a time ([`FILL_GAP`], [`FILL_SPAN`]), most of
+/// them are one read.
+const FILL_BATCHED: usize = 16 << 10;
+/// Fills whose sources lie this close are read together: reading the bytes
+/// between them costs less than another kernel call.
+const FILL_GAP: usize = 4 << 10;
+/// The most one read of fills' sources covers.
+const FILL_SPAN: usize = 1 << 20;
+
 impl Batch {
+    /// A fill of `len` bytes of title memory at `src` into upload memory at
+    /// `dst`, done by [`Batch::fills_done`].
+    fn fill(&mut self, dst: usize, src: usize, len: usize) {
+        self.fills.push((dst, src, len));
+    }
+
+    /// Does the waiting fills: their sources by address, a read of title
+    /// memory per span of them (as [`copy_mapped`] reads, zeros where a page
+    /// is not there), each fill's bytes from it.
+    fn fills_done(&mut self) {
+        if self.fills.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::copystat::Timed::new(crate::copystat::C::StepFillNs);
+        let mut fills = std::mem::take(&mut self.fills);
+        fills.sort_unstable_by_key(|f| f.1);
+        let mut copied = 0;
+        let mut i = 0;
+        while i < fills.len() {
+            let from = fills[i].1;
+            let mut to = from + fills[i].2;
+            let mut k = i + 1;
+            while k < fills.len() && fills[k].1 <= to + FILL_GAP && fills[k].1 + fills[k].2 - from <= FILL_SPAN {
+                to = to.max(fills[k].1 + fills[k].2);
+                k += 1;
+            }
+            self.fill_span.resize(to - from, 0);
+            copy_mapped(self.fill_span.as_mut_ptr(), from as *const u8, to - from, false);
+            for &(dst, src, len) in &fills[i..k] {
+                // SAFETY: the fill's upload memory, `len` bytes, and its
+                // bytes in the span just read.
+                unsafe { std::ptr::copy_nonoverlapping(self.fill_span.as_ptr().add(src - from), dst as *mut u8, len) };
+                copied += len;
+            }
+            i = k;
+        }
+        fills.clear();
+        self.fills = fills;
+        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -6119,6 +6257,53 @@ impl Batch {
         for (from, to) in refresh_runs(&shadow, ranges) {
             Self::update(&shadow, from, to);
         }
+    }
+
+    /// The refreshes of a flush ([`wide_refresh`]): what each asks is asked
+    /// here, copy after copy, and the pages found written are copied on
+    /// the kept threads, pieces of about [`WIDE_REFRESH_JOB`] bytes, before
+    /// this returns. The time counted is the time it took.
+    fn update_wide(refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>) {
+        let started = std::time::Instant::now();
+        let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+        let copied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut plan = Vec::new();
+        for (shadow, runs) in refreshes {
+            for (from, to) in runs {
+                shadow.plan(from, to - from, &mut plan);
+            }
+            // Pieces of work: runs of the plan together up to the size.
+            let mut first = 0;
+            let mut bytes = 0;
+            for i in 0..plan.len() {
+                bytes += plan[i].1 - plan[i].0;
+                if bytes >= WIDE_REFRESH_JOB || i + 1 == plan.len() {
+                    let piece: Vec<(usize, usize)> = plan[first..=i].to_vec();
+                    let (shadow, copied) = (shadow.clone(), copied.clone());
+                    jobs.push(Box::new(move || {
+                        #[cfg(feature = "diagnostics")]
+                        let job = std::time::Instant::now();
+                        let mut n = 0;
+                        for &(from, to) in &piece {
+                            n += shadow.copy_planned(from, to);
+                        }
+                        copied.fetch_add(n, Ordering::Relaxed);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            let (start, len) = shadow.span();
+                            let asked = piece.iter().map(|r| r.1 - r.0).sum();
+                            crate::copystat::range(start as usize, len as usize, asked, n, job.elapsed().as_micros() as u64, 0);
+                        }
+                    }));
+                    first = i + 1;
+                    bytes = 0;
+                }
+            }
+            plan.clear();
+        }
+        crate::shadow::wide_run(jobs);
+        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied.load(Ordering::Relaxed) as u64, Ordering::Relaxed);
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -6149,6 +6334,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        self.fills_done();
         self.index.clear();
         let refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = self
             .refreshes
@@ -6171,25 +6357,8 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && refreshes.len() >= 4 {
-            // Each copy on its own, several at a time: a copy's refresh
-            // writes that copy and reads title memory, nothing of another's.
-            // The time counted is the time it took, not the threads' sum.
-            let started = std::time::Instant::now();
-            let before = PREPARING[0].load(Ordering::Relaxed);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = refreshes
-                .into_iter()
-                .map(|(shadow, runs)| {
-                    Box::new(move || {
-                        for (from, to) in runs {
-                            Self::update(&shadow, from, to);
-                        }
-                    }) as Box<dyn FnOnce() + Send>
-                })
-                .collect();
-            crate::shadow::wide_run(jobs);
-            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        if wide_refresh() && refreshes.len() >= 2 {
+            Self::update_wide(refreshes);
         } else {
             for (shadow, runs) in refreshes {
                 for (from, to) in runs {
@@ -7428,6 +7597,47 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         assert!(!batch.texture_due(&a.clone()));
         assert!(!batch.texture_due(&b));
+    }
+
+    /// Fills done together give each destination what a read of its own
+    /// gives: its source's bytes, zeros where a page is not there, however
+    /// the sources lie (apart, close, overlapping, out of order).
+    #[test]
+    fn fills_done_together_read_what_each_alone_reads() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const PAGE: usize = 4096;
+        // Three pages, the middle one not there.
+        // SAFETY: a fresh reservation of our own, committed in part.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        for page in [0, 2] {
+            // SAFETY: inside the reservation.
+            let at = unsafe { VirtualAlloc((base + page * PAGE) as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) } as usize;
+            assert_eq!(at, base + page * PAGE);
+            for i in 0..PAGE {
+                // SAFETY: committed above.
+                unsafe { *((at + i) as *mut u8) = (i * 7 + page) as u8 };
+            }
+        }
+        let sources = [(base + 100, 200), (base + 120, 50), (base + 3000, 2000), (base + 2 * PAGE + 10, 300), (base + 40, 16), (base + PAGE + 5, 64)];
+        let mut alone: Vec<Vec<u8>> = sources.iter().map(|&(_, len)| vec![0xAA; len]).collect();
+        let mut together: Vec<Vec<u8>> = alone.clone();
+        for (&(src, len), dst) in sources.iter().zip(&mut alone) {
+            super::copy_mapped(dst.as_mut_ptr(), src as *const u8, len, false);
+        }
+        let mut batch = Batch::default();
+        for (&(src, len), dst) in sources.iter().zip(&mut together) {
+            batch.fill(dst.as_mut_ptr() as usize, src, len);
+        }
+        batch.fills_done();
+        assert!(batch.fills.is_empty());
+        assert_eq!(alone, together);
+        // The page that is not there read as zeros; the others as written.
+        assert!(together[5].iter().all(|&b| b == 0));
+        assert_eq!(together[4][0], (40 * 7) as u8);
+        assert_eq!(together[3][0], (10 * 7 + 2) as u8);
+        // SAFETY: our reservation, nothing points into it any more.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 
     #[test]
