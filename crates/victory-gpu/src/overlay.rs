@@ -780,12 +780,7 @@ impl Pipelines {
             DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
             BlendOpAlpha: D3D12_BLEND_OP_ADD,
             LogicOp: D3D12_LOGIC_OP_NOOP,
-            // Colour only: the frame's alpha stays as the title left it.
-            // Window grabs (PrintWindow) honour it, and showed holes where
-            // the panel's alpha met the title's.
-            RenderTargetWriteMask: (D3D12_COLOR_WRITE_ENABLE_RED.0
-                | D3D12_COLOR_WRITE_ENABLE_GREEN.0
-                | D3D12_COLOR_WRITE_ENABLE_BLUE.0) as u8,
+            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
         };
         let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
         formats[0] = format;
