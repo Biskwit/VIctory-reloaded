@@ -1,4 +1,4 @@
-# Starts the title with the settings this fork is played with (README.md, "How to run it").
+# Starts the title with the settings this fork is played with (README.md, "Getting started").
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
