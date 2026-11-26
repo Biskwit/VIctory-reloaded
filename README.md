@@ -68,7 +68,7 @@ What these runs found and fixed on this PC is in
 ### Benchmark charts
 
 The charts show the latest completed Series S benchmark on an RTX 4090.
-Select a chart to open its interactive view.
+Select a chart to explore the readings, adjust the FPS target and project a reduction in frame time.
 
 [![Explore frame rate, 1% low and percentile range](docs/charts/profile-frame-rate.svg)](https://taynangt.github.io/Vice-Tay/#fps)
 
