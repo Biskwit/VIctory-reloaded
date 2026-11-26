@@ -38,10 +38,11 @@ nothing from the game goes in the tree.*
   - translated shaders carry a real shader hash part instead of zeros;
   - indirect dispatches of more than 65,535 groups run whole on NVIDIA too,
     as they did on AMD only: cut, the Series X cell scene showed rows of
-    blocks at its bottom right (`VICTORY_INDIRECT_WIDE=0` cuts them). Known
-    problem, being worked on: with them whole, the Series X cell scene shows
-    a dark stepped shape on the left wall and speckles on the bunk instead.
-    Series S does not reach 65,535 groups and is not affected;
+    blocks at its bottom right (`VICTORY_INDIRECT_WIDE=0` cuts them). The
+    dark stepped shape on the left wall and the speckles on the bunk that
+    some launches show in that scene are not theirs: they come and go by
+    launch with the cut too, and the shape shows on Series S with Vice-Tay's
+    own tree and no ambient stand-in;
   - compute pipelines a dispatch asks for made first, and waited for within
     a cap, instead of dropped behind the draws' (`VICTORY_COMPUTE_FIRST=0`,
     `VICTORY_COMPUTE_WAIT`): cold launches kept the main character's head;
