@@ -10810,6 +10810,7 @@ mod refresh_tests {
     /// title memory holds.
     #[test]
     fn refreshed_ranges_hold_title_memory() {
+        let _one = crate::watch::one_asking_test();
         // SAFETY (all blocks): title memory and copies of the test's own,
         // written by this thread and, in `Batch::flush`, by the threads that
         // refresh, which are done when it returns.
@@ -10931,6 +10932,7 @@ mod refresh_tests {
     /// `VICTORY_TEST_ROUNDS`, if what is landed is noted before it is in.)
     #[test]
     fn landings_title_writes_and_light_refreshes_at_once() {
+        let _one = crate::watch::one_asking_test();
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         assert!(crate::safecopy::on());
         const LEN: usize = 24 * PAGE;
@@ -11158,6 +11160,7 @@ mod refresh_tests {
     /// is so no more once something wrote it.
     #[test]
     fn unchanged_ranges_are_known() {
+        let _one = crate::watch::one_asking_test();
         for view in [false, true] {
             let region = title(8 * PAGE, view);
             // (A page read for the first time counts as written.)
@@ -11249,6 +11252,7 @@ mod refresh_tests {
     #[test]
     #[ignore]
     fn frame_of_refreshes() {
+        let _one = crate::watch::one_asking_test();
         let mut random = Random(0x9876_5432_1234_5671);
         const EACH: usize = 224 << 10;
         const BIG: usize = 174 << 20;
