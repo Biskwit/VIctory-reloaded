@@ -513,6 +513,12 @@ impl State {
         set(self.roots(compute), slot, Root::Table(handle));
     }
 
+    /// Something else set the host list's heaps (a clear): the next draw or
+    /// dispatch sets the title's again.
+    pub(crate) fn heaps_changed(&mut self) {
+        self.host_heaps = [0; 2];
+    }
+
     pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
         set(self.roots(compute), slot, Root::View(address));
     }

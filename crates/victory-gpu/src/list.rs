@@ -1261,6 +1261,154 @@ extern "system" fn clear_rtv(
     let _ = (this, handle, color, count, rects);
 }
 
+/// `ClearUnorderedAccessViewUint(gpu handle, handle, resource, values,
+/// count, rects)`: AMD FidelityFX (the Series S profile's FSR 4) clears its
+/// textures so.
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    handle: u64,
+    _resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, gpu, handle, values, count, rects, false);
+}
+
+/// `ClearUnorderedAccessViewFloat`, as [`clear_uav_uint`].
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    handle: u64,
+    _resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, gpu, handle, values.cast(), count, rects, true);
+}
+
+/// A host unordered access view to clear: its slot in a heap of ours that
+/// shaders do not see, and in one they do, which the clear sets on the
+/// list. A ring, as the host's render target views: a slot is valid until
+/// the ring comes round, long after its list has run.
+#[cfg(windows)]
+struct ClearViews {
+    cpu: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap,
+    visible: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap,
+    step: u32,
+    next: std::sync::atomic::AtomicU32,
+}
+
+/// The view described at the title's `handle` (or its `gpu` handle),
+/// cleared to `values` (bits, or floats with `float`).
+/// shortcut: views of buffers are not cleared (logged once); FidelityFX
+/// clears textures.
+fn clear_uav(
+    this: This,
+    gpu: u64,
+    handle: u64,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+    float: bool,
+) {
+    #[cfg(windows)]
+    with_state(this, |list, state| {
+        use windows::Win32::Graphics::Direct3D12::*;
+        const SLOTS: u32 = 1024;
+        // SAFETY: the title passes four values (null is tolerated).
+        let Some(values) = (unsafe { values.as_ref() }) else {
+            return;
+        };
+        let Some(view) = crate::descriptor::view(handle).or_else(|| crate::descriptor::view(gpu))
+        else {
+            return;
+        };
+        let crate::descriptor::View::Unordered(resource, ..) = view else {
+            return;
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        static VIEWS: std::sync::OnceLock<Option<ClearViews>> = std::sync::OnceLock::new();
+        let Some(views) = VIEWS.get_or_init(|| {
+            let heap = |flags| {
+                // SAFETY: a plain heap creation.
+                unsafe {
+                    host.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: SLOTS,
+                        Flags: flags,
+                        NodeMask: 0,
+                    })
+                }
+                .ok()
+            };
+            Some(ClearViews {
+                cpu: heap(D3D12_DESCRIPTOR_HEAP_FLAG_NONE)?,
+                visible: heap(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?,
+                // SAFETY: a plain query.
+                step: unsafe {
+                    host.device
+                        .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                },
+                next: std::sync::atomic::AtomicU32::new(0),
+            })
+        }) else {
+            return;
+        };
+        let slot = views.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % SLOTS;
+        // SAFETY: slots of our heaps.
+        let (cpu, visible, gpu) = unsafe {
+            let mut cpu = views.cpu.GetCPUDescriptorHandleForHeapStart();
+            cpu.ptr += (slot * views.step) as usize;
+            let mut visible = views.visible.GetCPUDescriptorHandleForHeapStart();
+            visible.ptr += (slot * views.step) as usize;
+            let mut gpu = views.visible.GetGPUDescriptorHandleForHeapStart();
+            gpu.ptr += u64::from(slot * views.step);
+            (cpu, visible, gpu)
+        };
+        let Some(texture) = crate::descriptor::host::texture_uav(&view, cpu) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(?view, "unordered access clear of a buffer skipped"));
+            return;
+        };
+        let resource = resource as This;
+        // A depth texture's unordered access is its colour twin's.
+        if !list.twin_use(resource, true, true) {
+            const UNORDERED_ACCESS: u32 = 0x8;
+            ensure_state(list, resource, UNORDERED_ACCESS);
+        }
+        crate::texture::host_written(resource);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("clear unordered access of {resource:?} to {values:#x?}"));
+        let rects = (count > 0 && !rects.is_null()).then(|| {
+            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        });
+        // SAFETY: an open list; slots of our heaps, the view made just now
+        // of a live texture.
+        unsafe {
+            host.device
+                .CopyDescriptorsSimple(1, visible, cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            list.list.SetDescriptorHeaps(&[Some(views.visible.clone())]);
+            if float {
+                let floats = values.map(f32::from_bits);
+                list.list
+                    .ClearUnorderedAccessViewFloat(gpu, cpu, &texture, &floats, rects.unwrap_or(&[]));
+            } else {
+                list.list
+                    .ClearUnorderedAccessViewUint(gpu, cpu, &texture, values, rects.unwrap_or(&[]));
+            }
+        }
+        state.heaps_changed();
+    });
+    #[cfg(not(windows))]
+    let _ = (this, gpu, handle, values, count, rects, float);
+}
+
 /// `ClearDepthStencilView(handle, flags, depth, stencil, count, rects)`;
 /// flags: 1 depth, 2 stencil.
 extern "system" fn clear_dsv(
@@ -2139,10 +2287,12 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
+const MORE_METHODS: [(usize, *const ()); 11] = [
     (28, query_mark as *const ()),             // 0xe0 BeginQuery
     (29, query_mark as *const ()),             // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
+    (53, clear_uav_uint as *const ()),         // 0x1a8
+    (54, clear_uav_float as *const ()),        // 0x1b0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
     (99, driver_hint as *const ()),            // 0x318
