@@ -2,8 +2,8 @@
 //! with the Windows SDK's `dxc` into the build's output: the repository holds
 //! only the source (docs/asset-policy.md). Without a compiler the output is
 //! empty, no mesh pipeline gets the stage, and mesh draws go the plain way.
-//! With the diagnostics feature, likewise the overlay's shaders
-//! (`src/overlay.hlsl`); without them there is no overlay or view.
+//! Likewise the overlay's shaders (`src/overlay.hlsl`), with the view's in
+//! diagnostics builds; without them there is no overlay or view.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,21 +22,21 @@ fn main() {
     }
     let overlay = "src/overlay.hlsl";
     println!("cargo:rerun-if-changed={overlay}");
+    let mut entries = vec![("vs_6_0", "corners"), ("ps_6_0", "panel")];
     if std::env::var_os("CARGO_FEATURE_DIAGNOSTICS").is_some() {
-        let entries = [
-            ("vs_6_0", "corners"),
-            ("ps_6_0", "text"),
+        entries.extend([
+            ("vs_6_0", "view_corners"),
             ("ps_6_0", "view"),
             ("cs_6_0", "reset"),
             ("cs_6_0", "reduce"),
-        ];
-        let mut built = true;
-        for (target, entry) in entries {
-            built &= compile(dxc.as_deref(), overlay, target, entry, &out_dir.join(format!("overlay-{entry}.dxil")));
-        }
-        if !built {
-            println!("cargo:warning=the overlay's shaders did not compile: no overlay or view");
-        }
+        ]);
+    }
+    let mut built = true;
+    for (target, entry) in entries {
+        built &= compile(dxc.as_deref(), overlay, target, entry, &out_dir.join(format!("overlay-{entry}.dxil")));
+    }
+    if !built {
+        println!("cargo:warning=no Windows SDK dxc.exe (or VICTORY_PC_DXC), or the overlay's shaders did not compile: no overlay");
     }
 }
 
