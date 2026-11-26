@@ -244,22 +244,30 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// (NVIDIA) refused the whole texture, so every pass that wrote it drew
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
+/// The same for the shared-exponent R9G9B9E5 (67), a full-screen target of
+/// the title's Series S profile that no PC GPU renders to (the typed null
+/// view standing for the refused texture removed the device): R11G11B10
+/// float stands in, 32 bits, unsigned and without alpha like it, with
+/// 6/6/5-bit mantissas for its shared 9.
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
-/// shortcut: copies between such a target and a texture the title fills
-/// itself in the 16-bit format are skipped ([`stands_in`]); convert them
-/// if a pass turns out to need one.
+/// shortcut: a stand-in's texels are not the title's bits, so nothing moves
+/// them as bytes: copies between such a target and a texture in the
+/// console format are skipped ([`stands_in`]), read backs of it into title
+/// memory are refused, and a view placed in its memory in another format
+/// reads title memory ([`alias_of`]); each is logged. Convert them if a
+/// pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 26)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
-            STAND_INS.map(|(f, _)| {
+            STAND_INS.map(|(f, stand_in)| {
                 let Some(host) = crate::host::host() else {
                     return false;
                 };
@@ -279,7 +287,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                    tracing::info!(format = f, stand_in, "the host does not render to this format");
                 }
                 refused
             })
@@ -1232,6 +1240,15 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
     let other = *targets.get(&(r.data() as u64))? as This;
     let o = resource(other);
+    // A stand-in target's texels are not the title's bits ([`target_format`]).
+    if target_format(o.desc.format) != o.desc.format {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(view = ?this, target = ?other, format = r.desc.format, target_format = o.desc.format,
+                "a view placed in a stand-in target's memory reads title memory")
+        });
+        return None;
+    }
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
         && o.desc.dimension == r.desc.dimension
@@ -1240,7 +1257,6 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.mip_levels == r.desc.mip_levels
         && o.desc.depth_or_array_size == r.desc.depth_or_array_size
         && o.desc.flags & DEPTH == 0
-        && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
     same.then_some(other)
 }
@@ -2699,6 +2715,42 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
+    }
+
+    /// A shared-exponent (R9G9B9E5) target, which the Series S profile
+    /// renders to and PC GPUs do not, has a host copy, and the title's
+    /// target views in its format, of it and of no texture (a typed null
+    /// view), leave the device be. The null view in the console format
+    /// removed the device.
+    #[cfg(windows)]
+    #[test]
+    fn a_shared_exponent_target_has_a_host_copy() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        const TARGET_AND_UNORDERED: u32 = 5;
+        let desc = ResourceDesc {
+            flags: TARGET_AND_UNORDERED,
+            ..texture(64, 64, 67, 1)
+        };
+        let mut image = null;
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut image),
+            S_OK
+        );
+        let copy = host_resource(image).expect("a host copy of the target");
+        // SAFETY: a live resource.
+        assert_eq!(unsafe { copy.GetDesc() }.Format.0 as u32, target_format(67));
+        let view = [67u32, 4, 0, 0, 0, 0];
+        for resource in [image, null] {
+            let mut slot = [0u8; 112];
+            crate::descriptor::create_rtv(null, resource, &view, slot.as_mut_ptr() as u64);
+            let record = crate::descriptor::rtv_record(slot.as_ptr() as u64).unwrap();
+            host.rtv(host_resource(record.resource), record.desc().as_ref());
+        }
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets

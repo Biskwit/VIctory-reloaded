@@ -1089,6 +1089,11 @@ fn read_back(
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+    // shortcut: a stand-in's texels are not the title's bits
+    // (`crate::resource::target_format`).
+    if crate::resource::stands_in(src.resource) {
+        return Err("a target in a stand-in format");
+    }
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
