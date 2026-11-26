@@ -43,6 +43,12 @@ if ($Machine -eq '7900xtx') {
     # console-like picture of our earlier tree; 0.2 is the least tried without
     # the purple probe blocks that no stand-in leaves, at the same frame time.
     $settings.VICTORY_AMBIENT = '0.2'
+    # Title buffers from 64 KiB up, not 1 MiB, get a copy in the card's own
+    # memory: in the PC's memory every load a shader makes of them crosses
+    # the bus. A replay of the Series S cell: 34.7 -> 24.3 ms on the card;
+    # live on an i9-12900K the card was busy 46 -> 28 ms a frame and the
+    # frame went 58.0 -> 52.5 ms; the card's memory in use grew 0.4 GB.
+    $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
     if (-not $Safe) {
         # Pages are mapped by several threads only while the title streams
         # (not the default: one run behind it).
