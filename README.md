@@ -48,7 +48,29 @@ nothing from the game goes in the tree.*
     `VICTORY_COMPUTE_WAIT`): cold launches kept the main character's head;
   - the control file, live switches, the texture view and window shots
     (diagnostics builds);
-  - PIX captures taken from inside the run (diagnostics builds).
+  - PIX captures taken from inside the run (diagnostics builds);
+  - Series S speed on a PC with an i9-12900K (24 logical processors: 8 fast
+    cores of two threads, 8 slow ones) and the RTX 4090, measured in the
+    prologue's cell with frame replays and launches (table below):
+    - title buffers from 64 KiB up get a copy in the card's own memory, not
+      from 1 MiB (`VICTORY_CARD_BUFFERS_MIN_KB=64` in `play.ps1`'s 4090
+      block): in the PC's memory every load a shader makes of them crosses
+      the bus. A frame replay spent 34.7 ms on the card, 24.3 with them on it;
+      live (on a trial merge of Vice-Tay's newer main) the card was busy 17 ms
+      less a frame, for 0.4 GB of its memory;
+    - fewer worker threads where the processor has fewer than 32 logical
+      ones (8/6/3 list, under-write and landing threads instead of 12/8/6):
+      more of them than the fast cores run made the submitting thread, which
+      a frame waits for, share its core; 58.0-60.4 -> 54.3-56.1 ms a frame on
+      that trial merge;
+    - `XMemAllocDefault` blocks of 1 MiB and more are write-watched memory of
+      their own, not the host heap's (`VICTORY_XMEM_WATCHED=0`: as before): a
+      21 MB block that shaders write was copied whole twice a frame (42 MB,
+      4.4 ms on the frame's path) and sent up to the card as often;
+    - the frame replay makes the buffers of heaps opened from memory and of
+      heaps made not resident (it lost the card on this capture), and with
+      `--breadcrumbs` names the list, breadcrumb and resource a lost card
+      stopped at.
 - **Not brought over (yet)** from our earlier tree (fxceless's fork with about
   140 commits of ours): its FidelityFX SDK path for the Series S upscale
   (Vice-Tay translates FSR 4's own code) and its other rendering fixes, which
@@ -59,6 +81,20 @@ nothing from the game goes in the tree.*
   Vice-Tay changes most, its module name is taken by Vice-Tay's frame replay,
   and Vice-Tay's `victory replay` ([docs/replay.md](docs/replay.md)) already
   re-translates, swaps and skips shaders and finds what draws a pixel.
+
+### Series S on our PC
+
+i9-12900K, RTX 4090, 64 GB, `scripts\play.ps1` (its 4090 block), the
+prologue's cell, warm launches; medians of the log's frame lines once the
+scene has settled (frames 1300-3600). Vice-Tay's own measurements, on its
+Ryzen 9 9950X3D, are below the line.
+
+| Build | fps: median (p10) | ms a frame | preparing / card busy / copying back |
+|---|---|---|---|
+| before (4fa2f0b), 2 launches | 17.4 (16.7) | 57.5 | 45.5 / 43.8 / 24.1 |
+| after (the three changes above), 3 launches | 19.9 (19.0) | 50.3 | 40.0 / 30.8 / 26.5 |
+| after, the gate: 1 cold launch on a fresh cache and 3 warm ones | 19.8 (18.8) | 50.5 | 40.7 / 31.0 / 25.8 |
+| after, the gate's 15-minute warm session | 20.9 (19.9) | 47.8 | 37.9 / 29.6 / 21.5 |
 
 ## The overlay
 

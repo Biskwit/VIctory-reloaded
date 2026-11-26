@@ -38,11 +38,30 @@ if ($Machine -eq '7900xtx') {
     # NVIDIA sets its clocks by the driver's power mode: no spinner on the
     # compute queue. 16 cores record and land, not 8.
     $settings.VICTORY_THIN_THREADS = '12'; $settings.VICTORY_UNDER_THREADS = '8'; $settings.VICTORY_LAND_THREADS = '6'
+    if ([Environment]::ProcessorCount -lt 32) {
+        # Fewer logical processors than the 9950X3D's 32: an i9-12900K has 24
+        # (8 fast cores of two threads, 8 slow ones), and 12/8/6 ran more of
+        # our threads beside the submitting one than its cores have. Series S
+        # cell, RTX 4090 with an i9-12900K (Vice-Tay 22c6eac merged in): 8/6/3
+        # took the frame 58.0-60.4 -> 54.3-56.1 ms (the submitting thread's
+        # own work 31 -> 27 ms of CPU); 6/4/3 with VICTORY_MAP_THREADS=1 gained
+        # nothing (59.2). With the card buffers below and write-watched XMem
+        # blocks, on 4fa2f0b: 57.3-57.6 -> 49.4-51.5 ms (README, our PC).
+        $settings.VICTORY_THIN_THREADS = '8'; $settings.VICTORY_UNDER_THREADS = '6'; $settings.VICTORY_LAND_THREADS = '3'
+    }
     # A fifth of the ambient estimate, not 0.8: in the prologue's cell on this
     # card 0.8 lit the wall and the dark right side 2-3 times as bright as the
     # console-like picture of our earlier tree; 0.2 is the least tried without
     # the purple probe blocks that no stand-in leaves, at the same frame time.
     $settings.VICTORY_AMBIENT = '0.2'
+    # Title buffers from 64 KiB up, not 1 MiB, get a copy in the card's own
+    # memory: in the PC's memory every load a shader makes of them crosses
+    # the bus. A replay of the Series S cell: 34.7 -> 24.3 ms on the card;
+    # live on an i9-12900K the card was busy 46 -> 28 ms a frame and the
+    # frame went 58.0 -> 52.5 ms (Vice-Tay 22c6eac merged in); on 4fa2f0b
+    # with the threads above and write-watched XMem blocks the card is busy
+    # 27-35 ms of a 49-52 ms frame. The card's memory in use grew 0.4 GB.
+    $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
     if (-not $Safe) {
         # Pages are mapped by several threads only while the title streams
         # (not the default: one run behind it).
