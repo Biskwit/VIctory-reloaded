@@ -36,6 +36,9 @@ nothing from the game goes in the tree.*
     the early list still starts the early ones while the title loads: the
     cell scene comes about 14 s later (`VICTORY_LIBRARY_LOAD=1` loads it);
   - translated shaders carry a real shader hash part instead of zeros;
+  - indirect dispatches of more than 65,535 groups run whole on NVIDIA too,
+    as they did on AMD only: cut, the Series X cell scene showed rows of
+    blocks at its bottom right (`VICTORY_INDIRECT_WIDE=0` cuts them);
   - compute pipelines a dispatch asks for made first, and waited for within
     a cap, instead of dropped behind the draws' (`VICTORY_COMPUTE_FIRST=0`,
     `VICTORY_COMPUTE_WAIT`): cold launches kept the main character's head;
