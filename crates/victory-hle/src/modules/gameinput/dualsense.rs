@@ -157,7 +157,8 @@ mod host {
         SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
     };
     use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-        HIDD_ATTRIBUTES, HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid,
+        HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS, HidD_FreePreparsedData,
+        HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid, HidD_GetPreparsedData, HidP_GetCaps,
     };
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
@@ -225,6 +226,37 @@ mod host {
             .collect()
     }
 
+    /// Windows sizes each report buffer for its top-level HID collection.
+    /// The calibration and pairing reports use the same feature buffer.
+    struct Reports {
+        input: Vec<u8>,
+        feature: Vec<u8>,
+    }
+
+    impl Reports {
+        fn for_device(handle: HANDLE) -> Option<Self> {
+            let mut data = 0;
+            // SAFETY: the device is open and the output is writable.
+            if !unsafe { HidD_GetPreparsedData(handle, &mut data) } {
+                return None;
+            }
+            let mut caps = HIDP_CAPS::default();
+            // SAFETY: `data` was obtained above and is released after its last use.
+            let status = unsafe { HidP_GetCaps(data, &mut caps) };
+            unsafe { HidD_FreePreparsedData(data) };
+            if status != HIDP_STATUS_SUCCESS
+                || caps.InputReportByteLength == 0
+                || caps.FeatureReportByteLength == 0
+            {
+                return None;
+            }
+            Some(Self {
+                input: vec![0; usize::from(caps.InputReportByteLength)],
+                feature: vec![0; usize::from(caps.FeatureReportByteLength)],
+            })
+        }
+    }
+
     /// Feature report `id` into `buffer` (its first byte), `false` when the
     /// pad did not answer. A round trip to the pad, so over Bluetooth it also
     /// tells whether the pad is still there.
@@ -238,8 +270,8 @@ mod host {
     /// Asks for the calibration report: it switches a pad on Bluetooth to
     /// full reports (0x31), again after it reconnected; over USB it changes
     /// nothing. `false` when the pad did not answer.
-    fn full_reports(handle: HANDLE) -> bool {
-        feature(handle, 0x05, &mut [0; 41])
+    fn full_reports(handle: HANDLE, buffer: &mut [u8]) -> bool {
+        feature(handle, 0x05, buffer)
     }
 
     /// Opens the pads not open yet, each with a reader thread.
@@ -272,21 +304,20 @@ mod host {
             {
                 continue;
             }
-            let Some(handle) = open(&path) else {
+            let Some((handle, mut reports)) = open(&path) else {
                 continue;
             };
             let bluetooth = lower.contains("{00001124-");
             // A paired pad that is switched off can still be listed over
             // Bluetooth: it does not answer.
-            if !full_reports(handle) {
+            if !full_reports(handle, &mut reports.feature) {
                 tracing::debug!(path = %lower, "DualSense listed but not answering");
                 // SAFETY: just opened, nothing else has it.
                 unsafe { CloseHandle(handle) };
                 continue;
             }
-            let mut pairing = [0u8; 20];
-            let mac = if feature(handle, 0x09, &mut pairing) {
-                mac(&pairing)
+            let mac = if feature(handle, 0x09, &mut reports.feature) {
+                mac(&reports.feature)
             } else {
                 None
             };
@@ -321,7 +352,7 @@ mod host {
             let raw = handle as usize;
             if let Err(error) = std::thread::Builder::new()
                 .name("DualSense reader".into())
-                .spawn(move || read(raw as HANDLE, id, bluetooth))
+                .spawn(move || read(raw as HANDLE, id, bluetooth, reports))
             {
                 lock().retain(|pad| pad.id != id);
                 // SAFETY: just opened, and no reader has it.
@@ -332,7 +363,7 @@ mod host {
     }
 
     /// Reads reports until the pad goes away, then forgets it.
-    fn read(handle: HANDLE, id: u64, bluetooth: bool) {
+    fn read(handle: HANDLE, id: u64, bluetooth: bool, mut reports: Reports) {
         let set = |state: Option<PadState>| {
             if let Some(pad) = lock().iter_mut().find(|pad| pad.id == id) {
                 pad.state = state;
@@ -340,7 +371,6 @@ mod host {
         };
         // SAFETY: an unnamed manual-reset event; no security attributes.
         let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-        let mut report = [0u8; 128];
         let why = 'pad: loop {
             if event.is_null() {
                 break 'pad "no event";
@@ -354,8 +384,8 @@ mod host {
             let started = unsafe {
                 ReadFile(
                     handle,
-                    report.as_mut_ptr(),
-                    report.len() as u32,
+                    reports.input.as_mut_ptr(),
+                    reports.input.len() as u32,
                     std::ptr::null_mut(),
                     &mut overlapped,
                 )
@@ -381,9 +411,9 @@ mod host {
                 // Silent: whatever was held is not held any more, and the
                 // pad may be gone without the read failing.
                 set(None);
-                if !full_reports(handle) {
+                if !full_reports(handle, &mut reports.feature) {
                     // SAFETY: cancel the read and wait for it to end, so
-                    // nothing writes into `report` once we return.
+                    // nothing writes into the input buffer once we return.
                     unsafe {
                         CancelIoEx(handle, &overlapped);
                         GetOverlappedResult(handle, &overlapped, &mut got, 1);
@@ -391,7 +421,7 @@ mod host {
                     break 'pad "not answering";
                 }
             }
-            if let Some(state) = parse(&report[..got as usize], bluetooth) {
+            if let Some(state) = parse(&reports.input[..got as usize], bluetooth) {
                 set(Some(state));
             }
         };
@@ -408,7 +438,7 @@ mod host {
 
     /// The pad at `path` opened for reading, `None` when it is something else
     /// or cannot be opened.
-    fn open(path: &[u16]) -> Option<HANDLE> {
+    fn open(path: &[u16]) -> Option<(HANDLE, Reports)> {
         let mut name = path.to_vec();
         name.push(0);
         // SAFETY: a terminated path; no security attributes or template.
@@ -434,12 +464,12 @@ mod host {
         let ours = unsafe { HidD_GetAttributes(handle, &mut attributes) }
             && attributes.VendorID == SONY
             && PRODUCTS.contains(&attributes.ProductID);
-        if !ours {
-            // SAFETY: just opened.
-            unsafe { CloseHandle(handle) };
-            return None;
+        if ours && let Some(reports) = Reports::for_device(handle) {
+            return Some((handle, reports));
         }
-        Some(handle)
+        // SAFETY: just opened.
+        unsafe { CloseHandle(handle) };
+        None
     }
 
     /// The device paths of the HID devices present, without terminators.
