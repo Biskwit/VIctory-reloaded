@@ -53,7 +53,7 @@ Speed:
 - Translated shaders are keyed by the translator's sources, so a rebuild of the rest keeps the shader cache.
 
 On screen:
-- **Overlay on the game, in every build.** On by default (`VICTORY_OVERLAY=0` hides it): a table at the top left with frames per second and time per frame (green from 15 fps, amber from 10, red below), where the frame's time goes (CPU prep, GPU, copy-back), draws, dispatches, dropped draws, the shader and pipeline caches, and VRAM.
+- **Overlay on the game, in every build.** On by default (`VICTORY_OVERLAY=0` hides it): a compact table at the top left, in Consolas from Windows, with the console profile (Series X or S), frames per second and time per frame (green from 15 fps, amber from 10, red below), where the frame's time goes (CPU prep, GPU, copy-back), draws, dropped draws and VRAM.
 
 Debugging (diagnostics builds, see below):
 - **Control file to steer a running game:** live switches, screenshots, render-target dumps, viewing any render target on screen, repairs, PIX captures.
@@ -234,7 +234,7 @@ is deleted:
 
 | Command | Effect |
 |---------|--------|
-| `overlay on` / `overlay off` | shows or hides the overlay (on by default); in these builds it also lists the live switches set |
+| `overlay on` / `overlay off` | shows or hides the overlay (on by default); in these builds it adds a smaller block: dispatches, shader and pipeline caches, pipelines compiling, shared memory, the live switches set |
 | `view <n> [r\|g\|b\|a\|rgb]` / `view <0xaddress> [...]` / `view off` | presents the frame's `n`-th target (first-use order, as `dump` numbers them) or a texture by address instead of the frame; floats and depth normalized as dumps are |
 | `targets` | logs the next frame's targets: number, address, size, format |
 | `shot [name]` | saves what the window shows (without the overlay) as `<name>.png` in `VICTORY_CAPTURE`, else beside the control file |

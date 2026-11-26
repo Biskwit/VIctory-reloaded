@@ -2,19 +2,26 @@
 //! copied into the window's buffer and before it is presented
 //! (`crate::host::Host::present`): the overlay, in every build, on unless
 //! `VICTORY_OVERLAY=0` (in diagnostics builds, `overlay on|off` of
-//! `crate::control` too). It is a table on a dark panel at the top left, in
-//! a bitmap font of our own: frames a second and time a frame twice as
-//! big, green from the 15 a second aimed at, amber from 10, red below; then
-//! groups of rows, a grey label on the left and its value in white against
-//! the right edge: where a frame's time goes, with bars of its share of the
-//! frame; the work a frame; the shader and pipeline caches; the card's
-//! memory; in diagnostics builds the live switches set (`crate::live`) and
-//! the view's line ([`view`]).
+//! `crate::control` too). It is a compact table on a dark panel at the top
+//! left: the console the title sees; frames a second and time a frame in
+//! large type, green from the 15 a second aimed at, amber from 10, red
+//! below; where a frame's time goes, with bars of its share of the frame;
+//! draws, dropped draws and the card's memory, a grey label on the left and
+//! its value in white against the right edge. Diagnostics builds add a
+//! block in smaller type: dispatches, the shader and pipeline caches,
+//! shared memory, the live switches set (`crate::live`) and the view's line
+//! ([`view`]).
+//!
+//! Text is Consolas, which ships with Windows, drawn by GDI with grey
+//! anti-aliasing into an atlas when the overlay first draws (and again when
+//! the window's height changes), at sizes that follow the window's height;
+//! the shader blends its ink by the atlas's coverage, a pixel for a pixel.
+//! Without Consolas our own 5x8 bitmap font takes its place.
 //!
 //! The shaders are `overlay.hlsl`, compiled by the build script. The rows
 //! are made when the frame line's figures change, once a second
 //! (`crate::host`'s meter); every present replays their draws, a rectangle
-//! each: the panel, its lines and bars, and a draw a row of text.
+//! each: the panel, its lines and bars, and a draw a label or value.
 
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
@@ -57,32 +64,35 @@ const LINE: usize = 128;
 struct Constants {
     rect: [f32; 4],
     target: [f32; 2],
-    colours: [u32; 2],
+    style: [u32; 2],
     head: [u32; 4],
     words: [u32; LINE / 4],
 }
 
-/// The root parameters: the constants (both root signatures), the font.
+/// The root parameters: the constants (both root signatures), the atlas.
 const DRAW: u32 = 0;
 const FONT: u32 = 1;
 
-/// A character's width in font pixels (`CELL_WIDTH` in overlay.hlsl), and
-/// a glyph's height.
-const CELL: u32 = 6;
-const GLYPH: u32 = 8;
+/// The atlas's faces: the big figures, the rows, the diagnostics block.
+const BIG: usize = 0;
+const MAIN: usize = 1;
+const SMALL: usize = 2;
 
-/// The table's measures in font pixels: from the window's corner to the
-/// panel, from the panel's edges to the rows (across, down), a row's pitch
-/// (its glyphs 2 down), the big row's, a rule's (its line 3 down).
-const MARGIN: u32 = 6;
-const PAD: [u32; 2] = [6, 4];
-const ROW: u32 = 12;
-const BIG_ROW: u32 = 20;
-const RULE_ROW: u32 = 7;
+/// Pixels an em of each face in a window 1080 pixels high; more or fewer
+/// with the window's height.
+const EMS: [u32; 3] = [24, 14, 12];
 
-/// The table's width in characters at least; a bar's; the value column
-/// beside bars ("100.0 ms").
-const NARROWEST: usize = 32;
+/// A face of the atlas: the cell of its glyphs in pixels (one for all: the
+/// fonts are monospaced) and the byte where its first glyph starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Face {
+    cell: [u32; 2],
+    base: u32,
+}
+
+/// The table's width in characters of the main face at least, a bar's,
+/// and the value column beside bars ("100.0 ms").
+const NARROWEST: usize = 26;
 const BAR_CHARS: usize = 8;
 const BAR_VALUE: usize = 8;
 
@@ -92,12 +102,13 @@ const fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
     u32::from_le_bytes([r, g, b, a])
 }
 
-const BACKGROUND: u32 = rgba(8, 10, 14, 216);
-const RULE: u32 = rgba(255, 255, 255, 48);
+const BACKGROUND: u32 = rgba(10, 12, 16, 216);
+const RULE: u32 = rgba(255, 255, 255, 40);
 const TRACK: u32 = rgba(255, 255, 255, 28);
 const BAR: u32 = rgba(96, 165, 250, 255);
-const LABEL: u32 = rgba(160, 168, 180, 255);
+const LABEL: u32 = rgba(150, 158, 170, 255);
 const VALUE: u32 = rgba(240, 242, 245, 255);
+const DETAIL: u32 = rgba(196, 202, 210, 255);
 const GREEN: u32 = rgba(90, 255, 115, 255);
 const AMBER: u32 = rgba(255, 199, 64, 255);
 const RED: u32 = rgba(255, 89, 77, 255);
@@ -124,7 +135,8 @@ pub(crate) fn set_on(on: bool) {
 }
 
 /// The glyphs of characters 32 (space) to 126 (`~`), drawn for this
-/// overlay: 8 rows a glyph, top first, its 5 columns in bits 4 (left) to 0.
+/// overlay where Windows has no Consolas ([`bitmap`]): 8 rows a glyph, top
+/// first, its 5 columns in bits 4 (left) to 0.
 /// Capitals and digits stand on rows 0-6; row 7 holds descenders.
 #[rustfmt::skip]
 const GLYPHS: [[u8; 8]; 95] = [
@@ -277,19 +289,167 @@ fn pack(line: &str) -> ([u32; LINE / 4], u32) {
     (words, bytes.len() as u32)
 }
 
+/// The bitmap font as the atlas holds a face ([`atlas`]): each font pixel
+/// `scale` pixels, in cells of 6x10 font pixels (a column and a row each
+/// side of the 5x8 glyph but the right).
+fn bitmap(scale: u32) -> (Vec<u8>, [u32; 2]) {
+    let [w, h] = [6 * scale, 10 * scale];
+    let mut glyphs = Vec::with_capacity(GLYPHS.len() * (w * h) as usize);
+    for glyph in &GLYPHS {
+        for y in 0..h {
+            for x in 0..w {
+                let (x, y) = (x / scale, y / scale);
+                let on = (1..=8).contains(&y) && x < 5 && glyph[y as usize - 1] >> (4 - x) & 1 != 0;
+                glyphs.push(if on { 255 } else { 0 });
+            }
+        }
+    }
+    (glyphs, [w, h])
+}
+
+/// Characters 32 to 126 in Consolas at `em` pixels an em, anti-aliased in
+/// grey, as the atlas holds a face ([`atlas`]), and their cell: Consolas's
+/// advance by its height. `None` if Windows has no Consolas.
+fn consolas(em: u32) -> Option<(Vec<u8>, [u32; 2])> {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::*;
+    use windows::core::{PCWSTR, w};
+    // SAFETY: a memory device context, font and DIB section of our own,
+    // released before returning; the DIB's bits are read once GDI has
+    // drawn (GdiFlush) and while the section lives.
+    unsafe {
+        let dc = CreateCompatibleDC(None);
+        if dc.is_invalid() {
+            return None;
+        }
+        let font = CreateFontW(
+            -(em as i32),
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_TT_ONLY_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            ANTIALIASED_QUALITY,
+            u32::from(FIXED_PITCH.0 | FF_MODERN.0),
+            w!("Consolas"),
+        );
+        let old_font = SelectObject(dc, font.into());
+        let mut name = [0u16; 32];
+        let named = GetTextFaceW(dc, Some(&mut name)).max(0) as usize;
+        let mut metrics = TEXTMETRICW::default();
+        // GDI gives another face when it has no Consolas.
+        let found = String::from_utf16_lossy(&name[..named.min(name.len())])
+            .trim_end_matches('\0')
+            .eq_ignore_ascii_case("Consolas")
+            && GetTextMetricsW(dc, &mut metrics).as_bool();
+        let [w, h] = [
+            metrics.tmAveCharWidth.max(0) as u32,
+            metrics.tmHeight.max(0) as u32,
+        ];
+        let wide = w * GLYPHS.len() as u32;
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: wide as i32,
+                // Top row first.
+                biHeight: -(h as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let section = (found && w > 0 && h > 0)
+            .then(|| CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok())
+            .flatten();
+        let mut made = None;
+        if let Some(section) = section {
+            let old_bitmap = SelectObject(dc, section.into());
+            SetTextColor(dc, COLORREF(0x00ff_ffff));
+            SetBkColor(dc, COLORREF(0));
+            SetBkMode(dc, OPAQUE);
+            let text: Vec<u16> = (32..=126).collect();
+            let advances = vec![w as i32; text.len()];
+            let drawn = ExtTextOutW(
+                dc,
+                0,
+                0,
+                ETO_OPTIONS(0),
+                None,
+                PCWSTR(text.as_ptr()),
+                text.len() as u32,
+                Some(advances.as_ptr()),
+            );
+            let _ = GdiFlush();
+            if drawn.as_bool() {
+                // White on black, grey anti-aliasing: any channel is the
+                // coverage; green, of blue, green, red, unused.
+                let pixels = std::slice::from_raw_parts(bits.cast::<u8>(), (wide * h * 4) as usize);
+                let mut glyphs = Vec::with_capacity((wide * h) as usize);
+                for glyph in 0..GLYPHS.len() as u32 {
+                    for y in 0..h {
+                        for x in 0..w {
+                            glyphs.push(pixels[((y * wide + glyph * w + x) * 4 + 1) as usize]);
+                        }
+                    }
+                }
+                made = Some((glyphs, [w, h]));
+            }
+            SelectObject(dc, old_bitmap);
+            let _ = DeleteObject(section.into());
+        }
+        SelectObject(dc, old_font);
+        let _ = DeleteObject(font.into());
+        let _ = DeleteDC(dc);
+        made
+    }
+}
+
+/// The atlas for a window `height` pixels high, and its faces (big, main,
+/// small): Consolas at [`EMS`] pixels an em for 1080, or the bitmap font if
+/// Windows has none. A face is characters 32 to 126, a byte of coverage a
+/// pixel, glyph after glyph, each row after row (as the shader reads it).
+fn atlas(height: u32) -> (Vec<u8>, [Face; 3]) {
+    let ems = EMS.map(|em| ((em * height + 540) / 1080).max(8));
+    let glyphs = match ems.map(consolas) {
+        [Some(big), Some(main), Some(small)] => [big, main, small],
+        _ => {
+            tracing::warn!("no Consolas: the overlay draws with its bitmap font");
+            let scale = (height / 1080).max(1);
+            [bitmap(2 * scale), bitmap(scale), bitmap(scale)]
+        }
+    };
+    let mut bytes = Vec::new();
+    let faces = glyphs.map(|(glyphs, cell)| {
+        let base = bytes.len() as u32;
+        bytes.extend(glyphs);
+        Face { cell, base }
+    });
+    (bytes, faces)
+}
+
 /// A row of the table.
 #[derive(Debug, Clone, PartialEq)]
 enum Row {
-    /// Text in white.
+    /// The overlay's name, and the console the title sees.
     Title(&'static str),
-    /// Two figures at the row's ends, twice as big, in a colour.
+    /// Two figures at the row's ends in the big face, in a colour.
     Big(String, String, u32),
     /// A label and its value against the right edge; with a share (0 to 1),
     /// a bar of it between them.
     Item(&'static str, String, Option<f64>),
+    /// A label and its value in the small face.
+    Detail(&'static str, String),
     /// A thin line between groups.
     Rule,
-    /// Grey text across the table, in lines that fit it.
+    /// Grey text in the small face, in lines that fit the table.
     Note(String),
 }
 
@@ -298,14 +458,12 @@ enum Row {
 enum Shape {
     /// A rectangle (left, top, right, bottom) filled with a colour.
     Fill([u32; 4], u32),
-    /// Text: its glyphs' top left, pixels a font pixel, the characters, the
-    /// column from which they take the second colour, the colours.
+    /// Text: its cells' top left, its face, the characters, the colour.
     Text {
         at: [u32; 2],
-        scale: u32,
+        face: usize,
         text: String,
-        split: usize,
-        colours: [u32; 2],
+        colour: u32,
     },
 }
 
@@ -322,43 +480,40 @@ fn fps_colour(fps: f64) -> u32 {
 }
 
 /// What the table shows besides the frame line, read when its rows are
-/// made: shaders found in the cache and translated, host pipelines loaded
-/// from the library and made, those being made, the library's bytes, the
-/// card's memory (`Host::video_memory`).
+/// made: the console the title sees, shaders found in the cache and
+/// translated, host pipelines loaded from the library and made, those
+/// being made, the card's memory (`Host::video_memory`).
 struct Counts {
+    console: &'static str,
     shaders: (u64, u64),
     pipelines: [u64; 2],
     making: u64,
-    library: u64,
     memory: Option<[u64; 4]>,
 }
 
 impl Counts {
     fn now(host: &Host) -> Counts {
+        let console = crate::console::current().name();
         Counts {
+            console: console.strip_prefix("Xbox ").unwrap_or(console),
             shaders: crate::shader_cache::counts(),
             pipelines: crate::pipeline::library_pipelines(),
             making: crate::pipeline::making(),
-            library: crate::pipeline::kept()[4],
             memory: host.video_memory(),
         }
     }
 }
 
-/// The table's rows: `line`'s figures, `counts`, and the live switches set.
-fn rows(line: &FrameLine, counts: &Counts, live: &[(&'static str, String)]) -> Vec<Row> {
+/// The table's rows: `line`'s figures and `counts`; with `details` (the
+/// live switches set), the diagnostics block.
+fn rows(line: &FrameLine, counts: &Counts, details: Option<&[(&'static str, String)]>) -> Vec<Row> {
     const GB: f64 = (1u64 << 30) as f64;
+    let gb = |bytes: u64| bytes as f64 / GB;
     let ms = |ms: f64| format!("{ms:.1} ms");
     // Each against the whole frame: they overlap.
     let share = |part: f64| Some(if line.ms > 0.0 { part / line.ms } else { 0.0 });
-    let (cached, translated) = counts.shaders;
-    let [loaded, made] = counts.pipelines;
-    let library = match counts.library >> 20 {
-        0 => "none".to_owned(),
-        mb => format!("{mb} MB"),
-    };
     let mut rows = vec![
-        Row::Title("VIctory-reloaded"),
+        Row::Title(counts.console),
         // Whole milliseconds: a clear gap after the frames a second.
         Row::Big(
             format!("{:.1} fps", line.fps),
@@ -371,61 +526,47 @@ fn rows(line: &FrameLine, counts: &Counts, live: &[(&'static str, String)]) -> V
         Row::Item("Copy-back", ms(line.back), share(line.back)),
         Row::Rule,
         Row::Item("Draws", format!("{:.0}", line.draws), None),
-        Row::Item("Dispatches", format!("{:.0}", line.dispatches), None),
         Row::Item("Dropped", format!("{:.0}", line.dropped), None),
         Row::Rule,
         Row::Item(
-            "Shaders",
-            format!("{cached} cached, {translated} new"),
+            "VRAM",
+            match counts.memory {
+                Some([budget, used, ..]) => format!("{:.2} / {:.2} GB", gb(used), gb(budget)),
+                None => "unknown".to_owned(),
+            },
             None,
         ),
-        Row::Item("Pipelines", format!("{loaded} cached, {made} new"), None),
-        Row::Item("Compiling", format!("{} pipelines", counts.making), None),
-        Row::Item("Pipeline cache", library, None),
-        Row::Rule,
     ];
-    match counts.memory {
-        Some([budget, used, _, shared]) => {
-            let gb = |bytes: u64| bytes as f64 / GB;
-            rows.push(Row::Item(
-                "VRAM",
-                format!("{:.2} / {:.2} GB", gb(used), gb(budget)),
-                None,
-            ));
-            rows.push(Row::Item(
+    if let Some(live) = details {
+        let (cached, translated) = counts.shaders;
+        let [loaded, made] = counts.pipelines;
+        rows.extend([
+            Row::Rule,
+            Row::Detail("Dispatches", format!("{:.0}", line.dispatches)),
+            Row::Detail("Shaders", format!("{cached} + {translated} new")),
+            Row::Detail("Pipelines", format!("{loaded} + {made} new")),
+            Row::Detail("Compiling", counts.making.to_string()),
+        ]);
+        if let Some([.., shared]) = counts.memory {
+            rows.push(Row::Detail(
                 "Shared memory",
                 format!("{:.2} GB", gb(shared)),
-                None,
             ));
         }
-        None => rows.push(Row::Item("VRAM", "unknown".to_owned(), None)),
-    }
-    if !live.is_empty() {
-        rows.push(Row::Rule);
         rows.extend(
             live.iter()
-                .map(|(name, value)| Row::Item(name, value.clone(), None)),
+                .map(|(name, value)| Row::Detail(name, value.clone())),
         );
     }
     rows
 }
 
-/// `left` and `right` on a line of `chars` characters, `right` against its
-/// end (cut to leave a space after `left`, which is cut to the line), and
-/// the column where `right` starts.
-fn spread(left: &str, right: &str, chars: usize) -> (String, usize) {
-    let left = &left[..left.len().min(chars)];
-    let room = chars.saturating_sub(left.len() + 1);
-    let right = &right[..right.len().min(room)];
-    let pad = chars - left.len();
-    (format!("{left}{right:>pad$}"), chars - right.len())
-}
-
-/// The shapes of `rows` at `scale` pixels a font pixel: the panel, then
-/// each row's. The rows are as wide as the widest needs, at least
-/// [`NARROWEST`] characters and an even count (the big row's halves), at
-/// most `room` characters.
-fn layout(rows: &[Row], scale: u32, room: usize) -> Vec<Shape> {
+/// The shapes of `rows` drawn with `faces`: the panel, then each row's.
+/// The rows are as wide as the widest needs, at least [`NARROWEST`]
+/// characters of the main face, at most `room` pixels; the panel's
+/// measures follow the main face.
+fn layout(rows: &[Row], faces: &[Face; 3], room: u32) -> Vec<Shape> {
+    let [cw, ch] = faces[MAIN].cell;
     let bars = || {
         rows.iter().filter_map(|row| match row {
             Row::Item(label, value, Some(_)) => Some((label.len(), value.len())),
@@ -438,11 +579,13 @@ fn layout(rows: &[Row], scale: u32, room: usize) -> Vec<Shape> {
         .max()
         .unwrap_or(0)
         .max(BAR_VALUE);
+    let chars = |face: usize, n: usize| n as u32 * faces[face].cell[0];
     let needs = |row: &Row| match row {
-        Row::Title(title) => title.len(),
-        Row::Big(left, right, _) => 2 * (left.len() + 1 + right.len()),
-        Row::Item(label, value, None) => label.len() + 2 + value.len(),
-        Row::Item(_, _, Some(_)) => bar_label + 1 + BAR_CHARS + 1 + bar_value,
+        Row::Title(console) => chars(MAIN, "VIctory-reloaded".len() + 2 + console.len()),
+        Row::Big(left, right, _) => chars(BIG, left.len() + 1 + right.len()),
+        Row::Item(label, value, None) => chars(MAIN, label.len() + 2 + value.len()),
+        Row::Item(_, _, Some(_)) => chars(MAIN, bar_label + 1 + BAR_CHARS + 1 + bar_value),
+        Row::Detail(label, value) => chars(SMALL, label.len() + 2 + value.len()),
         Row::Rule | Row::Note(_) => 0,
     };
     let width = rows
@@ -450,122 +593,140 @@ fn layout(rows: &[Row], scale: u32, room: usize) -> Vec<Shape> {
         .map(needs)
         .max()
         .unwrap_or(0)
-        .max(NARROWEST)
-        .next_multiple_of(2)
-        .min(room.min(LINE))
-        .max(1);
-    let u = scale;
-    let cell = CELL * u;
-    let left = (MARGIN + PAD[0]) * u;
-    // The last glyph's right edge: a cell's last column is a gap.
-    let right = left + width as u32 * cell - u;
-    // Bars run from a cell after the label column to a cell before the
+        .max(chars(MAIN, NARROWEST))
+        .min(room)
+        .max(cw);
+    let (margin, pad) = (ch / 2, [cw, ch / 3]);
+    let left = margin + pad[0];
+    let right = left + width;
+    // Bars run from a character after the label column to one before the
     // value column.
-    let from = left + (bar_label + 1) as u32 * cell;
-    let to = left + width.saturating_sub(bar_value + 1) as u32 * cell;
-    let text = |y: u32, scale: u32, (text, split): (String, usize), colours| Shape::Text {
-        at: [left, y + 2 * u],
-        scale,
-        text,
-        split,
-        colours,
-    };
+    let from = left + chars(MAIN, bar_label + 1);
+    let to = right.saturating_sub(chars(MAIN, bar_value + 1));
     let mut shapes = vec![Shape::Fill([0; 4], BACKGROUND)];
-    let mut y = (MARGIN + PAD[1]) * u;
+    let mut y = margin + pad[1];
+    // A label at the left and a value against the right edge, in `face`
+    // and its row's height; the value is cut to leave a space after the
+    // label, which is cut to the row.
+    let mut pair =
+        |y: &mut u32, face: usize, (label, value): (&str, &str), [ink, value_ink]: [u32; 2]| {
+            let room = (width / faces[face].cell[0]) as usize;
+            let (label, value) = (printable(label), printable(value));
+            let label = &label[..label.len().min(room)];
+            let value = &value[..value.len().min(room.saturating_sub(label.len() + 1))];
+            let text = |x, text: &str, colour| Shape::Text {
+                at: [x, *y],
+                face,
+                text: text.to_owned(),
+                colour,
+            };
+            shapes.push(text(left, label, ink));
+            if !value.is_empty() {
+                shapes.push(text(right - chars(face, value.len()), value, value_ink));
+            }
+            *y += faces[face].cell[1];
+        };
+    let mut fills = Vec::new();
+    let mut notes = Vec::new();
     for row in rows {
         match row {
-            Row::Title(title) => {
-                let title = printable(title);
-                shapes.push(text(y, u, (title.clone(), title.len()), [VALUE; 2]));
-                y += ROW * u;
+            Row::Title(console) => {
+                pair(&mut y, MAIN, ("VIctory-reloaded", console), [VALUE, LABEL])
             }
-            Row::Big(l, r, colour) => {
-                let line = spread(&printable(l), &printable(r), width / 2);
-                shapes.push(text(y, 2 * u, line, [*colour; 2]));
-                y += BIG_ROW * u;
-            }
+            Row::Big(l, r, colour) => pair(&mut y, BIG, (l.as_str(), r.as_str()), [*colour; 2]),
             Row::Item(label, value, bar) => {
                 if let Some(share) = bar
                     && to > from
                 {
-                    let (top, bottom) = (y + 3 * u, y + 8 * u);
-                    shapes.push(Shape::Fill([from, top, to, bottom], TRACK));
+                    let thick = (ch / 4).max(2);
+                    let top = y + (ch - thick) / 2;
+                    fills.push(Shape::Fill([from, top, to, top + thick], TRACK));
                     let filled = (f64::from(to - from) * share.clamp(0.0, 1.0)).round() as u32;
                     if filled > 0 {
-                        shapes.push(Shape::Fill([from, top, from + filled, bottom], BAR));
+                        fills.push(Shape::Fill([from, top, from + filled, top + thick], BAR));
                     }
                 }
-                let line = spread(&printable(label), &printable(value), width);
-                shapes.push(text(y, u, line, [LABEL, VALUE]));
-                y += ROW * u;
+                pair(&mut y, MAIN, (*label, value.as_str()), [LABEL, VALUE]);
+            }
+            Row::Detail(label, value) => {
+                pair(&mut y, SMALL, (*label, value.as_str()), [LABEL, DETAIL]);
             }
             Row::Rule => {
-                let top = y + 3 * u;
-                shapes.push(Shape::Fill([left, top, right, top + u.div_ceil(2)], RULE));
-                y += RULE_ROW * u;
+                let top = y + ch / 4;
+                fills.push(Shape::Fill(
+                    [left, top, right, top + (ch / 16).max(1)],
+                    RULE,
+                ));
+                y += ch / 2;
             }
             Row::Note(note) => {
-                for line in wrap(note, width) {
-                    let split = line.len();
-                    shapes.push(text(y, u, (line, split), [LABEL; 2]));
-                    y += ROW * u;
+                let room = (width / faces[SMALL].cell[0]) as usize;
+                for line in wrap(note, room) {
+                    notes.push(Shape::Text {
+                        at: [left, y],
+                        face: SMALL,
+                        text: line,
+                        colour: LABEL,
+                    });
+                    y += faces[SMALL].cell[1];
                 }
             }
         }
     }
-    shapes[0] = Shape::Fill(
-        [MARGIN * u, MARGIN * u, right + PAD[0] * u, y + PAD[1] * u],
-        BACKGROUND,
-    );
+    shapes[0] = Shape::Fill([margin, margin, right + pad[0], y + pad[1]], BACKGROUND);
+    shapes.splice(1..1, fills);
+    shapes.extend(notes);
     shapes
 }
 
-/// The shaders' constants for `shape` in a window of `size`.
-fn constants(shape: &Shape, size: [u32; 2]) -> Constants {
+/// The shaders' constants for `shape` drawn with `faces` in a window of
+/// `size`.
+fn constants(shape: &Shape, faces: &[Face; 3], size: [u32; 2]) -> Constants {
     let target = size.map(|s| s as f32);
     match shape {
         Shape::Fill(rect, colour) => Constants {
             rect: rect.map(|v| v as f32),
             target,
-            colours: [*colour, 0],
+            style: [*colour, 0],
             ..Default::default()
         },
         Shape::Text {
             at: [x, y],
-            scale,
+            face,
             text,
-            split,
-            colours,
+            colour,
         } => {
             let (words, count) = pack(text);
-            let (right, bottom) = (x + count * CELL * scale, y + GLYPH * scale);
+            let Face { cell: [w, h], base } = faces[*face];
             Constants {
-                rect: [*x as f32, *y as f32, right as f32, bottom as f32],
+                rect: [*x as f32, *y as f32, (x + count * w) as f32, (y + h) as f32],
                 target,
-                colours: *colours,
-                head: [*scale, count, *split as u32, 0],
+                style: [*colour, w | h << 8],
+                head: [count, base, 0, 0],
                 words,
             }
         }
     }
 }
 
-/// The panel's draws in a window of `size`, its font pixels a 540th of its
-/// height: `line`'s table (with the counts as they are now), if any, and
-/// `note` under it.
+/// The panel's draws in a window of `size` with `faces`: `line`'s table
+/// (with the counts as they are now), if any, and `note` under it.
 fn draws(
     host: &Host,
     line: Option<&FrameLine>,
     size: [u32; 2],
+    faces: &[Face; 3],
     note: Option<&str>,
 ) -> Vec<Constants> {
     let mut table = match line {
         Some(line) => {
             #[cfg(feature = "diagnostics")]
             let live = crate::live::active();
+            #[cfg(feature = "diagnostics")]
+            let details = Some(&live[..]);
             #[cfg(not(feature = "diagnostics"))]
-            let live: Vec<(&'static str, String)> = Vec::new();
-            rows(line, &Counts::now(host), &live)
+            let details = None;
+            rows(line, &Counts::now(host), details)
         }
         None => Vec::new(),
     };
@@ -575,11 +736,12 @@ fn draws(
         }
         table.push(Row::Note(note.to_owned()));
     }
-    let scale = (size[1] / 540).max(1);
-    let room = (size[0] / scale).saturating_sub(2 * (MARGIN + PAD[0])) / CELL;
-    layout(&table, scale, room as usize)
+    // The window's width less the panel's margin and padding each side.
+    let [cw, ch] = faces[MAIN].cell;
+    let room = size[0].saturating_sub(2 * (ch / 2 + cw));
+    layout(&table, faces, room)
         .iter()
-        .map(|shape| constants(shape, size))
+        .map(|shape| constants(shape, faces, size))
         .collect()
 }
 
@@ -618,7 +780,12 @@ impl Pipelines {
             DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
             BlendOpAlpha: D3D12_BLEND_OP_ADD,
             LogicOp: D3D12_LOGIC_OP_NOOP,
-            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            // Colour only: the frame's alpha stays as the title left it.
+            // Window grabs (PrintWindow) honour it, and showed holes where
+            // the panel's alpha met the title's.
+            RenderTargetWriteMask: (D3D12_COLOR_WRITE_ENABLE_RED.0
+                | D3D12_COLOR_WRITE_ENABLE_GREEN.0
+                | D3D12_COLOR_WRITE_ENABLE_BLUE.0) as u8,
         };
         let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
         formats[0] = format;
@@ -660,8 +827,12 @@ impl Pipelines {
 /// The objects the overlay draws with, made at its first use.
 pub(crate) struct Overlay {
     pipelines: Pipelines,
-    /// The font ([`GLYPHS`]), in upload memory.
-    font: ID3D12Resource,
+    /// The atlas ([`atlas`]) in upload memory, the window height it was
+    /// drawn for, and its faces.
+    font: Option<(ID3D12Resource, u32, [Face; 3])>,
+    /// Atlases drawn for other heights: a list in flight may still read
+    /// one.
+    retired: Vec<ID3D12Resource>,
     /// The panel's draws as last made.
     drawn: Option<Drawn>,
     /// The view's objects, made at the first view (`None` inside: none
@@ -687,8 +858,22 @@ impl Overlay {
             );
             return None;
         }
-        match Self::make(host) {
-            Ok(made) => made,
+        // SAFETY: the shaders' blob carries the root signature.
+        match unsafe {
+            host.device
+                .CreateRootSignature::<ID3D12RootSignature>(0, CORNERS)
+        } {
+            Ok(root) => {
+                tracing::info!("overlay made");
+                Some(Overlay {
+                    pipelines: Pipelines::new(root, [CORNERS, PANEL], true),
+                    font: None,
+                    retired: Vec::new(),
+                    drawn: None,
+                    #[cfg(feature = "diagnostics")]
+                    view: None,
+                })
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "no overlay");
                 None
@@ -696,30 +881,10 @@ impl Overlay {
         }
     }
 
-    fn make(host: &Host) -> windows::core::Result<Option<Overlay>> {
-        let Some((font, data)) = host.upload_buffer(GLYPHS.len() as u64 * 8) else {
-            return Ok(None);
-        };
-        // SAFETY: the upload buffer's mapping holds the font's bytes; the
-        // shaders' blob carries the root signature.
-        unsafe {
-            std::ptr::copy_nonoverlapping(GLYPHS.as_ptr().cast::<u8>(), data, GLYPHS.len() * 8);
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, CORNERS)?;
-            crate::host::name(&font, || "overlay font".to_owned());
-            tracing::info!("overlay made");
-            Ok(Some(Overlay {
-                pipelines: Pipelines::new(root, [CORNERS, PANEL], true),
-                font,
-                drawn: None,
-                #[cfg(feature = "diagnostics")]
-                view: None,
-            }))
-        }
-    }
-
     /// Records the panel at the top left of the window buffer `back` (in the
     /// render target state): `line`'s table, if any, and `note` under it.
-    /// Its draws are made again when either changed, or the window's size.
+    /// Its draws are made again when either changed, or the window's size;
+    /// its atlas when the window's height did.
     fn panel(
         &mut self,
         host: &Host,
@@ -734,6 +899,25 @@ impl Overlay {
         let Some(pipeline) = self.pipelines.get(host, d.Format) else {
             return;
         };
+        if self
+            .font
+            .as_ref()
+            .is_none_or(|(_, height, _)| *height != size[1])
+        {
+            let (bytes, faces) = atlas(size[1]);
+            let Some((buffer, data)) = host.upload_buffer(bytes.len() as u64) else {
+                return;
+            };
+            // SAFETY: the upload buffer's mapping holds as many bytes.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len()) };
+            crate::host::name(&buffer, || "overlay font".to_owned());
+            if let Some((old, ..)) = self.font.replace((buffer, size[1], faces)) {
+                self.retired.push(old);
+            }
+        }
+        let Some((font, _, faces)) = &self.font else {
+            return;
+        };
         let line = line.copied();
         let drawn = match self.drawn.take() {
             Some(drawn)
@@ -745,17 +929,17 @@ impl Overlay {
                 line,
                 size,
                 note: note.map(str::to_owned),
-                draws: draws(host, line.as_ref(), size, note),
+                draws: draws(host, line.as_ref(), size, faces, note),
             },
         };
         let drawn = self.drawn.insert(drawn);
         let words = (size_of::<Constants>() / 4) as u32;
-        // SAFETY: an open list; our root signature and font, which live as
+        // SAFETY: an open list; our root signature and atlas, which live as
         // long as the overlay; a view of the window buffer from the host's
         // ring, made where it is recorded (the ring comes round).
         unsafe {
             list.SetGraphicsRootSignature(&self.pipelines.root);
-            list.SetGraphicsRootShaderResourceView(FONT, self.font.GetGPUVirtualAddress());
+            list.SetGraphicsRootShaderResourceView(FONT, font.GetGPUVirtualAddress());
             target(list, host.rtv(Some(back), None), size);
             list.SetPipelineState(&pipeline);
             for constants in &drawn.draws {
@@ -867,26 +1051,28 @@ mod tests {
         }
     }
 
-    /// The shader finds a glyph's row as overlay.hlsl does: the word at the
-    /// glyph's 8 bytes plus the row's group of four, shifted by the row.
+    /// A glyph's pixel as overlay.hlsl finds it in a face: the face's base,
+    /// the glyph's cells before it, the rows above, the column.
+    fn coverage(bytes: &[u8], face: Face, c: u8, [x, y]: [u32; 2]) -> u8 {
+        let [w, h] = face.cell;
+        bytes[(face.base + (u32::from(c - 32) * h + y) * w + x) as usize]
+    }
+
+    /// The bitmap font's faces are where the shader reads them: the capital
+    /// A in its cell, a row and a column of space around, twice as big at
+    /// scale 2.
     #[test]
-    fn rows_are_where_the_shader_reads_them() {
-        let bytes: Vec<u8> = GLYPHS.iter().flatten().copied().collect();
-        let row_of = |c: u8, row: usize| {
-            let at = usize::from(c - 32) * 8 + (row & !3);
-            let word = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-            (word >> ((row & 3) * 8)) & 0x1f
-        };
-        // The capital A: a top bar, its sides, the crossbar on row 4.
-        let a: Vec<String> = (0..8)
-            .map(|row| {
-                (0..5)
-                    .map(|x| {
-                        if row_of(b'A', row) >> (4 - x) & 1 != 0 {
-                            '#'
-                        } else {
-                            '.'
-                        }
+    fn the_bitmap_font_is_where_the_shader_reads_it() {
+        let (bytes, cell) = bitmap(1);
+        assert_eq!(cell, [6, 10]);
+        assert_eq!(bytes.len(), GLYPHS.len() * 60);
+        let face = Face { cell, base: 0 };
+        let a: Vec<String> = (0..10)
+            .map(|y| {
+                (0..6)
+                    .map(|x| match coverage(&bytes, face, b'A', [x, y]) {
+                        255 => '#',
+                        _ => '.',
                     })
                     .collect()
             })
@@ -894,11 +1080,61 @@ mod tests {
         assert_eq!(
             a,
             [
-                ".###.", "#...#", "#...#", "#...#", "#####", "#...#", "#...#", "....."
+                "......", ".###..", "#...#.", "#...#.", "#...#.", "#####.", "#...#.", "#...#.",
+                "......", "......"
             ]
         );
-        // A descender on the last row.
-        assert_ne!(row_of(b'g', 7), 0);
+        let (twice, cell) = bitmap(2);
+        let face2 = Face { cell, base: 0 };
+        assert_eq!(cell, [12, 20]);
+        for (x, y) in [(1, 1), (0, 2), (4, 5)] {
+            let one = coverage(&bytes, face, b'A', [x, y]);
+            assert_eq!(coverage(&twice, face2, b'A', [2 * x + 1, 2 * y + 1]), one);
+        }
+    }
+
+    /// GDI draws Consolas into cells taller than wide, a space as nothing,
+    /// other characters with anti-aliased edges; twice the size, about twice
+    /// the cell. (Skipped where Windows has no Consolas.)
+    #[test]
+    fn consolas_is_drawn_anti_aliased() {
+        let (Some((bytes, cell)), Some((_, twice))) = (consolas(14), consolas(28)) else {
+            eprintln!("no Consolas here");
+            return;
+        };
+        let [w, h] = cell;
+        assert!(w >= 6 && h > w && h <= 20, "{cell:?}");
+        assert_eq!(bytes.len(), GLYPHS.len() * (w * h) as usize);
+        let glyph = |c: u8| {
+            let at = (u32::from(c - 32) * w * h) as usize;
+            &bytes[at..at + (w * h) as usize]
+        };
+        assert!(glyph(b' ').iter().all(|&b| b == 0));
+        for c in *b"#0g~" {
+            assert!(glyph(c).iter().any(|&b| b > 200), "{}", c as char);
+        }
+        assert!(
+            glyph(b'0').iter().any(|&b| b > 0 && b < 255),
+            "anti-aliased"
+        );
+        assert!(
+            twice[1].abs_diff(2 * h) <= 2 && twice[0].abs_diff(2 * w) <= 2,
+            "{twice:?}"
+        );
+    }
+
+    /// The atlas lays its faces one after the other, the big one the
+    /// tallest.
+    #[test]
+    fn the_atlas_holds_three_faces() {
+        let (bytes, faces) = atlas(1080);
+        let size = |f: Face| GLYPHS.len() as u32 * f.cell[0] * f.cell[1];
+        assert_eq!(faces[BIG].base, 0);
+        assert_eq!(faces[MAIN].base, size(faces[BIG]));
+        assert_eq!(faces[SMALL].base, faces[MAIN].base + size(faces[MAIN]));
+        assert_eq!(bytes.len() as u32, faces[SMALL].base + size(faces[SMALL]));
+        assert!(faces[BIG].cell[1] > faces[MAIN].cell[1]);
+        assert!(faces[MAIN].cell[1] >= faces[SMALL].cell[1]);
     }
 
     #[test]
@@ -936,6 +1172,22 @@ mod tests {
         assert_eq!(hlsl.matches("num32BitConstants = 44, b0").count(), 2);
     }
 
+    /// Faces the size of Consolas's at 24, 14 and 12 pixels an em.
+    const FACES: [Face; 3] = [
+        Face {
+            cell: [13, 28],
+            base: 0,
+        },
+        Face {
+            cell: [8, 17],
+            base: 0,
+        },
+        Face {
+            cell: [7, 15],
+            base: 0,
+        },
+    ];
+
     fn sample() -> (FrameLine, Counts) {
         let gb = |gb: f64| (gb * (1u64 << 30) as f64) as u64;
         let line = FrameLine {
@@ -949,10 +1201,10 @@ mod tests {
             dropped: 340.0,
         };
         let counts = Counts {
+            console: "Series X",
             shaders: (2319, 4),
             pipelines: [1977, 596],
             making: 0,
-            library: 64 << 20,
             memory: Some([gb(22.82), gb(14.99), 0, gb(5.5)]),
         };
         (line, counts)
@@ -961,20 +1213,23 @@ mod tests {
     fn items(rows: &[Row]) -> Vec<(&str, &str)> {
         rows.iter()
             .filter_map(|row| match row {
-                Row::Item(label, value, _) => Some((*label, value.as_str())),
+                Row::Item(label, value, _) | Row::Detail(label, value) => {
+                    Some((*label, value.as_str()))
+                }
                 _ => None,
             })
             .collect()
     }
 
-    /// The rows name the figures in a player's words, with their units, in
-    /// groups apart; the times have bars of their share of the frame; live
-    /// switches set make a group of their own.
+    /// The table names the console and the essential figures in a player's
+    /// words, with their units; the times have bars of their share of the
+    /// frame. Diagnostics builds add the caches, shared memory and the live
+    /// switches set.
     #[test]
     fn rows_name_the_figures_with_their_units() {
         let (line, mut counts) = sample();
-        let table = rows(&line, &counts, &[]);
-        assert_eq!(table[0], Row::Title("VIctory-reloaded"));
+        let table = rows(&line, &counts, None);
+        assert_eq!(table[0], Row::Title("Series X"));
         assert_eq!(table[1], Row::Big("5.7 fps".into(), "176 ms".into(), RED));
         assert_eq!(
             items(&table),
@@ -983,122 +1238,123 @@ mod tests {
                 ("GPU", "48.3 ms"),
                 ("Copy-back", "56.8 ms"),
                 ("Draws", "5030"),
-                ("Dispatches", "4783"),
                 ("Dropped", "340"),
-                ("Shaders", "2319 cached, 4 new"),
-                ("Pipelines", "1977 cached, 596 new"),
-                ("Compiling", "0 pipelines"),
-                ("Pipeline cache", "64 MB"),
                 ("VRAM", "14.99 / 22.82 GB"),
-                ("Shared memory", "5.50 GB"),
             ]
         );
-        assert_eq!(table.iter().filter(|row| **row == Row::Rule).count(), 4);
+        assert_eq!(table.iter().filter(|row| **row == Row::Rule).count(), 3);
         let Row::Item("CPU prep", _, Some(share)) = &table[3] else {
             panic!("{:?}", table[3]);
         };
         assert!((share - 102.6 / 176.0).abs() < 1e-9);
-        assert!(
-            table
-                .iter()
-                .all(|row| !matches!(row, Row::Item("Draws", _, Some(_))))
-        );
 
         let live = [("VICTORY_SCISSOR_TEST", "full".to_owned())];
-        let with = rows(&line, &counts, &live);
-        assert_eq!(with.len(), table.len() + 2);
-        assert_eq!(with[table.len()], Row::Rule);
+        let more = rows(&line, &counts, Some(&live));
+        assert_eq!(more[..table.len()], table[..]);
+        assert_eq!(more[table.len()], Row::Rule);
         assert_eq!(
-            with[table.len() + 1],
-            Row::Item("VICTORY_SCISSOR_TEST", "full".into(), None)
+            items(&more[table.len()..]),
+            [
+                ("Dispatches", "4783"),
+                ("Shaders", "2319 + 4 new"),
+                ("Pipelines", "1977 + 596 new"),
+                ("Compiling", "0"),
+                ("Shared memory", "5.50 GB"),
+                ("VICTORY_SCISSOR_TEST", "full"),
+            ]
         );
 
         counts.memory = None;
-        counts.library = 0;
-        let unknown = rows(&line, &counts, &[]);
-        assert!(items(&unknown).contains(&("VRAM", "unknown")));
-        assert!(items(&unknown).contains(&("Pipeline cache", "none")));
+        assert!(items(&rows(&line, &counts, None)).contains(&("VRAM", "unknown")));
     }
 
-    /// A value stands against the row's right edge, its label at the left;
-    /// what does not fit is cut, the label last.
-    #[test]
-    fn values_stand_against_the_right_edge() {
-        assert_eq!(
-            spread("GPU", "48.3 ms", 16),
-            ("GPU      48.3 ms".to_owned(), 9)
-        );
-        assert_eq!(
-            spread("Dispatches", "4783", 15),
-            ("Dispatches 4783".to_owned(), 11)
-        );
-        assert_eq!(
-            spread("Dispatches", "4783", 14),
-            ("Dispatches 478".to_owned(), 11)
-        );
-        assert_eq!(spread("A long label", "1", 6), ("A long".to_owned(), 6));
-        assert_eq!(spread("Title", "", 8), ("Title   ".to_owned(), 8));
+    /// Each text shape's bounds in pixels.
+    fn bounds(shape: &Shape) -> [u32; 4] {
+        match shape {
+            Shape::Fill(rect, _) => *rect,
+            Shape::Text { at, face, text, .. } => {
+                let [w, h] = FACES[*face].cell;
+                [at[0], at[1], at[0] + text.len() as u32 * w, at[1] + h]
+            }
+        }
     }
 
-    fn texts(shapes: &[Shape]) -> Vec<(&str, usize, u32)> {
+    fn texts(shapes: &[Shape]) -> Vec<(&str, [u32; 4])> {
         shapes
             .iter()
             .filter_map(|shape| match shape {
-                Shape::Text {
-                    text, split, scale, ..
-                } => Some((text.as_str(), *split, *scale)),
+                Shape::Text { text, .. } => Some((text.as_str(), bounds(shape))),
                 Shape::Fill(..) => None,
             })
             .collect()
     }
 
-    /// Every row is as wide as the widest needs: at least NARROWEST
-    /// characters, an even count, at most the room; values end at its right
-    /// edge, where their colour starts.
+    /// Labels start at the table's left edge and values end at its right
+    /// edge, whatever their face; the table is as wide as its widest row
+    /// needs, at least NARROWEST characters of the main face, at most the
+    /// room.
     #[test]
-    fn rows_share_one_width() {
+    fn labels_and_values_line_up_in_every_face() {
         let (line, counts) = sample();
-        let shapes = layout(&rows(&line, &counts, &[]), 2, 200);
-        for (text, split, scale) in texts(&shapes) {
-            if text == "VIctory-reloaded" {
-                continue;
-            }
-            assert_eq!(text.len() * (scale / 2) as usize, NARROWEST, "{text:?}");
-            assert_eq!(text.as_bytes()[split - 1], b' ', "{text:?}");
-            assert_ne!(text.as_bytes()[split], b' ', "{text:?}");
+        let live = [("VICTORY_SKIP_PIPELINES", "0000000000000000".to_owned())];
+        let shapes = layout(&rows(&line, &counts, Some(&live)), &FACES, 1000);
+        let Shape::Fill(panel, BACKGROUND) = shapes[0] else {
+            panic!("{:?}", shapes[0]);
+        };
+        let [cw, ch] = FACES[MAIN].cell;
+        let (left, right) = (panel[0] + cw, panel[2] - cw);
+        // The live switch is the widest row, in the small face.
+        assert_eq!(right - left, 7 * (22 + 2 + 16));
+        let placed = texts(&shapes);
+        for label in ["VIctory-reloaded", "5.7 fps", "CPU prep", "VRAM", "Shaders"] {
+            let (_, at) = placed.iter().find(|(t, _)| *t == label).unwrap();
+            assert_eq!(at[0], left, "{label}");
         }
-        let wide = layout(
-            &[Row::Item(
-                "Shaders",
-                "123456 cached, 12345 new".into(),
-                None,
-            )],
-            1,
-            200,
-        );
+        for value in [
+            "Series X",
+            "176 ms",
+            "102.6 ms",
+            "14.99 / 22.82 GB",
+            "2319 + 4 new",
+        ] {
+            let (_, at) = placed.iter().find(|(t, _)| *t == value).unwrap();
+            assert_eq!(at[2], right, "{value}");
+        }
+        // Without it, the bars' rows: "Copy-back", a bar, "102.6 ms".
+        let shapes = layout(&rows(&line, &counts, None), &FACES, 1000);
+        let Shape::Fill(panel, _) = shapes[0] else {
+            unreachable!()
+        };
         assert_eq!(
-            texts(&wide),
-            [("Shaders   123456 cached, 12345 new", 10, 1)]
+            panel[2] - panel[0] - 2 * cw,
+            (9 + 1 + BAR_CHARS + 1 + 8) as u32 * cw
         );
-        let capped = layout(&[Row::Item("Shaders", "9".repeat(60), None)], 1, 41);
-        assert_eq!(texts(&capped)[0].0.len(), 41);
-        let big = layout(
-            &[Row::Big("144.0 fps".into(), "6.9 ms".into(), GREEN)],
-            1,
-            200,
+        let short = layout(&[Row::Item("Draws", "1".into(), None)], &FACES, 1000);
+        let Shape::Fill(panel, _) = short[0] else {
+            unreachable!()
+        };
+        assert_eq!(panel[2] - panel[0] - 2 * cw, NARROWEST as u32 * cw);
+        assert_eq!(panel[..2], [ch / 2, ch / 2]);
+        // A narrow window cuts values to leave a space after the label.
+        let cut = layout(
+            &[Row::Item("Pipelines", "9".repeat(40), None)],
+            &FACES,
+            15 * cw,
         );
-        assert_eq!(texts(&big), [("144.0 fps 6.9 ms", 10, 2)]);
+        let placed = texts(&cut);
+        assert_eq!(placed[0].0, "Pipelines");
+        assert_eq!(placed[1].0, "99999");
+        assert_eq!(placed[1].1[2], ch / 2 + cw + 15 * cw);
     }
 
-    /// The panel comes first and holds every other shape with its padding
-    /// around them; rules span the rows; bars lie between the label and
-    /// value columns, filled by their share and never past full; a note
-    /// is broken into lines of the table's width.
+    /// The panel comes first and holds every other shape with its padding;
+    /// rules span the rows; bars lie between the label and value columns,
+    /// filled by their share and never past full; a note is broken into
+    /// lines of the table's width in the small face.
     #[test]
     fn the_panel_holds_rules_bars_and_notes() {
-        let u = 2;
         let table = [
-            Row::Title("VIctory-reloaded"),
+            Row::Title("Series S"),
             Row::Rule,
             Row::Item("CPU prep", "88.0 ms".into(), Some(0.5)),
             Row::Item("Copy-back", "300.0 ms".into(), Some(1.7)),
@@ -1107,71 +1363,57 @@ mod tests {
                 "view 3 0x7ff612345678 1920x1080 f10 rgb: values 0.0000e0 to 1.2500e1".into(),
             ),
         ];
-        let shapes = layout(&table, u, 200);
+        let shapes = layout(&table, &FACES, 1000);
         let Shape::Fill(panel, BACKGROUND) = shapes[0] else {
             panic!("{:?}", shapes[0]);
         };
-        let (left, cell) = ((MARGIN + PAD[0]) * u, CELL * u);
-        let right = left + NARROWEST as u32 * cell - u;
-        assert_eq!(panel[..3], [MARGIN * u, MARGIN * u, right + PAD[0] * u]);
-        let fills: Vec<([u32; 4], u32)> = shapes[1..]
-            .iter()
-            .filter_map(|shape| match shape {
-                Shape::Fill(rect, colour) => Some((*rect, *colour)),
-                Shape::Text { .. } => None,
-            })
-            .collect();
+        let [cw, ch] = FACES[MAIN].cell;
+        let (left, right) = (panel[0] + cw, panel[2] - cw);
         for shape in &shapes[1..] {
-            let [l, t, r, b] = match shape {
-                Shape::Fill(rect, _) => *rect,
-                Shape::Text {
-                    at, scale, text, ..
-                } => [
-                    at[0],
-                    at[1],
-                    at[0] + text.len() as u32 * CELL * scale - scale,
-                    at[1] + GLYPH * scale,
-                ],
-            };
+            let [l, t, r, b] = bounds(shape);
+            assert!(l >= left && r <= right, "{shape:?}");
             assert!(
-                l >= panel[0] + PAD[0] * u && r <= panel[2] - PAD[0] * u,
-                "{shape:?}"
-            );
-            assert!(
-                t >= panel[1] + PAD[1] * u && b <= panel[3] - PAD[1] * u,
+                t >= panel[1] + ch / 3 && b <= panel[3] - ch / 3,
                 "{shape:?}"
             );
         }
-        let rules: Vec<_> = fills.iter().filter(|(_, c)| *c == RULE).collect();
-        assert_eq!(rules.len(), 2);
-        assert!(
-            rules
+        let fills = |colour| -> Vec<[u32; 4]> {
+            shapes[1..]
                 .iter()
-                .all(|(rect, _)| rect[0] == left && rect[2] == right)
-        );
+                .filter_map(|s| match s {
+                    Shape::Fill(rect, c) if *c == colour => Some(*rect),
+                    _ => None,
+                })
+                .collect()
+        };
+        let rules = fills(RULE);
+        assert_eq!(rules.len(), 2);
+        assert!(rules.iter().all(|r| r[0] == left && r[2] == right));
         // "Copy-back" is the longest label beside a bar, "300.0 ms" the
         // longest value.
-        let (from, to) = (left + 10 * cell, left + (NARROWEST as u32 - 9) * cell);
-        let tracks: Vec<_> = fills
-            .iter()
-            .filter(|(_, c)| *c == TRACK)
-            .map(|(r, _)| *r)
-            .collect();
-        let bars: Vec<_> = fills
-            .iter()
-            .filter(|(_, c)| *c == BAR)
-            .map(|(r, _)| *r)
-            .collect();
+        let (from, to) = (left + 10 * cw, right - 9 * cw);
+        let (tracks, bars) = (fills(TRACK), fills(BAR));
         assert_eq!(tracks.len(), 2);
         assert!(tracks.iter().all(|r| r[0] == from && r[2] == to));
         assert_eq!(bars[0][2] - bars[0][0], (to - from) / 2);
         assert_eq!(bars[1][2], to);
-        let notes: Vec<_> = texts(&shapes).into_iter().skip(3).collect();
+        // After the title's and the bars' labels and values.
+        let notes = &texts(&shapes)[6..];
         assert!(notes.len() > 1);
-        assert!(
-            notes
-                .iter()
-                .all(|(text, split, _)| text.len() <= NARROWEST && *split == text.len())
-        );
+        let room = ((right - left) / FACES[SMALL].cell[0]) as usize;
+        assert!(notes.iter().all(|(t, _)| t.len() <= room));
+    }
+
+    /// At 1080 rows the essential table takes less than a fifth of the
+    /// window's width and a quarter of its height.
+    #[test]
+    fn the_table_is_compact() {
+        let (line, counts) = sample();
+        let shapes = layout(&rows(&line, &counts, None), &FACES, 1900);
+        let Shape::Fill(panel, _) = shapes[0] else {
+            unreachable!()
+        };
+        assert!(panel[2] <= 1920 / 5, "{panel:?}");
+        assert!(panel[3] <= 1080 / 4, "{panel:?}");
     }
 }

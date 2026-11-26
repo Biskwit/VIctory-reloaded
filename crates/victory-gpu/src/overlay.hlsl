@@ -4,8 +4,8 @@
 // the Windows SDK's compiler by the crate's build script (build.rs), entry
 // point by entry point; nothing compiled is kept in the repository.
 //
-// The panel's root signature: the draw's 44 constants and the font as a
-// root view. The view's: the same constants, the viewed texture's range of
+// The panel's root signature: the draw's 44 constants and the font's atlas
+// as a root view. The view's: the same constants, the viewed texture's range of
 // values as a root unordered view, and a table of the viewed texture read as
 // floats and as integers (whichever does not fit its format is a null view).
 #define PANEL_RS "RootConstants(num32BitConstants = 44, b0), SRV(t0)"
@@ -17,13 +17,13 @@ cbuffer Draw : register(b0) {
     float4 rect;
     // The target's size in pixels.
     float2 target;
-    // Panel: the colour of the text's first columns and of the rest, or a
-    // filled rectangle's (the first); 8 bits a channel, red lowest, alpha
-    // highest.
-    uint2 colours;
-    // Panel: pixels per font pixel (0: the rectangle is filled), the text's
-    // characters, and the first column in the second colour. View: the
-    // channel shown (0-3; 4: red, green and blue), and how (SHOW_*).
+    // Panel: the colour of the text or of a filled rectangle (8 bits a
+    // channel, red lowest, alpha highest), and the cell of the text's face
+    // in pixels: width in bits 0-7, height in bits 8-15 (0: filled).
+    uint2 style;
+    // Panel: the text's characters, and the byte of the atlas where its
+    // face starts. View: the channel shown (0-3; 4: red, green and blue),
+    // and how (SHOW_*).
     uint4 head;
     // Panel: the characters, four a word, the first in the low byte. View:
     // words[0] = the texture's width and height, 1 if it holds integers,
@@ -31,8 +31,8 @@ cbuffer Draw : register(b0) {
     uint4 words[8];
 };
 
-// The glyphs of characters 32 to 126, 8 bytes each: a row a byte, top
-// first, the glyph's 5 columns in bits 4 (left) to 0.
+// The font's atlas: faces of characters 32 to 126, a byte of coverage a
+// pixel, glyph after glyph, each row after row (`crate::overlay::atlas`).
 ByteAddressBuffer font : register(t0);
 // The lowest and highest value of the viewed channels, as ordered keys.
 RWByteAddressBuffer range : register(u0);
@@ -45,9 +45,6 @@ Texture2DArray<uint4> integers : register(t2);
 static const uint SHOW_RANGE = 1;
 static const uint SHOW_HIGHEST = 2;
 static const uint SHOW_CURVE = 4;
-
-// A character's width in font pixels: the glyph's 5 and a column between.
-static const uint CELL_WIDTH = 6;
 
 float4 place(uint i) {
     float2 at = lerp(rect.xy, rect.zw, float2(i & 1, i >> 1));
@@ -63,27 +60,28 @@ float4 colour(uint c) {
     return float4(c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff, c >> 24) / 255.0;
 }
 
-// A filled rectangle, or a line of text whose rectangle starts at its
-// glyphs' top left; what is not a glyph's pixel is left as it is.
+// A filled rectangle, or a line of text whose rectangle starts at its first
+// cell's top left, a pixel of the atlas a pixel; the ink is blended by the
+// glyph's coverage, and what it does not cover is left as it is.
 [RootSignature(PANEL_RS)]
 float4 panel(float4 p : SV_Position) : SV_Target {
-    uint scale = head.x;
-    if (scale == 0) {
-        return colour(colours.x);
+    uint2 cell = uint2(style.y & 0xff, (style.y >> 8) & 0xff);
+    float4 ink = colour(style.x);
+    if (cell.x == 0) {
+        return ink;
     }
-    uint2 at = uint2(p.xy - rect.xy) / scale;
-    uint column = at.x / CELL_WIDTH;
-    uint x = at.x % CELL_WIDTH;
-    if (column >= head.y || x >= 5 || at.y >= 8) {
+    uint2 at = uint2(p.xy - rect.xy);
+    uint column = at.x / cell.x;
+    if (column >= head.x || at.y >= cell.y) {
         discard;
     }
     uint c = (words[column / 16][(column / 4) % 4] >> ((column % 4) * 8)) & 0xff;
-    uint row = at.y;
-    uint bits = (font.Load((c - 32) * 8 + (row & ~3u)) >> ((row & 3) * 8)) & 0x1f;
-    if (((bits >> (4 - x)) & 1) == 0) {
+    uint byte = head.y + ((c - 32) * cell.y + at.y) * cell.x + at.x % cell.x;
+    uint covered = (font.Load(byte & ~3u) >> ((byte & 3) * 8)) & 0xff;
+    if (covered == 0) {
         discard;
     }
-    return colour(column < head.z ? colours.x : colours.y);
+    return float4(ink.rgb, ink.a * covered / 255.0);
 }
 
 [RootSignature(VIEW_RS)]
