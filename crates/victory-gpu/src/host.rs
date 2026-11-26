@@ -6071,22 +6071,30 @@ impl HostList {
     }
 }
 
-/// Whether a submission's refreshes of host copies run on several threads,
-/// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
+/// Whether the copying of a flush's refreshes of host copies runs on
+/// several threads (`VICTORY_WIDE_REFRESH=0`: all of it on the submitting
+/// thread, as before).
 ///
 /// A submission brings some sixty copies up to date, one after the other
 /// on the submitting thread: for each, the pages the title wrote are asked
-/// for and read through the kernel into the copy. That is the frame line's
-/// "copies", 45-50 ms a frame, and the copies have nothing to do with one
-/// another: each refresh writes its own copy and its own notes, and reads
-/// title memory. With the switch the copies of a flush (four or more) are
-/// spread over the threads kept for the snapshots (`crate::shadow::wide`).
-/// The write-watch journal and the guards are behind their own locks, as
-/// they are for the title's threads.
+/// for and read into the copy. In the cell scene that was 48 ms a frame,
+/// half asking (the write-watch journal and the guards) and half copying
+/// (run sp-base1). The asking takes the journal's and the guards' locks
+/// and stays on the submitting thread, copy after copy, as before; only
+/// the copying of the pages it found written goes to the threads kept for
+/// the snapshots (`crate::shadow::wide`), in pieces of
+/// [`WIDE_REFRESH_JOB`] bytes. (Each copy's asking and copying on a thread
+/// of their own, this switch's first form, was no faster: the threads
+/// waited for the journal's lock, which the guards' work holds, 197 ms a
+/// frame summed over them in run sp-wide1.)
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_none_or(|v| v != "0"))
 }
+
+/// About this many bytes of pages to copy to a piece of work in
+/// [`Batch::update_wide`].
+const WIDE_REFRESH_JOB: usize = 1 << 20;
 
 /// A submission's refreshes not done yet, per buffer copy ([`refresh_runs`]):
 /// done before a step that writes title memory or gives a range to shaders,
@@ -6201,6 +6209,53 @@ impl Batch {
         }
     }
 
+    /// The refreshes of a flush ([`wide_refresh`]): what each asks is asked
+    /// here, copy after copy, and the pages found written are copied on
+    /// the kept threads, pieces of about [`WIDE_REFRESH_JOB`] bytes, before
+    /// this returns. The time counted is the time it took.
+    fn update_wide(refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>) {
+        let started = std::time::Instant::now();
+        let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+        let copied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut plan = Vec::new();
+        for (shadow, runs) in refreshes {
+            for (from, to) in runs {
+                shadow.plan(from, to - from, &mut plan);
+            }
+            // Pieces of work: runs of the plan together up to the size.
+            let mut first = 0;
+            let mut bytes = 0;
+            for i in 0..plan.len() {
+                bytes += plan[i].1 - plan[i].0;
+                if bytes >= WIDE_REFRESH_JOB || i + 1 == plan.len() {
+                    let piece: Vec<(usize, usize)> = plan[first..=i].to_vec();
+                    let (shadow, copied) = (shadow.clone(), copied.clone());
+                    jobs.push(Box::new(move || {
+                        #[cfg(feature = "diagnostics")]
+                        let job = std::time::Instant::now();
+                        let mut n = 0;
+                        for &(from, to) in &piece {
+                            n += shadow.copy_planned(from, to);
+                        }
+                        copied.fetch_add(n, Ordering::Relaxed);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            let (start, len) = shadow.span();
+                            let asked = piece.iter().map(|r| r.1 - r.0).sum();
+                            crate::copystat::range(start as usize, len as usize, asked, n, job.elapsed().as_micros() as u64, 0);
+                        }
+                    }));
+                    first = i + 1;
+                    bytes = 0;
+                }
+            }
+            plan.clear();
+        }
+        crate::shadow::wide_run(jobs);
+        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied.load(Ordering::Relaxed) as u64, Ordering::Relaxed);
+    }
+
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
         let started = std::time::Instant::now();
@@ -6252,25 +6307,8 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && refreshes.len() >= 4 {
-            // Each copy on its own, several at a time: a copy's refresh
-            // writes that copy and reads title memory, nothing of another's.
-            // The time counted is the time it took, not the threads' sum.
-            let started = std::time::Instant::now();
-            let before = PREPARING[0].load(Ordering::Relaxed);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = refreshes
-                .into_iter()
-                .map(|(shadow, runs)| {
-                    Box::new(move || {
-                        for (from, to) in runs {
-                            Self::update(&shadow, from, to);
-                        }
-                    }) as Box<dyn FnOnce() + Send>
-                })
-                .collect();
-            crate::shadow::wide_run(jobs);
-            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        if wide_refresh() && refreshes.len() >= 2 {
+            Self::update_wide(refreshes);
         } else {
             for (shadow, runs) in refreshes {
                 for (from, to) in runs {
