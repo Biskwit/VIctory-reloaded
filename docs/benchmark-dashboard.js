@@ -1,4 +1,4 @@
-import { parseBenchmark, parsePlayLog } from './benchmark-data.js?v=playtest';
+import { parseBenchmark } from './benchmark-data.js?v=interactive';
 
 const byId = id => document.getElementById(id);
 const ui = {
@@ -13,7 +13,7 @@ const ui = {
   replay: byId('replay'),
 };
 const view = {
-  chart: 'fps', mode: 'time', target: 30, benchmark: null, session: null,
+  chart: 'fps', mode: 'time', target: 30, benchmark: null,
   profile: null, selected: '', limit: 60,
 };
 const readings = new Map();
@@ -135,11 +135,18 @@ function makeFrameRate() {
     };
   });
   const legend = element('div', 'legend');
-  for (const [key, label] of [['median', 'Median'], ['low', '1% low'], ['band', '10th–90th percentile'], ['goal', 'FPS target']]) {
-    const control = button('', label, key);
+  const metrics = [
+    ['median', 'Median', number(median) + ' fps'],
+    ['low', '1% low', number(low) + ' fps'],
+    ['band', '10th–90th percentile', number(p10) + '–' + number(p90) + ' fps'],
+    ['goal', 'FPS target', number(view.target, 0) + ' fps'],
+  ];
+  for (const [key, label, value] of metrics) {
+    const control = button('', label, key, label + ' ' + value);
     const swatch = element('span', 'swatch swatch-' + key);
     swatch.setAttribute('aria-hidden', 'true');
     control.prepend(swatch);
+    control.append(element('strong', 'legend-value', value));
     legend.append(control);
   }
   fps.append(legend);
@@ -237,93 +244,6 @@ function svgElement(tag, attrs) {
   return node;
 }
 
-function makeSession() {
-  const { minutes } = view.session;
-  const plot = element('div', 'session-plot');
-  const svg = svgElement('svg', { viewBox: '0 0 780 244', 'aria-hidden': 'true' });
-  const left = 50;
-  const right = 744;
-  const top = 26;
-  const bottom = 202;
-  const maximum = Math.max(30, Math.ceil(Math.max(...minutes.map(p => p.fps)) / 5) * 5);
-  const elapsed = Math.max(1, minutes.at(-1).elapsed - minutes[0].elapsed);
-  const y = value => bottom - (bottom - top) * value / maximum;
-  const points = minutes.map(p => ({
-    x: left + (right - left) * (p.elapsed - minutes[0].elapsed) / elapsed, y: y(p.fps),
-  }));
-  const tick = (x, y, value, anchor) => {
-    const label = svgElement('text', { x, y, 'text-anchor': anchor });
-    label.textContent = value;
-    svg.append(label);
-  };
-  const step = maximum === 30 ? 5 : maximum / 5;
-  for (let fps = 0; fps <= maximum; fps += step) {
-    svg.append(svgElement('path', { d: 'M' + left + ' ' + y(fps) + 'H' + right, class: 'session-rule' }));
-    tick(left - 8, y(fps) + 5, fps, 'end');
-  }
-  svg.append(svgElement('path', { d: 'M' + left + ' ' + y(30) + 'H' + right, class: 'session-target' }));
-  tick(right, y(30) - 8, '30 fps target', 'end');
-  const path = points.map((p, index) => {
-    const connected = index > 0 && minutes[index].elapsed - minutes[index - 1].elapsed === 1;
-    return (connected ? 'L' : 'M') + p.x + ' ' + p.y;
-  }).join('');
-  const line = svgElement('path', {
-    d: path, class: 'session-reveal', pathLength: 1, 'stroke-dasharray': 1, 'stroke-dashoffset': 0,
-  });
-  line.dataset.reveal = 'line';
-  svg.append(svgElement('path', { d: path, class: 'session-line' }), line);
-  for (const index of new Set([0, .25, .5, .75, 1].map(n => Math.round(n * (minutes.length - 1))))) {
-    tick(points[index].x, bottom + 25, minutes[index].time, 'middle');
-  }
-  const guide = svgElement('path', { class: 'session-guide' });
-  const marker = svgElement('circle', { r: 6, class: 'session-point' });
-  svg.append(guide, marker);
-  const input = element('input');
-  input.type = 'range';
-  input.id = 'logged-minute';
-  input.min = 0;
-  input.max = minutes.length - 1;
-  const caption = element('label', '', 'Logged minute');
-  caption.htmlFor = input.id;
-  const output = element('output');
-  output.setAttribute('for', input.id);
-  const controls = element('div', 'session-controls');
-  controls.append(caption, input, output);
-  plot.append(svg, controls);
-  minutes.forEach((p, index) => {
-    readings.set('minute-' + index, () => ({
-      title: p.time + ' UTC',
-      value: number(p.fps) + ' fps',
-      description: [p.scene, 'Preparing ' + number(p.preparing) + ' ms',
-        'Copying back ' + number(p.copyingBack) + ' ms'].filter(Boolean).join(' · '),
-    }));
-  });
-  function selectMinute(index, announce = true) {
-    const point = points[index];
-    guide.setAttribute('d', 'M' + point.x + ' ' + top + 'V' + bottom);
-    marker.setAttribute('cx', point.x);
-    marker.setAttribute('cy', point.y);
-    input.value = index;
-    output.value = minutes[index].time + ' UTC';
-    input.setAttribute('aria-valuetext', output.value);
-    if (announce && view.selected !== 'minute-' + index) inspect('minute-' + index);
-  }
-  const moveScrubber = event => {
-    const box = svg.getBoundingClientRect();
-    const position = (event.clientX - box.left) / box.width * 780;
-    const closest = points.reduce((best, point, index) =>
-      Math.abs(point.x - position) < Math.abs(points[best].x - position) ? index : best, 0);
-    selectMinute(closest);
-  };
-  svg.addEventListener('pointermove', event => {
-    if (event.pointerType === 'mouse') moveScrubber(event);
-  });
-  svg.addEventListener('click', moveScrubber);
-  input.addEventListener('input', () => selectMinute(input.valueAsNumber));
-  selectMinute(minutes.length - 1, false);
-  return plot;
-}
-
 function gpuRing(load) {
   const figure = element('figure', 'ring-reading');
   const svg = svgElement('svg', { class: 'ring', viewBox: '0 0 110 110', 'aria-hidden': 'true' });
@@ -419,11 +339,17 @@ function updateTarget(value) {
     const reference = mark.dataset.reference === 'fps' ? value : frameBudget;
     mark.style.setProperty('--x', position(reference, Number(mark.dataset.limit)));
   }
+  const targetMetric = ui.plot.querySelector('.legend [data-inspect="goal"]');
+  if (targetMetric) {
+    const label = number(value, 0) + ' fps';
+    targetMetric.querySelector('.legend-value').textContent = label;
+    targetMetric.setAttribute('aria-label', 'FPS target ' + label);
+  }
   if (view.selected === 'goal') inspect('goal');
 }
 
-function animateChart(explicit = false) {
-  if (!explicit && motion.matches) return;
+function animateChart() {
+  if (motion.matches) return;
   for (const mark of ui.plot.querySelectorAll('[data-reveal]')) {
     for (const animation of mark.getAnimations()) animation.cancel();
     const reveal = mark.dataset.reveal;
@@ -432,15 +358,14 @@ function animateChart(explicit = false) {
     if (reveal === 'ring') keyframes = [
       { strokeDashoffset: '100' }, { strokeDashoffset: mark.getAttribute('stroke-dashoffset') },
     ];
-    if (reveal === 'line') keyframes = [{ strokeDashoffset: '1' }, { strokeDashoffset: '0' }];
     mark.animate(keyframes, {
-      duration: reveal === 'point' ? 300 : reveal === 'line' ? 1050 : 680,
+      duration: reveal === 'point' ? 300 : 680,
       delay: Number(mark.dataset.delay ?? 0),
       easing: 'cubic-bezier(.25,.08,.24,1)',
       fill: 'backwards',
     });
   }
-  if (explicit) ui.replay.firstElementChild.animate(
+  ui.replay.firstElementChild.animate(
     [{ transform: 'rotate(0deg)' }, { transform: 'rotate(360deg)' }],
     { duration: 450, easing: 'ease-out' },
   );
@@ -454,12 +379,11 @@ function renderChart() {
     number(resourceSamples, 0) + ' samples across the full session, including loading.';
   const display = {
     compare: ['Compare console profiles', 'The profiles share a scale in each chart. Change the target to move the gold markers.', makeComparison, 'fps-0'],
-    fps: ['Frame rate in the world', 'Drag the gold marker to compare the samples with a different target.', makeFrameRate, 'median'],
+    fps: ['Frame rate in the world', 'Select a metric for details. Drag the gold marker or use the target slider to compare.', makeFrameRate, 'median'],
     timing: view.mode === 'time' ?
       ['Frame timing', 'Separate medians for each timing counter.', makeFrameTiming, 'frame'] :
       ['Data transferred per frame', 'Median reported data volume by counter.', makeFrameTiming, 'copy'],
     hardware: ['GPU and memory', hardwareCaption, makeHardware, 'vram'],
-    session: ['Frame rate over the session', 'Move across the chart or use the slider to inspect a recorded minute.', makeSession, 'minute-' + (view.session?.minutes.length - 1)],
   };
   const [title, caption, makePlot, initial] = display[view.chart];
   byId('chart-title').textContent = title;
@@ -468,14 +392,13 @@ function renderChart() {
   ui.plot.replaceChildren(makePlot());
   const reading = ui.plot.nextElementSibling;
   reading.hidden = !readings.size;
-  ui.replay.hidden = !readings.size;
+  ui.replay.hidden = !readings.size || motion.matches;
   for (const control of ui.modes.querySelectorAll('[data-mode]')) {
     control.setAttribute('aria-pressed', String(control.dataset.mode === view.mode));
   }
   view.selected = '';
   updateTarget(view.target);
   inspect(initial);
-  animateChart();
 }
 
 function selectChart(name, focus = false) {
@@ -493,20 +416,10 @@ function selectChart(name, focus = false) {
 }
 
 function renderContext() {
-  const { benchmark: data, profile, session } = view;
+  const { benchmark: data, profile } = view;
   const comparing = view.chart === 'compare';
-  const playLog = view.chart === 'session';
-  byId('overview').hidden = comparing || playLog;
-  byId('profile-field').hidden = comparing || playLog || data.profiles.length < 2;
-  byId('target-panel').hidden = playLog;
-  byId('dashboard-grid').classList.toggle('session-view', playLog);
-  if (playLog) {
-    byId('benchmark-context').replaceChildren(
-      session.profile + ' · Play log · Build ', element('code', '', session.build),
-      ' · ' + session.minutes.length + ' recorded minutes',
-    );
-    return;
-  }
+  byId('overview').hidden = comparing;
+  byId('profile-field').hidden = comparing || data.profiles.length < 2;
   const date = new Intl.DateTimeFormat('en-GB', {
     day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC',
   }).format(new Date(data.date + 'T00:00:00Z'));
@@ -571,17 +484,11 @@ function bindTargetMarker() {
 }
 
 async function start() {
-  const sessionRequest = fetch(new URL('./play-log.md', import.meta.url), { cache: 'no-cache' })
-    .then(async response => response.ok ? parsePlayLog(await response.text()) : null)
-    .catch(() => null);
   const source = await fetch(new URL('./measurements.md', import.meta.url), { cache: 'no-cache' });
   if (!source.ok) throw new Error('Measurement source returned HTTP ' + source.status);
   const data = parseBenchmark(await source.text());
   view.benchmark = data;
-  const session = await sessionRequest;
-  view.session = session?.build === data.build ? session : null;
   byId('compare-tab').hidden = data.profiles.length < 2;
-  byId('session-tab').hidden = !view.session;
   const activeTabs = ui.tabs.filter(tab => !tab.hidden);
   const requested = location.hash.slice(1);
   view.chart = activeTabs.find(tab => tab.dataset.chart === requested)?.dataset.chart ?? activeTabs[0].dataset.chart;
@@ -616,7 +523,10 @@ async function start() {
   });
   ui.slider.addEventListener('input', () => updateTarget(ui.slider.valueAsNumber));
   for (const preset of ui.presets) preset.addEventListener('click', () => updateTarget(Number(preset.dataset.target)));
-  ui.replay.addEventListener('click', () => animateChart(true));
+  ui.replay.addEventListener('click', animateChart);
+  motion.addEventListener('change', () => {
+    ui.replay.hidden = !readings.size || motion.matches;
+  });
   bindTargetMarker();
   measurementsTable(data.profiles);
   renderProfile(data.profiles[0]);
