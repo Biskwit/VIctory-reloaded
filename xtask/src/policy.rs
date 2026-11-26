@@ -35,7 +35,6 @@ const ALLOWED_DOCUMENTATION: &[&str] = &[
     "docs/benchmark-data.js",
     "docs/charts/profile-frame-rate.svg",
     "docs/charts/profile-frame-timing.svg",
-    "docs/charts/session-frame-rate.svg",
     "docs/index.html",
     "scripts/generate-benchmark-charts.mjs",
 ];
@@ -101,7 +100,7 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
     )
 }
 
-fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
+pub(crate) fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
     let git = |args: &[&str]| -> Result<Option<Vec<String>>> {
         let out = Command::new("git")
             .args(args)
