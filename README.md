@@ -14,18 +14,17 @@ developer or publisher.
 > [!TIP]
 > **[View the gameplay screenshots](https://github.com/TaynanGT/Vice-Tay-Screenshots#readme)**
 >
-> Ten in-game captures from the Series S playtest.
+> Ten captures from the Series S playtest on build `672cf831`.
 
 ## At a glance
 
-- **It plays.** On the Series S profile the game goes from the prison through a
-  playable flashback, a boat, a camp, a fist fight and two shoot-outs, with menus,
-  the map, checkpoints, deaths and retries.
+- **Playable prologue.** In the latest Series S benchmark the world loaded in
+  126 seconds, and the run completed eight minutes of movement and camera tests.
 - **It is not fast enough yet.** Vice-Tay is measured on the Series S profile. On
   the current build the world runs at **21.5 fps** (median; 18.4-24.0 for most
   frames), short of the 30 fps goal.
-- **Memory holds steady.** The game holds 26.4 GB (median, 27.9 GB at most) through
-  the measured session, with no slowdown over time.
+- **Memory in the latest run.** The game used 26.4 GB of private memory at the
+  median and peaked at 27.9 GB during the eight-minute benchmark.
 
 ## Test PC
 
@@ -68,7 +67,8 @@ What these runs found and fixed on this PC is in
 
 ### Benchmark charts
 
-The charts show the current Series S measurement above, on an RTX 4090.
+The charts show the latest completed Series S benchmark on an RTX 4090.
+[Open the interactive dashboard](https://taynangt.github.io/Vice-Tay/).
 
 ![Median FPS, 1% lows and percentile ranges by run, with a 30 fps target](docs/charts/profile-frame-rate.svg)
 

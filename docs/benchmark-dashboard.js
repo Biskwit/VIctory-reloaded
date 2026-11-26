@@ -578,7 +578,8 @@ async function start() {
   if (!source.ok) throw new Error('Measurement source returned HTTP ' + source.status);
   const data = parseBenchmark(await source.text());
   view.benchmark = data;
-  view.session = await sessionRequest;
+  const session = await sessionRequest;
+  view.session = session?.build === data.build ? session : null;
   byId('compare-tab').hidden = data.profiles.length < 2;
   byId('session-tab').hidden = !view.session;
   const activeTabs = ui.tabs.filter(tab => !tab.hidden);

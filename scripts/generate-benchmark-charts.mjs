@@ -88,7 +88,8 @@ function frameRateChart({ build, profiles }) {
   });
   const description = profiles.map(({ label, fps }) =>
     `${label} median ${decimal(fps.median)} fps, 1% low ${decimal(fps.low)}, P10 to P90 ${decimal(fps.p10)} to ${decimal(fps.p90)}.`).join(' ');
-  return chart('Frame rate by run', `RTX 4090 · Build ${build} · In-world samples`, description, bottom + 47, elements);
+  const title = profiles.length === 1 ? profiles[0].label + ' frame rate' : 'Frame rate by run';
+  return chart(title, `RTX 4090 · Build ${build} · In-world samples`, description, bottom + 47, elements);
 }
 
 const timingCounters = [
@@ -132,7 +133,8 @@ function frameTimingChart({ profiles }) {
   <text x="${x(frameBudget)}" y="${top - 11}" fill="${target}" font-size="15" font-weight="650" text-anchor="middle">33.3 ms at 30 fps</text>`);
   const description = profiles.map(p =>
     p.label + ' – ' + timingCounters.map(([label, key]) => label + ' ' + decimal(p.timing[key]) + ' ms').join(', ') + '.').join(' ');
-  return chart('Frame timing by run', 'Median values for four recorded counters', description, bottom + 51, elements);
+  const title = profiles.length === 1 ? profiles[0].label + ' frame timing' : 'Frame timing by run';
+  return chart(title, 'Median values for four recorded counters', description, bottom + 51, elements);
 }
 
 function sessionChart({ profile, build, minutes }) {
@@ -190,8 +192,10 @@ const playLog = parsePlayLog(await readFile(new URL('../docs/play-log.md', impor
 const charts = {
   'profile-frame-rate.svg': frameRateChart(measurement),
   'profile-frame-timing.svg': frameTimingChart(measurement),
-  'session-frame-rate.svg': sessionChart(playLog),
 };
+if (playLog.build === measurement.build) {
+  charts['session-frame-rate.svg'] = sessionChart(playLog);
+}
 
 await Promise.all(Object.entries(charts).map(([name, svg]) =>
   writeFile(new URL('../docs/charts/' + name, import.meta.url), svg)));

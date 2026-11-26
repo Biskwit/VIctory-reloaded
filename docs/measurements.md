@@ -1,13 +1,13 @@
 # Measurements
 
 Build bc090416 (`cargo build --profile diag -p victory --features diagnostics`), 2026-11-26,
-on the test PC the README describes. Each session: `scripts\play.ps1` with the
+on the test PC in the README. The benchmark used revision `7d62e536`.
+The only change between that revision and `bc090416` is in the README. Each session: `scripts\play.ps1` with the
 RTX 4090 settings, full screen, past the start screen into the prologue, then
 every minute a capture, the camera turned, a walk, and a route (run, turn,
 look around, step aside) with another capture.
 
-Frame columns are medians over the world lines (once a second, over 1,000
-draws a frame). Memory and card columns are samples every 20 s over the whole
+Frame columns use recorded in-world samples with over 1,000 draws. Memory and card columns are samples every 20 s over the whole
 session, loading included.
 
 | Profile | world lines | fps median | p10 | p90 | 1% low | ms/frame | preparing | copies ms / MB | textures ms / MB | GPU ms | copying back ms / MB | draws | dropped draws | captures |
