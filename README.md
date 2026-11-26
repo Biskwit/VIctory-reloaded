@@ -130,8 +130,10 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 
 | Option | What it does |
 |---|---|
-| (none) | Full screen, Series X profile, settings picked for your graphics card |
+| (none) | Full screen, Series X profile, settings picked for your graphics card, performance panel on |
 | **F11** or **Alt+Enter** | Switch between full screen and a window while it runs |
+| **F3** | Hide or show the performance panel (FPS, frame times, GPU, CPU, VRAM and RAM) |
+| `-NoPanel` | Start without the performance panel |
 | `-Windowed` | Start in a window |
 | `-Console series-s` | Run as a Series S: a smaller picture, lighter on the card, faster |
 | `-Machine 4090` / `7900xtx` | Force the settings for NVIDIA (measured on the RTX 4090) or AMD |
