@@ -158,6 +158,14 @@ pub fn helper_own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
 }
 
+/// Whether pixel shaders that request early depth testing can use the host's
+/// early depth-stencil test. Off unless `VICTORY_EARLY_DEPTH=1`; the shader
+/// cache keys on this setting.
+pub fn early_depth_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_some_and(|v| v == "1"))
+}
+
 /// Which of a translated program's group barriers wait for the whole
 /// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
 /// fence and lose the wait. A wait that some thread of the group never

@@ -497,8 +497,12 @@ fn note_shown(hwnd: HWND) {
     }
     // SAFETY: both queries borrow a window of this thread's.
     let top = unsafe { wm::IsWindowVisible(hwnd) != 0 && wm::GetAncestor(hwnd, wm::GA_ROOTOWNER) == hwnd };
-    if top {
-        let _ = TITLE_WINDOW.compare_exchange(0, hwnd as usize, Ordering::Relaxed, Ordering::Relaxed);
+    if top
+        && TITLE_WINDOW
+            .compare_exchange(0, hwnd as usize, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        super::gameinput::mouse::attach(hwnd);
     }
 }
 
@@ -529,9 +533,13 @@ extern "system" fn window_proc(
         toggle_full_screen(hwnd);
         return 0;
     }
+    if title_window && message == wm::WM_INPUT {
+        super::gameinput::mouse::receive(hwnd, wparam, lparam);
+    }
     if message == wm::WM_NCDESTROY {
         WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).remove(&(hwnd as usize));
         if title_window {
+            super::gameinput::mouse::detach(hwnd);
             // a window the title makes again is its window then
             TITLE_WINDOW.store(0, std::sync::atomic::Ordering::Relaxed);
         }
