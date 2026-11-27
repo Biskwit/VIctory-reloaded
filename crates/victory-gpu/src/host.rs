@@ -54,6 +54,7 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    title_stock: title_stock::Stock,
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
@@ -551,7 +552,10 @@ fn sweep() {
     if crate::residency::pressured() {
         trim_spare_chunks();
     }
-    crate::pool::room(host().and_then(|h| h.video_memory()));
+    let host = host();
+    let memory = host.and_then(|h| h.video_memory());
+    if let Some(host) = host { host.trim_title_stock(memory); }
+    crate::pool::room(memory);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -1096,6 +1100,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            title_stock: Default::default(),
             adapter,
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
@@ -4384,6 +4389,7 @@ fn late_line(frames: f64) {
 
 pub(crate) mod aside;
 pub(crate) mod awake;
+mod title_stock;
 mod card_steps;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
@@ -10744,6 +10750,7 @@ impl Host {
             let presented = p.meter.record_present(p.hwnd, status);
             showing.end();
             if !presented { return None; }
+            self.start_title_stock();
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
@@ -10964,6 +10971,30 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let made = self.create_shared_buffer(size).and_then(|buffer| {
+            resident(&self.device, &buffer)?;
+            mapped(&self.device)?;
+            self.map_shared_buffer(buffer)
+        });
+        match made {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+
+    fn map_shared_buffer(&self, buffer: ID3D12Resource) -> windows::core::Result<(ID3D12Resource, *mut u8)> {
+        let mut data = std::ptr::null_mut();
+        // SAFETY: CPU-visible L0 memory. The owner keeps the map alive.
+        unsafe { buffer.Map(0, None, Some(&mut data))?; }
+        #[cfg(feature = "diagnostics")]
+        crate::book::made(&buffer, || "a shared buffer".into());
+        Ok((buffer, data.cast()))
+    }
+
+    fn create_shared_buffer(&self, size: u64) -> windows::core::Result<ID3D12Resource> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10987,9 +11018,8 @@ impl Host {
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
+        // SAFETY: plain creation with a live device and valid descriptor.
+        unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
@@ -10998,27 +11028,9 @@ impl Host {
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
                     &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        #[cfg(feature = "diagnostics")]
-        if made.is_ok()
-            && let Some(b) = &buffer
-        {
-            crate::book::made(b, || "a shared buffer".into());
+                )?;
         }
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
-                None
-            }
-        }
+        buffer.ok_or_else(windows::core::Error::empty)
     }
 
     /// Whether buffers can lie in the card's memory and be mapped by the CPU
@@ -12383,4 +12395,3 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(None), 10_000);
     }
 }
-
