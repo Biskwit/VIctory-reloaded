@@ -92,7 +92,14 @@ nothing from the game goes in the tree.*
       wall. Diagnostics builds name where that lock is held longest;
     - the write watch's journal keeps its pages in 4 MiB pieces instead of
       one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
-      of 111; the submitting thread about 1 ms less a frame.
+      of 111; the submitting thread about 1 ms less a frame;
+    - a submission is prepared while the one before it is sent: the line's
+      thread prepares and publishes it, a second thread (victory-send)
+      records the card-copy lists, waits for the heaps' records and sends
+      (`VICTORY_SUBMIT_SPLIT=0`: one thread, as before). In-run A/B over 4
+      launches: 53.1 -> 50.5 ms a frame, the title's wait at presents 19.9 ->
+      16.0 ms; its gate ran at 43.3-46.0 ms a frame (23 fps over a 15-minute
+      session).
 - **Not brought over (yet)** from our earlier tree (fxceless's fork with about
   140 commits of ours): its FidelityFX SDK path for the Series S upscale
   (Vice-Tay translates FSR 4's own code) and its other rendering fixes, which
