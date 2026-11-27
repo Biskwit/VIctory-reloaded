@@ -113,6 +113,11 @@ How each of these was found, with the numbers:
 
 ## Measuring
 
+With a diagnostics build, add `-More @{VICTORY_JOIN_REASONS='1'}` to log why
+the submission lane stopped joining work. The per-frame line separates a
+queue boundary, a wait, the configured limits, and submission dependencies.
+Compare it alongside the number of joined submissions in the same interval.
+
 - Every host list that ran is kept for reuse.
 - Frame dumps (`VICTORY_CAPTURE`) are encoded on a thread of their own, and the
   ones still queued are written before the process exits.
