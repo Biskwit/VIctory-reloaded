@@ -6502,7 +6502,7 @@ impl Host {
             };
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
-                for batch in submission_batches(&lists, &firsts, parts, compare_at) {
+                for batch in submission_batches(&lists, &firsts, &parts, compare_at) {
                     self.queue.ExecuteCommandLists(batch);
                 }
                 self.queue.Signal(&self.fence, *submitted)
