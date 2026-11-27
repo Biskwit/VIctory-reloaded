@@ -115,6 +115,17 @@ nothing from the game goes in the tree.*
       wave's group info, the card-copy compare in a call of its own, and the
       first piece of a parallel compare kept (6f179dd1, b4c3ceb2, 4fd34fdd,
       0dc5d1be, 41d3184e, 53c9ab5d, fa8fc1d4, 21ec8110);
+    - our threads kept off the processors the title pins its own to (an HLE
+      SetThreadGroupAffinity learns its masks; here it takes logical
+      processors 0-13): the eight list threads go to the slow cores it
+      leaves, the submitting thread to the fast ones it leaves
+      (`VICTORY_PLACE_APART=0`, `VICTORY_PLACE_LANE=0`: as before). In-run
+      2x2 over 3 launches: 42.3 -> 40.0 ms a frame with both; putting every
+      pool on the slow cores instead cost 5 ms, as threads the submitting
+      one waits for slowed down. Its gate ran at 38.3-41.9 ms a minute (about
+      25 fps). Also from Vice-Tay: a batch wakes only the helpers it can use
+      (d60fc84f), and the frame meter's 5-second lines run on a thread of
+      their own (f36a0fcf), about 30 ms every 5 s off the submitting thread;
     - the write watch's journal keeps its pages in 4 MiB pieces instead of
       one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
       of 111; the submitting thread about 1 ms less a frame;
