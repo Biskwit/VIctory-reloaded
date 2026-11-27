@@ -468,7 +468,7 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
         }
     }
     println!("{} containers not found", missing.len());
-    victory_shader::emit::set_host_max_wave(crate::translate::host_wave::requested().unwrap_or(64));
+    victory_shader::emit::set_host_max_wave(crate::requested_host_wave().unwrap_or(64));
     victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_none_or(|value| value == "1"));
     victory_shader::emit::set_view_heap_limit(view_limit);
     victory_shader::emit::set_raw_views(raw_views);

@@ -193,6 +193,14 @@ fn parse_jobs(value: &str) -> Result<usize, &'static str> {
         .map_err(|_| "expected a worker count of 1 or more")
 }
 
+fn requested_host_wave() -> Option<u32> {
+    translate::host_wave::select(
+        std::env::var("VICTORY_HOST_WAVE").ok().as_deref(),
+        std::env::var("VICTORY_HOST_MAX_WAVE").ok().as_deref(),
+        |message| eprintln!("{message}"),
+    )
+}
+
 fn main() -> Result<()> {
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
@@ -232,7 +240,7 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            let wave = translate::host_wave::requested();
+            let wave = requested_host_wave();
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs, wave);
             }

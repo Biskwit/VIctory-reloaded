@@ -1,12 +1,4 @@
-/// Resolve both spellings before dispatching an offline translation.
-pub(crate) fn requested() -> Option<u32> {
-    select(
-        std::env::var("VICTORY_HOST_WAVE").ok().as_deref(),
-        std::env::var("VICTORY_HOST_MAX_WAVE").ok().as_deref(),
-        |message| eprintln!("{message}"),
-    )
-}
-
+/// Resolve both spellings once, before dispatching either translate mode.
 pub(crate) fn select(
     wave: Option<&str>,
     alias: Option<&str>,
