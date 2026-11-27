@@ -62,11 +62,11 @@ fn has_upload_reserve(commit: u64, bake: bool) -> bool {
     commit >= if bake { 256 * MIB } else { 512 * MIB }
 }
 
-fn has_growth_reserve(commit: u64, bake: bool) -> bool {
+fn has_growth_reserve(commit: u64, bytes: u64, bake: bool) -> bool {
     // Growing a fresh 64 MiB upload block for speculative bindless prefetch
     // requires more headroom than reusing slices already committed inside the
     // staging pool.
-    commit >= if bake { 256 * MIB } else { 1024 * MIB }
+    commit.saturating_sub(bytes) >= if bake { 256 * MIB } else { 1024 * MIB }
 }
 
 /// Leave commit for game allocations and submissions already in flight while
@@ -83,11 +83,21 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
 /// (reusing existing free ranges in already-committed pool blocks stays open
 /// whenever `admit_texture_pass` is true).
 pub(crate) fn allow_staging_growth(bake: bool) -> bool {
+    allow_growth(0, bake)
+}
+
+/// Whether a second CPU-backed buffer can fit while leaving the existing
+/// growth reserve for streaming and submissions.
+pub(crate) fn allow_optional_buffer_growth(bytes: u64) -> bool {
+    allow_growth(bytes, false)
+}
+
+fn allow_growth(bytes: u64, bake: bool) -> bool {
     let now = crate::host::coarse_ms();
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_growth_reserve(sample_commit(now), bake)
+    has_growth_reserve(sample_commit(now), bytes, bake)
 }
 
 /// A PC with 32 GiB of RAM or less, or `VICTORY_RESIDENCY_LIMITED=1` (the
@@ -178,8 +188,15 @@ mod tests {
         ] {
             assert_eq!(has_upload_reserve(commit, true), bake);
             assert_eq!(has_upload_reserve(commit, false), lookahead);
-            assert_eq!(has_growth_reserve(commit, false), growth);
+            assert_eq!(has_growth_reserve(commit, 0, false), growth);
         }
+    }
+
+    #[test]
+    fn a_second_buffer_counts_against_the_growth_reserve() {
+        assert!(!has_growth_reserve(GIB, 64 * MIB, false));
+        assert!(has_growth_reserve(GIB + 64 * MIB, 64 * MIB, false));
+        assert!(!has_growth_reserve(512 * MIB, GIB, false));
     }
 
     #[test]

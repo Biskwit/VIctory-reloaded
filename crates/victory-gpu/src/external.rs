@@ -68,8 +68,8 @@ impl Recording<'_> {
 
     /// Record AMD's preparation after the upscaler, on the same host list.
     pub fn prepare_framegen(&self, input: crate::framegen::Inputs<'_>) {
-        if let Some(context) = crate::framegen::prepare(self.commands(), self.title_list, input) {
-            self.keep(context);
+        if let Some(preparation) = crate::framegen::prepare(self.commands(), self.title_list, input) {
+            self.host.keep_frame_preparation(preparation);
         }
     }
 }

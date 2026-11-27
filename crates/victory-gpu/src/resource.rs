@@ -376,6 +376,10 @@ pub(crate) struct Twin {
     /// the bits of a 24-bit depth plane, so the two are not copied: a pass
     /// draws the twin into the plane.
     pub(crate) plane: Option<std::sync::Arc<HostTexture>>,
+    /// Immutable SRVs for the depth-plane twin, initialized when first drawn.
+    pub(crate) plane_views: std::sync::Mutex<
+        Option<windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap>,
+    >,
 }
 
 #[cfg(windows)]
@@ -593,6 +597,7 @@ fn twin_texture(
         behind: std::sync::atomic::AtomicU32::new(0),
         through,
         plane,
+        plane_views: Default::default(),
     }))
 }
 
@@ -4509,7 +4514,8 @@ mod tests {
         host.execute(&[&fill]);
 
         // Closing a recording draws the depth plane's twin into the plane.
-        // Record two lists before executing to check both retain distinct heaps.
+        // Record both lists before executing: they may share the same
+        // immutable descriptors, and each holds its own reference.
         let list = host.new_list().unwrap();
         assert!(list.twin_use(depth, true, true));
         list.twins_written();
@@ -4523,7 +4529,7 @@ mod tests {
             let second = other.kept_shader_heaps();
             assert_eq!(first.len(), 1);
             assert_eq!(second.len(), 1);
-            assert_ne!(first[0], second[0], "recorded passes share descriptor storage");
+            assert_eq!(first[0], second[0], "the same twin should reuse its immutable descriptors");
         }
         drop(other);
         host.execute(&[&list]);

@@ -404,7 +404,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     // Two sides all the same, the card's in the PC's memory.
     let host = host()?;
-    if !cards() || !host.card_ready() {
+    if !cards() || !host.card_ready() || !crate::residency::allow_optional_buffer_growth(size) {
         return None;
     }
     let (buffer, _) = host.shared_buffer(size)?;
@@ -519,7 +519,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     }
     // Two sides all the same, the card's in the PC's memory.
     let host = host()?;
-    if !host.card_ready() {
+    if !host.card_ready() || !crate::residency::allow_optional_buffer_growth(size) {
         return None;
     }
     let (buffer, _) = host.shared_buffer(size)?;
@@ -5080,6 +5080,19 @@ impl Shadow {
         let shadow = Arc::new(shadow);
         std::mem::forget(shadow.clone());
         shadow
+    }
+
+    /// Includes a synthetic card copy in submission-time updates for a test.
+    pub(crate) fn track_carded_test(self: &Arc<Self>) -> impl Drop {
+        struct Tracked(std::sync::Weak<Shadow>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                CARDED.lock().unwrap().retain(|weak| !weak.ptr_eq(&self.0));
+            }
+        }
+        let weak = Arc::downgrade(self);
+        CARDED.lock().unwrap().push(weak.clone());
+        Tracked(weak)
     }
 
     /// What shaders wrote goes into title memory ([`put_changed`]).

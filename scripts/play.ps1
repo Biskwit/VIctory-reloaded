@@ -6,7 +6,7 @@
 # -NoPanel      without the performance panel (on by default, F3 hides it while playing)
 # -SkipShaders  start even when the shader cache is cold (otherwise every shader is translated first)
 # -Console      series-x (the default) or series-s: the console the title takes this PC for
-# -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance)
+# -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance)
 # -Dlss4K       NVIDIA DLSS at 3840x2160 (quality, balanced or performance); FSR if it cannot start
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -Machine      auto (the default: by the graphics card), 7900xtx, 4070, 4090 or laptop
@@ -60,16 +60,10 @@ if ($Machine -eq '7900xtx') {
         # taken (submit thread 104.7 -> 50.9 ms a frame, 12.1 -> 14.3 fps here).
         $settings.VICTORY_PLACED_ORDER = '1'
     }
-    # The console wave64 programs a 32-lane card takes only in the wave-wide
-    # form; this list of them ran without a lost device on this card for 30
-    # minutes (the losses of runs 121-124 had the form on for every program).
-    # Kept under -Safe too: without it those programs do not translate and
-    # their draws are dropped, the picture -Safe is there to check.
-    $settings.VICTORY_WAVE_WIDE_ONLY = '6f225b641c5b0708,5dc3b25986622949,369cbe906ea72764,2cc4c197ee29e291'
 }
 if ($Machine -eq '4070') {
     # Ryzen 7 7800X3D: eight physical cores, versus the 4090 test PC's sixteen.
-    # Keep the same wave64 allowlist and rendering profile; spend VRAM on
+    # Keep the same rendering profile; spend VRAM on
     # shader buffers before textures consume it. No approximate shader modes.
     $settings.VICTORY_THIN_THREADS = '8'; $settings.VICTORY_UNDER_THREADS = '6'; $settings.VICTORY_LAND_THREADS = '4'
     $settings.VICTORY_MAP_THREADS = '1'; $settings.VICTORY_PIPELINE_WORKERS = '3'
@@ -136,7 +130,7 @@ $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
 if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { Write-Host "No $Exe."; exit 1 }
 # (Other settings left over in this window go; where your files are stays.)
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR', 'VICTORY_DLSS_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR', 'VICTORY_FFX_FG_DIR', 'VICTORY_DLSS_DIR'
 $inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })
 foreach ($entry in $inherited) { Remove-Item "Env:$($entry.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }

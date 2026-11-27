@@ -740,59 +740,17 @@ fn free_upload(fences: &[u64; UPLOADS], turn: usize, completed: u64) -> Option<u
     (1..=UPLOADS).map(|offset| (turn + offset) % UPLOADS).find(|&slot| fences[slot] <= completed)
 }
 
-const UI_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
-const UI_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
-    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0,
-);
+use crate::compose::{UI_FORMAT, UI_READ, UiFrames};
 
-/// A full-size premultiplied UI image for AMD's final composition.
-struct UiSurface {
-    size: (u32, u32),
-    texture: ID3D12Resource,
-    heap: ID3D12DescriptorHeap,
-    ready: bool,
+struct PanelUi {
+    frames: UiFrames,
+    current: Option<usize>,
 }
 
-impl UiSurface {
-    fn new(host: &Host, (width, height): (u32, u32)) -> Option<Self> {
-        let heap_props = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            Width: u64::from(width),
-            Height: height,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            Format: UI_FORMAT,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-            ..Default::default()
-        };
-        // SAFETY: a single-mip RGBA texture and its private RTV.
-        unsafe {
-            let mut texture: Option<ID3D12Resource> = None;
-            host.device.CreateCommittedResource(
-                &heap_props,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                None,
-                &mut texture,
-            ).ok()?;
-            let texture = texture?;
-            let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(
-                &D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                    NumDescriptors: 1,
-                    ..Default::default()
-                },
-            ).ok()?;
-            host.device.CreateRenderTargetView(&texture, None, heap.GetCPUDescriptorHandleForHeapStart());
-            Some(Self { size: (width, height), texture, heap, ready: false })
-        }
-    }
+pub(super) enum Target<'a> {
+    BackBuffer,
+    SeparateUi,
+    GameUi(&'a ID3D12Resource),
 }
 
 /// A panel update uses an upload and can supply a separate UI texture.
@@ -816,7 +774,7 @@ pub(super) struct Panel {
     snap: Option<Snapshot>,
     changed: bool,
     buffers: Option<Buffers>,
-    ui: Option<UiSurface>,
+    ui: Option<PanelUi>,
     failed: bool,
 }
 
@@ -955,7 +913,7 @@ impl Panel {
         back: &ID3D12Resource,
         (width, height): (u32, u32),
         format: DXGI_FORMAT,
-        framegen: bool,
+        target: Target<'_>,
     ) -> Option<PanelCopy> {
         self.last_size = (width, height);
         if !shown().load(Ordering::Relaxed) || self.failed {
@@ -967,10 +925,12 @@ impl Panel {
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
+        let framegen = !matches!(target, Target::BackBuffer);
+        let separate = matches!(target, Target::SeparateUi);
         let format = if framegen { UI_FORMAT } else { format };
-        if framegen && self.ui.as_ref().is_none_or(|ui| ui.size != (width, height)) {
+        if separate && self.ui.as_ref().is_none_or(|ui| ui.frames.size != (width, height)) {
             // The presenter drains the proxy before replacing its back buffers.
-            self.ui = UiSurface::new(host, (width, height));
+            self.ui = UiFrames::new(host, (width, height)).map(|frames| PanelUi { frames, current: None });
             if self.ui.is_none() {
                 self.failed = true;
                 tracing::warn!("performance panel: could not allocate the frame generation UI texture");
@@ -1000,16 +960,22 @@ impl Panel {
         let buffers = self.buffers.as_mut()?;
         let upload = if self.changed { buffers.write(snap, completed, framegen) } else { None };
         if upload.is_some() { self.changed = false; }
+        if upload.is_none() && !buffers.uploaded { return None; }
         let (w, h) = size(scale);
-        let ui = self.ui.as_mut().filter(|_| framegen);
-        if let Some(ui) = ui.as_ref() {
-            if ui.ready && upload.is_none() {
+        let own_ui = if let Some(ui) = self.ui.as_mut().filter(|_| separate) {
+            if let Some(index) = ui.current
+                && upload.is_none()
+            {
                 self.cost += began.elapsed();
-                return Some(PanelCopy { upload, ui: Some(ui.texture.clone()) });
+                return Some(PanelCopy { upload, ui: Some(ui.frames.images[index].clone()) });
             }
-            list.keep(&ui.texture);
-            list.keep(&ui.heap);
-        }
+            let index = ui.current.map_or(0, |index| index ^ 1);
+            ui.current = Some(index);
+            Some(&ui.frames.images[index])
+        } else {
+            None
+        };
+        if let Some(ui) = own_ui { list.keep(ui); }
         let list = &list.list;
         // SAFETY: an open list and live resources; the box lies within both.
         unsafe {
@@ -1029,19 +995,19 @@ impl Panel {
                 )]);
                 buffers.uploaded = true;
             }
-            let target = if let Some(ui) = ui {
-                let before = if ui.ready {
-                    UI_READ
-                } else {
-                    // Only the panel rectangle has opaque pixels.
-                    list.ClearRenderTargetView(ui.heap.GetCPUDescriptorHandleForHeapStart(), &[0.0; 4], None);
-                    D3D12_RESOURCE_STATE_RENDER_TARGET
-                };
-                list.ResourceBarrier(&[transition(&ui.texture, before, D3D12_RESOURCE_STATE_COPY_DEST)]);
-                ui.ready = true;
-                &ui.texture
-            } else {
-                back
+            let target = match (own_ui, target) {
+                (Some(ui), _) => {
+                    let rtv = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    list.ResourceBarrier(&[transition(ui, UI_READ, rtv)]);
+                    list.ClearRenderTargetView(host.rtv(Some(ui), None), &[0.0; 4], None);
+                    list.ResourceBarrier(&[transition(ui, rtv, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    ui
+                }
+                (_, Target::GameUi(ui)) => {
+                    list.ResourceBarrier(&[transition(ui, UI_READ, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    ui
+                }
+                _ => back,
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&buffers.card),
@@ -1080,7 +1046,7 @@ impl Panel {
         self.cost += began.elapsed();
         Some(PanelCopy {
             upload,
-            ui: self.ui.as_ref().filter(|_| framegen).map(|ui| ui.texture.clone()),
+            ui: own_ui.cloned(),
         })
     }
 

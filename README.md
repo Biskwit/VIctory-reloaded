@@ -90,18 +90,20 @@ respectively. For Series S, pass `VICTORY_DLSS='quality'` or
 profile's output size. Both accept the same three presets.
 
 For FSR, point `VICTORY_FIDELITYFX_DIR` or `[paths].fidelityfx_dir` at the
-folder containing `amd_fidelityfx_upscaler_dx12.dll`. The 4K mode uses
-FSR 4.1.2, and the Series S mode uses the analytical 3.1.6 provider.
+folder containing `amd_fidelityfx_upscaler_dx12.dll`. The 4K mode prefers
+FSR 4.1.2 and uses 3.1.6 when that is what the adapter supports. Series S
+uses FSR 3.1.6. Both profiles can use FSR when DLSS fails.
 For DLSS on an RTX card, set `VICTORY_DLSS_DIR` or `[paths].dlss_dir` to
 select a folder with `nvngx_dlss.dll`. NGX uses the driver's copy by
 default. `VICTORY_DLSS_NO_UPDATE=1` uses the installed selection without
 an NGX update. [AMD FSR SDK](https://gpuopen.com/amd-fsr-sdk/) ·
 [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS)
 
-For 2× Series S frame generation, set `VICTORY_FRAMEGEN='1'` and point
-`VICTORY_FFX_FG_DIR` at the SDK 2.4.0 `Kits/FidelityFX/signedbin` folder
-with `amd_fidelityfx_loader_dx12.dll` and
-`amd_fidelityfx_framegeneration_dx12.dll`. This uses AMD's analytical
+For 2× Series S frame generation, set `VICTORY_FRAMEGEN='1'`. Point
+`VICTORY_FFX_FG_DIR` or `[paths].ffx_fg_dir` at the SDK 2.4.0
+`Kits/FidelityFX/signedbin` folder with `amd_fidelityfx_loader_dx12.dll`
+and `amd_fidelityfx_framegeneration_dx12.dll`. If neither is set, the FSR
+upscaler folder is used. This uses AMD's analytical
 3.1.6 frame generation provider. The launch below uses DLSS on an RTX card.
 
 ```powershell

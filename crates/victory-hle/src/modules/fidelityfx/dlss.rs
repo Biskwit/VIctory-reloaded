@@ -55,14 +55,14 @@ use windows::Win32::Graphics::Direct3D12::{ID3D12Device, ID3D12Resource};
 use windows::core::Interface;
 
 use super::{
-    CREATE_UPSCALE, CreateUpscale, DISPATCH_UPSCALE, DispatchUpscale, GET_PROVIDER_VERSION,
-    GET_RENDER_RESOLUTION, GET_VERSIONS, GetVersions, Header, MEMORY_USAGE_WITH_DEVICE,
-    MemoryUsageWithDevice, NO_PROVIDER, OK, PARAMETER, ProviderVersion, UNKNOWN_TYPE,
-    dispatch_output, host_state, minimum_extent,
+    Binding, CREATE_UPSCALE, CreateUpscale, DISPATCH_UPSCALE, DispatchUpscale, GET_PROVIDER_VERSION,
+    GET_RENDER_RESOLUTION, GET_UPSCALE_RATIO, GET_VERSIONS, GetVersions, Header,
+    MEMORY_USAGE_WITH_DEVICE, MemoryUsageWithDevice, NO_PROVIDER, OK, PARAMETER, ProviderVersion,
+    RatioQuery, RenderResolution, SetupError, UNKNOWN_TYPE, dispatch_output, host_state,
+    minimum_extent, with_resource_states,
 };
 
 // FidelityFX queries the bridge answers itself.
-const GET_UPSCALE_RATIO: u64 = 0x1_0002;
 const GET_JITTER_PHASE_COUNT: u64 = 0x1_0004;
 const GET_JITTER_OFFSET: u64 = 0x1_0005;
 const GPU_MEMORY_USAGE: u64 = 0x1_0008;
@@ -269,10 +269,10 @@ fn upscale_ratio(mode: u32) -> Option<f32> {
 
 /// FidelityFX's jitter sequence length for these widths.
 fn phase_count(render: u32, display: u32) -> i32 {
-    if render == 0 {
+    if render == 0 || display == 0 {
         return 0;
     }
-    (8.0 * (display as f32 / render as f32).powi(2)) as i32
+    ((8.0 * (display as f32 / render as f32).powi(2)) as i32).max(1)
 }
 
 fn halton(mut index: i32, base: i32) -> f32 {
@@ -608,6 +608,7 @@ struct Ngx {
     /// Shared by every context; NGX reads it during each call.
     parameters: Mutex<Parameters>,
     quality: i32,
+    ffx_quality: Option<u32>,
     presets: Presets,
     jitter_sign: [f32; 2],
     /// Whether the title's reactive mask goes to DLSS.
@@ -651,7 +652,12 @@ pub(super) fn active() -> bool {
 /// `NVSDK_NGX_PerfQuality_Value`), with `nvngx_dlss.dll` from `dir` if
 /// given and NGX's logs in `logs`. A summary of the setup, or why DLSS
 /// cannot run.
-pub(super) fn start(dir: Option<&Path>, logs: &Path, quality: i32) -> Result<String, String> {
+pub(super) fn start(
+    dir: Option<&Path>,
+    logs: &Path,
+    quality: i32,
+    ffx_quality: Option<u32>,
+) -> Result<String, String> {
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
         LoadLibraryExW,
@@ -827,6 +833,7 @@ pub(super) fn start(dir: Option<&Path>, logs: &Path, quality: i32) -> Result<Str
         shutdown,
         parameters: Mutex::new(parameters),
         quality,
+        ffx_quality,
         presets,
         jitter_sign,
         reactive,
@@ -1176,22 +1183,6 @@ pub(super) fn shut_down() {
 }
 
 #[repr(C)]
-struct RatioQuery {
-    header: Header,
-    quality: u32,
-    ratio: *mut f32,
-}
-
-#[repr(C)]
-struct RenderResolution {
-    header: Header,
-    display: [u32; 2],
-    quality: u32,
-    width: *mut u32,
-    height: *mut u32,
-}
-
-#[repr(C)]
 struct PhaseCount {
     header: Header,
     render_width: u32,
@@ -1242,6 +1233,10 @@ pub(super) fn query(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     if let Some((host, mut fallback)) = context_of(context).as_deref().and_then(fallback_of) {
         return super::query_on_host(host, &mut fallback, desc);
     }
+    query_dlss(desc, NGX.get().and_then(|ngx| ngx.ffx_quality))
+}
+
+fn query_dlss(desc: *mut Header, quality: Option<u32>) -> u32 {
     // SAFETY: the title passes a description; each type has its layout.
     unsafe {
         match (*desc).kind {
@@ -1264,14 +1259,14 @@ pub(super) fn query(context: *mut *mut c_void, desc: *mut Header) -> u32 {
             }
             GET_UPSCALE_RATIO => {
                 let q = &*desc.cast::<RatioQuery>();
-                let Some(ratio) = upscale_ratio(q.quality) else {
+                let Some(ratio) = upscale_ratio(quality.unwrap_or(q.quality)) else {
                     return PARAMETER;
                 };
                 put(q.ratio, ratio);
             }
             GET_RENDER_RESOLUTION => {
                 let q = &*desc.cast::<RenderResolution>();
-                let Some(ratio) = upscale_ratio(q.quality) else {
+                let Some(ratio) = upscale_ratio(quality.unwrap_or(q.quality)) else {
                     return PARAMETER;
                 };
                 put(q.width, (q.display[0] as f32 / ratio) as u32);
@@ -1309,15 +1304,31 @@ pub(super) fn query(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     OK
 }
 
-/// How a dispatch went on the title's list.
-enum Outcome {
-    Evaluated,
+/// Why a dispatch failed on the title's list.
+enum DispatchError {
     /// The dispatch itself was unusable (logged once, with the detail): the
     /// code for the title and what was wrong. The next may do.
     Refused(u32, &'static str),
     /// NGX failed: DLSS stops for this context.
     Failed(String),
 }
+
+impl From<SetupError> for DispatchError {
+    fn from(error: SetupError) -> Self {
+        match error {
+            SetupError::Aliased(index) => {
+                once!(warn, index, "DLSS: aliased arguments require conflicting resource states");
+                Self::Refused(PARAMETER, "conflicting states for one texture")
+            }
+            SetupError::Input(index) => {
+                once!(warn, index, "DLSS: an input could not be prepared on the title's list");
+                Self::Refused(PARAMETER, "an input not prepared")
+            }
+        }
+    }
+}
+
+type Outcome = Result<(), DispatchError>;
 
 /// A refused dispatch, counted: at [`REFUSALS`] in a row, DLSS stops for
 /// the context and the fallback (if any) takes this dispatch already.
@@ -1395,12 +1406,12 @@ pub(super) fn dispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         record_dispatch(list, ngx, &ctx, &dispatch, output_size)
     });
     match outcome {
-        Some(Outcome::Evaluated) => {
+        Some(Ok(())) => {
             ctx.refusals.store(0, Ordering::Relaxed);
             OK
         }
-        Some(Outcome::Refused(code, why)) => refused(&ctx, desc, code, why),
-        Some(Outcome::Failed(why)) => match stop(&ctx, &why, false) {
+        Some(Err(DispatchError::Refused(code, why))) => refused(&ctx, desc, code, why),
+        Some(Err(DispatchError::Failed(why))) => match stop(&ctx, &why, false) {
             // This frame too: FSR records on the same list after us.
             Mode::Fsr(_) => dispatch_fallback(&ctx, desc),
             _ => NO_PROVIDER,
@@ -1446,105 +1457,17 @@ fn stop(ctx: &Context, why: &str, device_removed: bool) -> Mode {
             Mode::Stopped
         }
     });
-    let fallback = match feature.mode {
-        Mode::Fsr(_) => "AMD FSR 4.1.2 upscales from now on",
-        _ => "none (no FSR folder): the title's FidelityFX dispatches fail",
+    let fallback_version = match feature.mode {
+        Mode::Fsr(_) => host.map(|h| h.version),
+        _ => None,
     };
     tracing::error!(
         reason = why,
-        fallback,
+        ?fallback_version,
         frames = ctx.frames.load(Ordering::Relaxed),
         "DLSS: stopped for this upscaler context"
     );
     feature.mode
-}
-
-/// A host backing's state on either side of the DLSS dispatch.
-#[derive(Clone, Copy)]
-struct Binding {
-    /// Native resource identity and the last state recorded on this list.
-    before: (usize, Option<u32>),
-    /// For an unknown title state, a successful dispatch leaves the NGX state.
-    declared: u32,
-    used: u32,
-    /// A failed dispatch may restore only a declared or observed state.
-    on_failure: Option<u32>,
-}
-
-/// Preparing an aliased input can move another binding into a copy state.
-/// Set NGX's states after all preparations, then restore the title's states
-/// whether preparation, feature creation or evaluation succeeds or fails.
-fn with_resource_states<T>(
-    bindings: [Option<Binding>; 7],
-    mut prepare: impl FnMut(usize) -> bool,
-    mut bind: impl FnMut(usize, u32) -> Result<T, Outcome>,
-    mut current: impl FnMut(usize) -> Option<(usize, Option<u32>)>,
-    mut restore: impl FnMut(usize, u32),
-    record: impl FnOnce(&[Option<T>; 7]) -> Outcome,
-) -> Outcome {
-    for (index, binding) in bindings.iter().enumerate() {
-        let Some(b) = binding else { continue };
-        if bindings[..index].iter().flatten().any(|other| {
-            other.before.0 == b.before.0
-                && (other.declared != b.declared
-                    || other.used != b.used
-                    || other
-                        .on_failure
-                        .zip(b.on_failure)
-                        .is_some_and(|(a, b)| a != b))
-        }) {
-            once!(
-                warn,
-                index,
-                "DLSS: aliased arguments require conflicting resource states"
-            );
-            return Outcome::Refused(PARAMETER, "conflicting states for one texture");
-        }
-    }
-    let mut all_bound = false;
-    let outcome = (|| {
-        if let Some(index) = (0..6).find(|&i| bindings[i].is_some() && !prepare(i)) {
-            once!(
-                warn,
-                index,
-                "DLSS: an input could not be prepared on the title's list"
-            );
-            return Outcome::Refused(PARAMETER, "an input not prepared");
-        }
-        let mut textures = std::array::from_fn(|_| None);
-        for (i, binding) in bindings.iter().enumerate() {
-            if let Some(b) = binding {
-                match bind(i, b.used) {
-                    Ok(texture) => textures[i] = Some(texture),
-                    Err(outcome) => return outcome,
-                }
-            }
-        }
-        all_bound = true;
-        record(&textures)
-    })();
-    for (i, binding) in bindings.iter().enumerate() {
-        if let Some(b) = binding {
-            let after = if matches!(outcome, Outcome::Evaluated) {
-                Some(b.declared)
-            } else {
-                b.on_failure
-            };
-            let Some(after) = after else { continue };
-            // A partial preparation can move a different binding into COPY_SOURCE.
-            // Leave untouched bindings alone even when their declarations differ.
-            let changed = if all_bound {
-                after != b.used
-            } else {
-                current(i)
-                    .is_some_and(|now| now != b.before && now.1.is_some_and(|state| state != after))
-            };
-            if changed {
-                restore(i, after);
-            }
-        }
-    }
-    outcome
 }
 
 /// The state DLSS gets a resource the title declared in `declared` (host
@@ -1583,7 +1506,7 @@ fn record_dispatch(
 ) -> Outcome {
     let mut feature = ctx.feature.lock().unwrap_or_else(|e| e.into_inner());
     if !feature.live || feature.mode != Mode::Dlss {
-        return Outcome::Refused(PARAMETER, "a context DLSS no longer serves");
+        return Err(DispatchError::Refused(PARAMETER, "a context DLSS no longer serves"));
     }
     let flags = ctx.upscale.flags;
     let mut bindings = [None; 7];
@@ -1596,7 +1519,7 @@ fn record_dispatch(
         let used = state_for(index == 6, declared);
         let Some(before) = list.texture_binding(resource) else {
             once!(warn, index, "DLSS: a resource has no host texture; the upscaling did not run");
-            return Outcome::Refused(PARAMETER, "a resource without a host texture");
+            return Err(DispatchError::Refused(PARAMETER, "a resource without a host texture"));
         };
         bindings[index] = Some(Binding {
             before,
@@ -1615,7 +1538,7 @@ fn record_dispatch(
             // Preparation may replace a mip-trimmed backing with a full one.
             let resource = dispatch.resources[index].resource.cast::<Object>();
             let Some((texture, state)) = list.texture(resource, used) else {
-                return Err(Outcome::Refused(
+                return Err(DispatchError::Refused(
                     PARAMETER,
                     "a resource without a host texture",
                 ));
@@ -1628,7 +1551,7 @@ fn record_dispatch(
                     used,
                     "DLSS: a resource cannot be in the state DLSS uses"
                 );
-                return Err(Outcome::Refused(
+                return Err(DispatchError::Refused(
                     PARAMETER,
                     "a resource in a state DLSS cannot use",
                 ));
@@ -1645,7 +1568,7 @@ fn record_dispatch(
                     height = desc.Height,
                     "DLSS: a resource cannot cover the dispatch rectangle"
                 );
-                return Err(Outcome::Refused(
+                return Err(DispatchError::Refused(
                     PARAMETER,
                     "a resource smaller than the dispatch",
                 ));
@@ -1668,7 +1591,7 @@ fn record_dispatch(
             )
         },
     );
-    if matches!(outcome, Outcome::Evaluated) {
+    if outcome.is_ok() {
         victory_gpu::external::output_written(dispatch.resources[6].resource.cast::<Object>());
     }
     outcome
@@ -1690,7 +1613,7 @@ fn evaluate(
     // Checked under the lock the shutdown takes: nothing is made or
     // evaluated after it.
     if SHUT_DOWN.load(Ordering::Acquire) {
-        return Outcome::Refused(NO_PROVIDER, "a dispatch after NGX shut down");
+        return Err(DispatchError::Refused(NO_PROVIDER, "a dispatch after NGX shut down"));
     }
     // Features the lists have let go of since the last dispatch.
     release_pending(ngx, &parameters);
@@ -1721,12 +1644,12 @@ fn evaluate(
         let result =
             unsafe { (ngx.create)(commands, SUPER_SAMPLING, parameters.object, &mut handle) };
         if !succeeded(result) || handle.is_null() {
-            return Outcome::Failed(format!(
+            return Err(DispatchError::Failed(format!(
                 "NVSDK_NGX_D3D12_CreateFeature failed: {} (render {:?}, output {output_size:?}, \
                  DLSS flags {flags:#x})",
                 result_name(result),
                 ctx.upscale.max_render,
-            ));
+            )));
         }
         feature.handle = Some(Arc::new(Handle(handle)));
         feature.output = output_size;
@@ -1754,7 +1677,7 @@ fn evaluate(
         }
     }
     let Some(shared) = feature.handle.clone() else {
-        return Outcome::Refused(PARAMETER, "no feature");
+        return Err(DispatchError::Refused(PARAMETER, "no feature"));
     };
     let handle = shared.0;
     // The list holds the feature until it has run, whatever becomes of the
@@ -1782,13 +1705,14 @@ fn evaluate(
     let result = unsafe { (ngx.evaluate)(commands, handle, parameters.object, 0) };
     drop(parameters);
     if !succeeded(result) {
-        return Outcome::Failed(format!(
+        return Err(DispatchError::Failed(format!(
             "NVSDK_NGX_D3D12_EvaluateFeature failed: {}",
             result_name(result)
-        ));
+        )));
     }
     if victory_gpu::framegen::requested()
         && let (Some(depth), Some(motion)) = (&textures[1], &textures[2])
+        && depth.as_raw() != motion.as_raw()
     {
         let read_state = |index: usize| {
             match state_for(false, host_state(dispatch.resources[index].state)) {
@@ -1807,7 +1731,7 @@ fn evaluate(
             render_size: values.render,
             upscale_flags: ctx.upscale.flags,
             jitter: dispatch.jitter,
-            motion_scale: values.motion_scale,
+            motion_scale: dispatch.motion_scale,
             frame_ms: values.frame_ms,
             reset: values.reset,
             camera: std::array::from_fn(|index| f32::from_bits(dispatch.settings[5 + index])),
@@ -1830,7 +1754,7 @@ fn evaluate(
     } else if frames == 1000 {
         tracing::info!("DLSS: 1000 frames evaluated");
     }
-    Outcome::Evaluated
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2032,7 +1956,7 @@ mod tests {
                     if i == 1 && fail_bind {
                         // A texture with incompatible flags got a different legal state.
                         state[i].set(0);
-                        return Err(Outcome::Refused(PARAMETER, "too small"));
+                        return Err(DispatchError::Refused(PARAMETER, "too small"));
                     }
                     Ok(i)
                 },
@@ -2046,18 +1970,18 @@ mod tests {
                         [COMPUTE_READ, 0xc0, UNORDERED_ACCESS]
                     );
                     if fail_create {
-                        Outcome::Failed("CreateFeature".into())
+                        Err(DispatchError::Failed("CreateFeature".into()))
                     } else {
-                        Outcome::Evaluated
+                        Ok(())
                     }
                 },
             );
             assert_eq!(called.get(), !fail_prepare && !fail_bind);
             assert_eq!(
-                matches!(result, Outcome::Refused(..)),
+                matches!(result, Err(DispatchError::Refused(..))),
                 fail_prepare || fail_bind
             );
-            assert_eq!(matches!(result, Outcome::Failed(_)), fail_create);
+            assert_eq!(matches!(result, Err(DispatchError::Failed(_))), fail_create);
             assert_eq!(
                 [state[0].get(), state[1].get(), state[6].get()],
                 [0x4, 0xc0, 0x80]
@@ -2076,6 +2000,7 @@ mod tests {
         for (index, declared, used, allowed) in [
             (1, 0x4, COMPUTE_READ, true),
             (1, 0x80, COMPUTE_READ, false),
+            (6, 0x4, COMPUTE_READ, false),
             (6, 0x4, UNORDERED_ACCESS, false),
         ] {
             let mut bindings = [None; 7];
@@ -2085,7 +2010,7 @@ mod tests {
                 used,
                 ..input
             });
-            let result = with_resource_states(
+            let result: Outcome = with_resource_states(
                 bindings,
                 |_| {
                     assert!(allowed);
@@ -2097,9 +2022,9 @@ mod tests {
                 },
                 |_| panic!("a rejected alias cannot need rollback"),
                 |_, _| assert!(allowed),
-                |_| Outcome::Evaluated,
+                |_| Ok(()),
             );
-            assert_eq!(matches!(result, Outcome::Evaluated), allowed);
+            assert_eq!(result.is_ok(), allowed);
         }
     }
 
@@ -2131,7 +2056,7 @@ mod tests {
             let result = with_resource_states(
                 bindings,
                 |_| true,
-                |_, _| Err::<(), _>(Outcome::Refused(PARAMETER, "bad input")),
+                |_, _| Err::<(), _>(DispatchError::Refused(PARAMETER, "bad input")),
                 |i| if i == 6 { Some((2, current)) } else { None },
                 |i, state| {
                     if i == 6 {
@@ -2140,9 +2065,41 @@ mod tests {
                 },
                 |_| panic!("a refused dispatch cannot be evaluated"),
             );
-            assert!(matches!(result, Outcome::Refused(..)));
+            assert!(matches!(result, Err(DispatchError::Refused(..))));
             assert_eq!(restored.get(), expected_restore);
         }
+    }
+
+    #[test]
+    fn series_s_dlss_answers_with_the_selected_fidelityfx_quality() {
+        let (mut width, mut height) = (0, 0);
+        let mut render = RenderResolution {
+            header: Header {
+                kind: GET_RENDER_RESOLUTION,
+                next: null_mut(),
+            },
+            display: [1920, 1080],
+            quality: 1,
+            width: &mut width,
+            height: &mut height,
+        };
+        assert_eq!(query_dlss(&mut render.header, None), OK);
+        assert_eq!([width, height], [1280, 720]);
+        assert_eq!(query_dlss(&mut render.header, Some(3)), OK);
+        assert_eq!([width, height], [960, 540]);
+        assert_eq!(render.quality, 1);
+
+        let mut ratio = 0.0;
+        let mut request = RatioQuery {
+            header: Header {
+                kind: GET_UPSCALE_RATIO,
+                next: null_mut(),
+            },
+            quality: 1,
+            ratio: &mut ratio,
+        };
+        assert_eq!(query_dlss(&mut request.header, Some(3)), OK);
+        assert_eq!(ratio, 2.0);
     }
 
     #[test]
@@ -2155,6 +2112,8 @@ mod tests {
         assert_eq!(phase_count(2560, 3840), 18);
         assert_eq!(phase_count(1920, 3840), 32);
         assert_eq!(phase_count(0, 3840), 0);
+        assert_eq!(phase_count(1920, 0), 0);
+        assert_eq!(phase_count(1920, 1), 1);
         // Halton (2, 3) from its second point, centred on the pixel.
         assert_eq!(jitter_offset(0, 18), [0.0, 1.0 / 3.0 - 0.5]);
         assert_eq!(jitter_offset(1, 18), [-0.25, 2.0 / 3.0 - 0.5]);
