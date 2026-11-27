@@ -105,3 +105,5 @@ How each of these was found, with the numbers:
   ones still queued are written before the process exits.
 - Diagnostics builds: `VICTORY_WALLS_TRACE=1` logs the source of each read-back;
   a placed texture view that gets no host view says why once per kind.
+- [VIctory-NVIDIA changes](victory-nvidia.md) covers the source revisions,
+  graphics fixes, optional settings and fault capture reader.
