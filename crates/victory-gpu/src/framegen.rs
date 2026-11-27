@@ -334,12 +334,28 @@ struct State {
     provider: u64,
     context: Option<Arc<Context>>,
     refused_layout: Option<([u32; 2], u32)>,
-    prepared: Option<(u64, bool)>,
+    prepared: Option<Prepared>,
     last_present: Option<u64>,
     real: u64,
     sample: Option<(Instant, u64, u32, u64)>,
     #[cfg(feature = "diagnostics")]
     cadence: Cadence,
+}
+
+#[derive(Clone, Copy)]
+struct Prepared {
+    frame: u64,
+    title_list: usize,
+    host_list: usize,
+    token: Option<u64>,
+    submitted: bool,
+    enabled: bool,
+}
+
+impl Prepared {
+    fn matches_present(self, frame: u64, token: Option<u64>) -> bool {
+        self.frame == frame && token.is_some() && self.token == token && self.submitted
+    }
 }
 
 #[cfg(feature = "diagnostics")]
@@ -358,6 +374,8 @@ struct Cadence {
     prepared: u64,
     present_no_prepare: u64,
     present_wrong_frame: u64,
+    present_wrong_token: u64,
+    present_before_submission: u64,
     present_reset: u64,
 }
 
@@ -534,6 +552,7 @@ fn make_context(api: &Api, state: &State, input: &Inputs<'_>) -> Option<Arc<Cont
 
 pub(crate) fn prepare(
     list: &ID3D12GraphicsCommandList,
+    title_list: crate::object::This,
     input: Inputs<'_>,
 ) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
     if !requested() {
@@ -658,7 +677,14 @@ pub(crate) fn prepare(
         // The SDK may already have recorded work before a failed return.
         return Some(context);
     }
-    state.prepared = Some((frame, enabled));
+    state.prepared = Some(Prepared {
+        frame,
+        title_list: title_list as usize,
+        host_list: list.as_raw() as usize,
+        token: None,
+        submitted: false,
+        enabled,
+    });
     #[cfg(feature = "diagnostics")]
     {
         state.cadence.prepared += 1;
@@ -666,6 +692,36 @@ pub(crate) fn prepare(
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| tracing::info!(frame, render = ?input.render_size, "frame generation: first AMD prepare recorded"));
     Some(context)
+}
+
+/// Bind the recorded upscaler input to the token supplied by the title on
+/// submission. Reusing the same list must not change an already bound token.
+pub(crate) fn bind_submission(lists: &[crate::object::This], token: u64) {
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(prepared) = state.prepared.as_mut()
+        && prepared.token.is_none()
+        && lists
+            .iter()
+            .any(|&list| list as usize == prepared.title_list)
+    {
+        prepared.token = Some(token);
+    }
+}
+
+/// Mark the input only after the graphics list was sent to the host queue.
+pub(crate) fn mark_submitted(lists: &[&crate::host::HostList]) {
+    if !requested() {
+        return;
+    }
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(prepared) = state.prepared.as_mut()
+        && !prepared.submitted
+        && lists
+            .iter()
+            .any(|list| list.list.as_raw() as usize == prepared.host_list)
+    {
+        prepared.submitted = true;
+    }
 }
 
 unsafe extern "C" fn generate(params: *mut Header, context: *mut c_void) -> u32 {
@@ -775,24 +831,28 @@ fn register_ui(api: &Api, state: &mut State, ui: Option<&ID3D12Resource>) -> boo
 pub(crate) fn present(
     swap_chain: &IDXGISwapChain3,
     frame: u64,
+    token: Option<u64>,
     ui: Option<&ID3D12Resource>,
 ) -> HRESULT {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
     let enabled = match state.prepared.take() {
-        Some((prepared, enabled)) if prepared == frame => {
+        Some(prepared) if prepared.matches_present(frame, token) => {
             #[cfg(feature = "diagnostics")]
-            if !enabled {
+            if !prepared.enabled {
                 state.cadence.present_reset += 1;
             }
-            enabled
+            prepared.enabled
         }
         _unmatched => {
             #[cfg(feature = "diagnostics")]
-            if _unmatched.is_some() {
-                state.cadence.present_wrong_frame += 1;
-            } else {
-                state.cadence.present_no_prepare += 1;
+            match _unmatched {
+                Some(prepared) if prepared.frame != frame => state.cadence.present_wrong_frame += 1,
+                Some(prepared) if prepared.token == token && !prepared.submitted => {
+                    state.cadence.present_before_submission += 1;
+                }
+                Some(_) => state.cadence.present_wrong_token += 1,
+                None => state.cadence.present_no_prepare += 1,
             }
             if let Some(api) = api() {
                 configure(api, &state, frame, false);
@@ -835,11 +895,16 @@ fn record_present(state: &mut State, presented: Option<u32>, enabled: bool) {
         state.sample = Some((now, state.real, presented, generated));
         return;
     };
-    let seconds = (now - at).as_secs_f64();
+    let elapsed = now - at;
+    let seconds = elapsed.as_secs_f64();
     if seconds >= 1.0 {
-        let real_fps = (state.real - real_then) as f64 / seconds;
-        let presented_fps = f64::from(presented_delta) / seconds;
-        let generated_fps = (generated - generated_then) as f64 / seconds;
+        let rendered_frames = state.real - real_then;
+        let presented_frames = presented_delta;
+        let generated_frames = generated - generated_then;
+        let sample_us = elapsed.as_micros() as u64;
+        let real_fps = rendered_frames as f64 / seconds;
+        let presented_fps = f64::from(presented_frames) / seconds;
+        let generated_fps = generated_frames as f64 / seconds;
         #[cfg(feature = "diagnostics")]
         {
             let rendered = u64::from((real_fps as f32).to_bits());
@@ -866,12 +931,18 @@ fn record_present(state: &mut State, presented: Option<u32>, enabled: bool) {
                     prepared = cadence.prepared,
                     present_no_prepare = cadence.present_no_prepare,
                     present_wrong_frame = cadence.present_wrong_frame,
+                    present_wrong_token = cadence.present_wrong_token,
+                    present_before_submission = cadence.present_before_submission,
                     present_reset = cadence.present_reset,
                     "frame generation: cadence"
                 );
             }
         }
         tracing::info!(
+            sample_us,
+            rendered_frames,
+            generated_frames,
+            presented_frames,
             enabled,
             "frame generation: {real_fps:.1} real fps, {generated_fps:.1} generated fps, {presented_fps:.1} fps presented"
         );
@@ -923,4 +994,29 @@ pub(crate) fn resize(
         state.format = surface_format(format).unwrap_or(0);
     }
     Some(resized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Prepared;
+
+    #[test]
+    fn generation_uses_only_the_submitted_list_for_the_presented_frame() {
+        let mut input = Prepared {
+            frame: 30,
+            title_list: 1,
+            host_list: 2,
+            token: None,
+            submitted: false,
+            enabled: true,
+        };
+        assert!(!input.matches_present(30, None));
+        input.token = Some(450);
+        assert!(!input.matches_present(30, Some(450)));
+        input.submitted = true;
+        assert!(input.matches_present(30, Some(450)));
+        assert!(!input.matches_present(31, Some(450)));
+        assert!(!input.matches_present(30, Some(451)));
+        assert!(!input.matches_present(30, None));
+    }
 }

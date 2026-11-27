@@ -6455,6 +6455,7 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            crate::framegen::mark_submitted(runs);
             #[cfg(feature = "diagnostics")]
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
@@ -6562,6 +6563,7 @@ impl Host {
             }
             let _ = (_i, started);
         }
+        crate::framegen::mark_submitted(runs);
         let _ = &firsts;
         let fence = *submitted;
         FINISHED.store(this_submission, Ordering::Release);
@@ -10180,7 +10182,7 @@ impl Host {
     /// shown; else, in diagnostics builds, whether the frame was black.
     #[allow(dead_code)]
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
-        self.present_planes(texture, state, None, frame)
+        self.present_planes(texture, state, None, frame, None)
     }
 
     /// Shows `texture`, optionally alpha-compositing a second `overlay` plane
@@ -10191,6 +10193,7 @@ impl Host {
         state: u32,
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
+        token: Option<u64>,
     ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
@@ -10232,7 +10235,7 @@ impl Host {
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made; showing base plane only");
                     drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+                    return self.present_planes(texture, state_u32, None, frame, token);
                 }
             }
         }
@@ -10278,7 +10281,7 @@ impl Host {
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made after resize; showing base plane only");
                     drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+                    return self.present_planes(texture, state_u32, None, frame, token);
                 }
             }
         }
@@ -10339,7 +10342,7 @@ impl Host {
                         drop(back);
                         drop(presenter);
                         tracing::warn!(%err, "could not record display composite; presenting the base plane");
-                        return self.present_planes(texture, state_u32, None, frame);
+                        return self.present_planes(texture, state_u32, None, frame, token);
                     }
                     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !ONCE.swap(true, Ordering::Relaxed) {
@@ -10469,7 +10472,7 @@ impl Host {
                 let ui = panel_copy.as_ref().and_then(|panel| panel.ui.as_ref());
                 #[cfg(not(feature = "diagnostics"))]
                 let ui = None;
-                crate::framegen::present(&p.swap_chain, frame, ui)
+                crate::framegen::present(&p.swap_chain, frame, token, ui)
             } else {
                 p.swap_chain.Present(0, DXGI_PRESENT(0))
             };
