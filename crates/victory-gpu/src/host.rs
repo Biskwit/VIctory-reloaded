@@ -11009,10 +11009,16 @@ impl Host {
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let (save_frame, capture_scene, read_now) = {
+                let listed = crate::capture::listed(frame);
+                let (save_frame, capture_scene) = crate::capture::requested(frame, listed, p.framegen);
+                (save_frame, capture_scene, save_frame || listed)
+            };
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
-            let game_ui = if p.framegen && planes.is_some() && !read_now {
+            #[cfg(not(feature = "diagnostics"))]
+            let capture_scene = false;
+            let game_ui = if p.framegen && planes.is_some() && (!read_now || capture_scene) {
                 if p.game_ui.as_ref().is_none_or(|ui| ui.size != (width, height)) {
                     p.game_ui = crate::compose::UiFrames::new(self, (width, height));
                 }
@@ -11126,8 +11132,21 @@ impl Host {
                 list.CopyResource(&back, texture);
             }
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
+            let scene_available = !capture_scene || planes.is_none() || game_ui.is_some();
+            #[cfg(feature = "diagnostics")]
+            if capture_scene && !scene_available {
+                tracing::warn!(frame, "could not separate the scene for capture before frame generation");
+            }
+            #[cfg(feature = "diagnostics")]
+            let capture = (save_frame && scene_available)
                 .then(|| {
+                    if capture_scene {
+                        tracing::info!(
+                            frame,
+                            title_ui_separate = game_ui.is_some(),
+                            "capturing the scene before frame generation"
+                        );
+                    }
                     if composed {
                         list.ResourceBarrier(&[transition(
                             &back,
@@ -11206,7 +11225,7 @@ impl Host {
             let _ = (flown, fence);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+                crate::capture::save_read_back(frame, capture_scene, &buffer, &footprint);
             }
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
