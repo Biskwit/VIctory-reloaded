@@ -2655,6 +2655,49 @@ struct Sent {
     handoff: Option<Box<Handoff>>,
 }
 
+/// Whether more of a published submission is left to others than the line's
+/// thread (on by default with [`split_send`]; `VICTORY_OFF_LINE=0`: as
+/// before; switched by `VICTORY_AB` too): the slots its steps on the card
+/// fill ([`card_steps::Slots`]) are written by [`sender`], and host lists
+/// are closed when they are reset after running (`crate::list::recycle`),
+/// not when one is taken for a title's list (`crate::list::detach`).
+///
+/// Why: the line's thread was 37 of a 39 ms frame (split-now-tl-3): 1.9 ms
+/// of it the slots (11,000 a frame, 7 ms on all threads), 1.1 ms closing 127
+/// new host lists a frame, each empty. The sender was idle 30 ms. Frames
+/// 1.7 ms shorter (split-now-off2-1..3).
+///
+/// The slots, published: the sender writes them after the submission's
+/// heaps' records and before its lists go to the queue, in the order
+/// submissions were published, as the slots that wait for textures.
+/// - Nothing of the preparing reads host heap slots (what a draw reads
+///   through a table it made itself, when recorded), so the next
+///   submission's preparing does not wait for them.
+/// - Records the title copied before the submission are made first, and
+///   the slot after them, as the card's fill comes after them on the
+///   console. (Before, the line's thread wrote the slot first and the
+///   records' round after it.) In the cell, no slot such a step fills had
+///   its title record changed at all (`VICTORY_SLOT_ORDER_COUNT=1`,
+///   split-now-cnt-1): the order changed nothing there.
+/// - The title writes such a slot again only once the submission ran (its
+///   fence), so no later record of its is written over.
+/// - A slot two submissions fill is written in their order: both by the
+///   sender, or the later one by the line's thread once every published
+///   one was sent ([`wait_sent`]).
+///
+/// The lists: a list taken for a title's list is closed (its next call is a
+/// reset). Reset and closed when it is given back, it is taken closed; one
+/// taken open (new, or given back with this off) is closed as before, and
+/// one taken closed to record into is reset again.
+pub(crate) fn off_line() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_OFF_LINE") {
+        return on && split_send();
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OFF_LINE").is_none_or(|v| v != "0")) && split_send()
+}
+
 /// Whether a submission's preparing and its sending are done by two threads
 /// in a row (on by default; `VICTORY_SUBMIT_SPLIT=0`: one thread does both,
 /// as before): the line's thread prepares the next submission while
@@ -2690,7 +2733,8 @@ struct Sent {
 ///   copies' references.
 /// - Not done: nothing of it is on the queue, its compare plan is not made
 ///   (only [`Host::relay_land`] reads it, once the card ran it), its slots
-///   that wait for textures are not made.
+///   that wait for textures are not made, nor (with [`off_line`]) the slots
+///   its steps on the card fill.
 ///
 /// Order: no submission of ours goes to the queue ahead of a published one.
 /// Every other one (waited for, the present's copy) first waits, under the
@@ -2785,6 +2829,8 @@ struct Handoff {
     take: Option<CardTake>,
     flown: bool,
     heaps: crate::descriptor::SyncedHeaps,
+    /// The slots its steps on the card fill ([`off_line`]).
+    slots: Option<card_steps::Slots>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; a handoff is touched by the
@@ -5743,6 +5789,11 @@ impl Host {
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        // The slots its steps on the card fill, after the records.
+        if let Some(slots) = h.slots.take() {
+            stage.next("sending: the slots steps on the card fill");
+            slots.write(true);
+        }
         #[cfg(feature = "diagnostics")]
         split.part(15);
         stage.next("sending: the lists");
@@ -6026,7 +6077,7 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
-        let own = if late { self.card_steps(runs) } else { None };
+        let mut own = if late { self.card_steps(runs, publish && off_line()) } else { None };
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
@@ -6248,6 +6299,7 @@ impl Host {
                 take,
                 flown,
                 heaps: heaps_synced,
+                slots: own.as_mut().and_then(card_steps::Taken::slots),
             };
             let sent = Sent {
                 number: this_submission,
