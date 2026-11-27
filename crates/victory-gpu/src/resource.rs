@@ -1230,8 +1230,9 @@ struct Hosted {
     /// When the host copy was last asked for (`crate::host::moment`),
     /// written under `made`'s lock.
     used: std::sync::atomic::AtomicU64,
-    /// The host refused to make it: not tried again.
-    refused: std::sync::atomic::AtomicBool,
+    /// Zero before allocation, then the deadline of the one recovery
+    /// attempt, or `u64::MAX` if the host refused permanently.
+    retry_at: std::sync::atomic::AtomicU64,
     /// Its host copy was let go as idle once.
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
@@ -1556,7 +1557,7 @@ pub(crate) fn host_waits(this: This) -> bool {
     }
     let r = resource(this);
     r.desc.dimension != BUFFER
-        && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
+        && r.host.retry_at.load(std::sync::atomic::Ordering::Relaxed) != u64::MAX
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
 }
 
@@ -1571,9 +1572,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     if made.is_none() {
-        if !make || r.host.refused.load(Relaxed) {
+        let retry_at = r.host.retry_at.load(Relaxed);
+        if !make || retry_at == u64::MAX {
             return None;
         }
+        if retry_at != 0 && crate::host::coarse_ms() < retry_at {
+            crate::residency::note_upload_deferred();
+            return None;
+        }
+        let first_attempt = retry_at == 0;
         let clear = r
             .host
             .clear
@@ -1605,7 +1612,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
+            let reserved = if partly {
+                host_texture_as(&r.desc, r.host.state, clear, true, first_attempt).ok()
+            } else {
+                None
+            };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1637,14 +1648,23 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 prefill = Some(found);
             }
         }
-        let texture = match texture {
-            Some(texture) => Some(texture),
-            None => host_texture(&r.desc.levels_from(base), r.host.state, clear),
+        let created = texture.map_or_else(
+            || host_texture_as(&r.desc.levels_from(base), r.host.state, clear, false, first_attempt),
+            Ok,
+        );
+        let texture = match created {
+            Ok(texture) => texture,
+            Err(error) => {
+                let retry = next_texture_retry(error.code(), first_attempt, crate::host::coarse_ms());
+                r.host.retry_at.store(retry, Relaxed);
+                if retry != u64::MAX {
+                    crate::residency::allocation_error(&error);
+                    crate::residency::note_upload_deferred();
+                }
+                return None;
+            }
         };
-        let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
-            return None;
-        };
+        r.host.retry_at.store(0, Relaxed);
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
         // the one target dumps and the captured frame's list of commands
@@ -2475,32 +2495,32 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, false).map(|made| made.0)
 }
 
-/// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
 #[cfg(windows)]
-fn host_texture(
-    desc: &ResourceDesc,
-    state: u32,
-    clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    host_texture_as(desc, state, clear, false)
+fn next_texture_retry(error: windows::core::HRESULT, first_attempt: bool, now: u64) -> u64 {
+    if first_attempt && error == windows::Win32::Foundation::E_OUTOFMEMORY {
+        now.saturating_add(crate::residency::UPLOAD_RETRY_MS)
+    } else {
+        u64::MAX
+    }
 }
 
-/// [`host_texture`]; `reserved`: without memory of its own, to be given
-/// tiles level by level (`crate::tiles`).
+/// Makes a host texture without the console's layout and flags. A reserved
+/// texture gets its memory as tiles arrive (`crate::tiles`).
 #[cfg(windows)]
 fn host_texture_as(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
     reserved: bool,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    first_attempt: bool,
+) -> windows::core::Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
-        return None;
+        return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG));
     }
-    let host = crate::host::host()?;
+    let unavailable = || windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL);
+    let host = crate::host::host().ok_or_else(unavailable)?;
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -2561,13 +2581,14 @@ fn host_texture_as(
                 &host.device,
                 (&raw const d).cast(),
                 D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32),
+                first_attempt,
             )
         }
     {
         crate::host::name(&t, || {
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
-        return Some(t);
+        return Ok(t);
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
@@ -2602,24 +2623,21 @@ fn host_texture_as(
             )
         }
     };
-    if let Err(e) = &made {
-        crate::residency::allocation_error(e);
+    if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
+        return Err(e);
     }
+    let texture = texture.ok_or_else(unavailable)?;
     if !reserved
-        && made.is_ok()
-        && let Some(t) = &texture
-        && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
+        && let Err(e) = crate::host::resident(&host.device, &texture).and_then(|()| crate::host::mapped(&host.device))
     {
         tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
-        texture = None;
+        return Err(e);
     }
-    if let Some(t) = &texture {
-        crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
-        });
-    }
-    texture
+    crate::host::name(&texture, || {
+        format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+    });
+    Ok(texture)
 }
 
 /// The host copy of title texture `this` if it is made and was made
@@ -2757,7 +2775,7 @@ fn hand_out_resource(
             // then color or depth and stencil: 5 words) or null.
             clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
             used: std::sync::atomic::AtomicU64::new(0),
-            refused: std::sync::atomic::AtomicBool::new(false),
+            retry_at: std::sync::atomic::AtomicU64::new(0),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -3440,6 +3458,51 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refused_texture_allocation_has_one_retry() {
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+        let delay = crate::residency::UPLOAD_RETRY_MS;
+        assert_eq!(next_texture_retry(E_OUTOFMEMORY, true, 100), 100 + delay);
+        assert_eq!(next_texture_retry(E_OUTOFMEMORY, false, 100 + delay), u64::MAX);
+        assert_eq!(next_texture_retry(E_INVALIDARG, true, 100), u64::MAX);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_retry_replaces_the_deferred_null_descriptor() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 4) else { return };
+        let null = std::ptr::null();
+        let desc = ResourceDesc { flags: 1, ..texture(4, 4, 28, 1) };
+        let mut title_texture = null;
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut title_texture),
+            S_OK,
+        );
+        let retry = &resource(title_texture).host.retry_at;
+        let mut words = [0u32; 4];
+        let handle = words.as_mut_ptr() as u64;
+        crate::descriptor::create_srv(null, title_texture, null.cast(), handle);
+
+        retry.store(u64::MAX - 1, Relaxed);
+        let (view, deferred) = crate::residency::upload_deferred_during(|| heap.mirror(0, handle, true));
+        assert!(view.is_some() && deferred);
+        assert!(heap.shows_none(0));
+        assert!(host_waits(title_texture));
+
+        // The same title record can be looked up after the cooldown.
+        while crate::host::coarse_ms() == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        retry.store(1, Relaxed);
+        let (view, deferred) = crate::residency::upload_deferred_during(|| heap.mirror(0, handle, true));
+        assert!(view.is_some() && !deferred);
+        assert!(heap.texture_slot_made_from(0, handle));
+        assert_eq!(retry.load(Relaxed), 0);
+        assert_eq!(slot::<Release>(title_texture, 0x10)(title_texture), 0);
     }
 
     fn heap(size: u64) -> This {

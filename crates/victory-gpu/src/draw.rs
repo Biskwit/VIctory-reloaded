@@ -2332,7 +2332,12 @@ impl State {
                     let placed = crate::descriptor::host::placed_texture(&view);
                     if let Some(&View::Shader(resource, _)) = placed.as_ref().or(Some(&view)) {
                         let resource = resource as This;
-                        let texture = crate::resource::host_resource(resource);
+                        let (texture, deferred) =
+                            crate::residency::upload_deferred_during(|| crate::resource::host_resource(resource));
+                        if deferred {
+                            host.restore_pending_list_flip(item);
+                            continue;
+                        }
                         let title_fills = texture.is_some_and(crate::texture::title_written);
                         let first = match (&placed, &view) {
                             (Some(_), View::Placed(_, _, desc)) => crate::resource::first_mip(desc),
@@ -2346,9 +2351,9 @@ impl State {
                             && (sync.is_some() || !crate::texture::unchanged(resource, first))
                         {
                             let was_staged = crate::texture::is_staged(resource);
-                            let _ = crate::residency::take_staging_deferred();
-                            readable(list, sampled.kind, &view);
-                            let failed = crate::residency::take_staging_deferred() || crate::residency::upload_refused();
+                            let (_, deferred) =
+                                crate::residency::upload_deferred_during(|| readable(list, sampled.kind, &view));
+                            let failed = deferred || crate::residency::upload_refused();
                             if !was_staged {
                                 crate::texture::unstage(resource);
                             }
@@ -2362,7 +2367,11 @@ impl State {
                 if let Some(sync) = sync.as_deref_mut() {
                     sync.publish.push((index, handle, key));
                 } else {
-                    let _ = host.mirror(index, handle, true);
+                    let (_, deferred) = crate::residency::upload_deferred_during(|| host.mirror(index, handle, true));
+                    if deferred {
+                        host.restore_pending_list_flip(item);
+                        continue;
+                    }
                 }
                 promoted += 1;
             }
@@ -2963,41 +2972,53 @@ impl State {
             // The view and the record it came from are read once: the upload
             // and whatever shows the slot later refer to that record, not to
             // one the title wrote to the slot meanwhile.
-            let (view, upload_key) = if sync_bake || shows_other || late {
-                match heap.handle(index).and_then(|handle| host.prepare_texture_slot(index, handle)) {
-                    Some((view, key)) => (Some(view), Some(key)),
-                    None => (None, None),
-                }
-            } else {
-                let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
-                (view, None)
+            let ((view, upload_key, placed), deferred) = crate::residency::upload_deferred_during(|| {
+                let (view, upload_key) = if sync_bake || shows_other || late {
+                    match heap.handle(index).and_then(|handle| host.prepare_texture_slot(index, handle)) {
+                        Some((view, key)) => (Some(view), Some(key)),
+                        None => (None, None),
+                    }
+                } else {
+                    let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+                    (view, None)
+                };
+                let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
+                (view, upload_key, placed)
+            });
+            let mirror_deferred = || {
+                crate::residency::upload_deferred_during(|| {
+                    if let Some(handle) = heap.handle(index) {
+                        let _ = host.mirror(index, handle, true);
+                    }
+                }).1
             };
-            let at_once = || {
-                if (late || (sync_bake && upload_key.is_some())) && let Some(handle) = heap.handle(index) {
-                    let _ = host.mirror(index, handle, true);
-                }
-            };
-            let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
-            if crate::residency::upload_refused() {
+            let at_once_deferred = || (late || (sync_bake && upload_key.is_some())) && mirror_deferred();
+            if deferred || crate::residency::upload_refused() {
                 served = false;
                 break;
             }
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
-                    at_once();
+                    if at_once_deferred() {
+                        served = false;
+                        break;
+                    }
                     host.texture_slot_done(index, write, None);
                     continue;
                 }
             };
-            let texture = crate::resource::host_resource(resource);
-            if crate::residency::upload_refused() {
+            let (texture, deferred) = crate::residency::upload_deferred_during(|| crate::resource::host_resource(resource));
+            if deferred || crate::residency::upload_refused() {
                 served = false;
                 break;
             }
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
-                at_once();
+                if at_once_deferred() {
+                    served = false;
+                    break;
+                }
                 // a render target, a depth or unordered access texture: the host's own
                 host.texture_slot_done(index, write, None);
                 continue;
@@ -3013,25 +3034,27 @@ impl State {
             };
             let same = !tabled && crate::texture::unchanged(resource, first);
             if same {
-                HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
                 if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), upload_key, heap.handle(index)) {
                     if let Some(copy) = crate::resource::host_copy(resource) {
                         sync.keep.push(copy);
                     }
                     sync.publish.push((index, handle, key));
                 } else {
-                    if shows_other && let Some(handle) = heap.handle(index) {
-                        let _ = host.mirror(index, handle, true);
+                    if shows_other && mirror_deferred() {
+                        served = false;
+                        break;
                     }
                     // Its bytes are in, or on the way there in a list before.
                     if late && texture.is_some_and(crate::pool::fresh) && !crate::texture::ahead::there(resource) {
                         if let (Some(handle), Some(key)) = (heap.handle(index), upload_key) {
                             host.texture_slot_show_after(list, index, handle, key);
                         }
-                    } else {
-                        at_once();
+                    } else if at_once_deferred() {
+                        served = false;
+                        break;
                     }
                 }
+                HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
                 let again = partly.map(|mapped| (frame + 1, mapped));
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
@@ -3065,22 +3088,21 @@ impl State {
                 break;
             }
             let late = late && ahead.is_none();
-            let _ = crate::residency::take_staging_deferred();
-            if let Some(view) = &view
-                && ahead.is_none()
-            {
-                // (What was found mapped of it a moment ago is not asked
-                // again, unless the host copy may need more.)
-                crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
-                readable(list, sampled.kind, view);
-                crate::texture::PICKING.set(None);
-            }
-            // A failed or deferred staging allocation leaves this slot due.
+            let (_, deferred) = crate::residency::upload_deferred_during(|| {
+                if let Some(view) = &view
+                    && ahead.is_none()
+                {
+                    // (What was found mapped of it a moment ago is not asked
+                    // again, unless the host copy may need more.)
+                    crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
+                    readable(list, sampled.kind, view);
+                    crate::texture::PICKING.set(None);
+                }
+            });
+            // An upload or backing deferred under memory pressure leaves this slot due.
             // Publishing it or marking it served would lose the only retry for
             // some materials.
-            if ahead.is_none()
-                && (crate::residency::take_staging_deferred() || crate::residency::upload_refused())
-            {
+            if ahead.is_none() && (deferred || crate::residency::upload_refused()) {
                 served = false;
                 break;
             }
@@ -4066,6 +4088,7 @@ impl State {
                         .map(|u| u.kind)
                         .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
                     let was = (listed.ready, listed.tabled);
+                    let mut read = kind.is_some();
                     if let Some(kind) = kind {
                         let tested = TESTED_DEPTH.get();
                         if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
@@ -4073,25 +4096,28 @@ impl State {
                                 TESTED_DEPTH.set((tested.0, true));
                             }
                         } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
-                            let _ = crate::residency::take_staging_deferred();
                             TESTED_DEPTH.set((tested.0, false));
-                            readable(list, kind, &view);
+                            let (_, deferred) = crate::residency::upload_deferred_during(|| readable(list, kind, &view));
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
-                            if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
+                            read = !deferred;
+                            if kind == ResourceType::Srv && read {
                                 listed.ready = (list.epoch(), tested.0, depth);
                             }
                         }
                     }
                     if let Some(title) = title_first
                         && listed.texture
-                        && listed.tabled != Some((title + k, kind.is_some()))
+                        && listed.tabled != Some((title + k, read))
                     {
-                        listed.tabled = Some((title + k, kind.is_some()));
-                        host.texture_slot_tabled(title + k, kind.is_some());
-                        if kind.is_some() {
-                            host.mirror_after(list, title + k, table + u64::from(k) * 32);
+                        if read {
+                            let (_, deferred) = crate::residency::upload_deferred_during(|| {
+                                host.mirror_after(list, title + k, table + u64::from(k) * 32);
+                            });
+                            read = !deferred;
                         }
+                        listed.tabled = Some((title + k, read));
+                        host.texture_slot_tabled(title + k, read);
                     }
                     if was != (listed.ready, listed.tabled) {
                         crate::descriptor::host::note_listed(recording, words, listed);
@@ -4124,13 +4150,15 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
-                        if let Some(kind) = kind {
-                            readable(list, kind, &view);
-                        }
+                        let (_, deferred) = crate::residency::upload_deferred_during(|| {
+                            host.make_at(index, &view);
+                            if let Some(kind) = kind {
+                                readable(list, kind, &view);
+                            }
+                        });
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
                         // (its texture is up to date now), and made in
@@ -4139,10 +4167,14 @@ impl State {
                         if let Some(title) = title_first
                             && crate::descriptor::host::is_texture_view(&view)
                         {
-                            host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() {
-                                host.mirror_after(list, title + k, table + u64::from(k) * 32);
+                            let mut read = kind.is_some() && !deferred;
+                            if read {
+                                let (_, deferred) = crate::residency::upload_deferred_during(|| {
+                                    host.mirror_after(list, title + k, table + u64::from(k) * 32);
+                                });
+                                read = !deferred;
                             }
+                            host.texture_slot_tabled(title + k, read);
                         }
                     }
                     None => {

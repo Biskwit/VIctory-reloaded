@@ -19,23 +19,28 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
+pub(crate) const UPLOAD_RETRY_MS: u64 = 500;
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
     if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
-        RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(500), Ordering::Relaxed);
+        RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(UPLOAD_RETRY_MS), Ordering::Relaxed);
     }
 }
 
 thread_local! {
-    static STAGING_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static UPLOAD_DEFERRALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-pub(crate) fn note_staging_deferred() {
-    STAGING_DEFERRED.set(true);
+pub(crate) fn note_upload_deferred() {
+    UPLOAD_DEFERRALS.set(UPLOAD_DEFERRALS.get().wrapping_add(1));
 }
 
-pub(crate) fn take_staging_deferred() -> bool {
-    STAGING_DEFERRED.replace(false)
+/// Detects upload deferral during this operation. Nested checks can observe
+/// the same deferral without consuming the enclosing operation's signal.
+pub(crate) fn upload_deferred_during<T>(work: impl FnOnce() -> T) -> (T, bool) {
+    let before = UPLOAD_DEFERRALS.get();
+    let result = work();
+    (result, UPLOAD_DEFERRALS.get() != before)
 }
 
 pub(crate) fn upload_refused() -> bool {
@@ -176,6 +181,17 @@ pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_upload_deferral_reaches_the_enclosing_operation() {
+        note_upload_deferred();
+        assert!(!upload_deferred_during(|| ()).1);
+        let (_, deferred) = upload_deferred_during(|| {
+            assert!(upload_deferred_during(note_upload_deferred).1);
+            assert!(!upload_deferred_during(|| ()).1);
+        });
+        assert!(deferred);
+    }
 
     #[test]
     fn bake_and_lookahead_leave_room_for_live_game_allocations() {

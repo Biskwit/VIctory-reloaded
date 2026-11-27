@@ -2060,7 +2060,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             if crate::residency::upload_refused()
                 || (speculative && !crate::residency::allow_staging_growth(false))
             {
-                crate::residency::note_staging_deferred();
+                crate::residency::note_upload_deferred();
                 return None;
             }
             let (buffer, data) = host.upload_buffer(total)?;
