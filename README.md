@@ -94,7 +94,14 @@ nothing from the game goes in the tree.*
       it under a gate of its own, not the guards' lock
       (`VICTORY_FAULT_FAST=0`: the lock, as before): about 72% of the faults
       that open a block take that path, and all threads' waits for the lock
-      fell another 55% (28-40 -> 12-18 ms a frame);
+      fell another 55% (28-40 -> 12-18 ms a frame). Two races in it that could
+      leave a write unreported were found by a stress test and fixed; each
+      has a test that holds the opener at the racy point (20 of 20 failed
+      without the fix, 0 of 20 with it);
+    - a guard-page fault inside one of our own copies re-arms the page
+      (Vice-Tay fa116500 + c2775339): it used to leave the title's guard page
+      (a thread's stack, for one) without its guard, which upstream traced to
+      silent exits a few minutes into the world;
     - the write watch's journal keeps its pages in 4 MiB pieces instead of
       one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
       of 111; the submitting thread about 1 ms less a frame;
