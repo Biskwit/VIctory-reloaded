@@ -2,7 +2,6 @@ use super::{Host, Prelude, host, lazy_prelude};
 use std::sync::{Mutex, OnceLock};
 
 const IDLE_LIMIT: usize = 128;
-const PRESSURED_LIMIT: usize = 16;
 
 struct IdlePrelude(Prelude);
 
@@ -31,28 +30,12 @@ impl Pool {
     }
 
     fn give(&self, prelude: Prelude) {
-        let limit = if crate::residency::pressured() {
-            PRESSURED_LIMIT
-        } else {
-            IDLE_LIMIT
-        };
+        // Retaining the bounded set avoids recreating command memory on
+        // every batch while host RAM pressure persists.
         let mut idle = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.len() < limit {
+        if idle.len() < IDLE_LIMIT {
             idle.push(IdlePrelude(prelude));
         }
-    }
-
-    pub(super) fn trim_for_pressure(&self) {
-        if !enabled() {
-            return;
-        }
-        let excess = {
-            let mut idle = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            let keep = idle.len().min(PRESSURED_LIMIT);
-            idle.split_off(keep)
-        };
-        // Release command memory after dropping the lock.
-        drop(excess);
     }
 }
 

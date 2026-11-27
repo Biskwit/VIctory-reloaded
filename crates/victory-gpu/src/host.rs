@@ -548,7 +548,6 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
-        prelude_pool::IDLE.trim_for_pressure();
     }
     let host = host();
     let memory = host.and_then(|h| h.video_memory());

@@ -55,8 +55,8 @@ How each of these was found, with the numbers:
   to 6 fps (`VICTORY_STRUCTURED_RAW=1` makes the copies).
 - **Reuse lazy state preludes** with `VICTORY_PRELUDE_POOL=1`. The pool
   takes the allocator and command list back after the owning list resets,
-  once its prior submission has finished. It holds up to 128 idle pairs,
-  or 16 under memory pressure. For a comparison, toggle the pool while
+  once its prior submission has finished. It holds up to 128 idle pairs.
+  For a comparison, toggle the pool while
   keeping the save, relay settings, resolution and cache the same.
 
 ## Picture
