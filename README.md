@@ -90,6 +90,11 @@ nothing from the game goes in the tree.*
       guards' lock from 54-60 to 32-36 ms a frame, most of it the title's own
       threads'. The frame does not move yet: the submitting thread is the
       wall. Diagnostics builds name where that lock is held longest;
+    - a write fault on a block whose page is shown at one address only opens
+      it under a gate of its own, not the guards' lock
+      (`VICTORY_FAULT_FAST=0`: the lock, as before): about 72% of the faults
+      that open a block take that path, and all threads' waits for the lock
+      fell another 55% (28-40 -> 12-18 ms a frame);
     - the write watch's journal keeps its pages in 4 MiB pieces instead of
       one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
       of 111; the submitting thread about 1 ms less a frame;
