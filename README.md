@@ -7,7 +7,7 @@
 >
 > **Nothing is expected or required.** Development will resume as soon as the limit is available again. If you would like to **optionally** help accelerate development and get us back to work earlier, voluntary donations go directly toward extra AI credits so we can return ahead of schedule; otherwise, the project will stay paused until Monday.
 >
-> **Ethereum (USDC, ERC-20):** `0x813E922837A7508d9A6838F171C63463f31A4717`
+> **Ethereum (USDC):** `0x813E922837A7508d9A6838F171C63463f31A4717`
 
 **Xbox Series compatibility on Windows, tuned on a GeForce RTX 4090.**
 
