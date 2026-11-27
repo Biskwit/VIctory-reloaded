@@ -22,10 +22,13 @@ the GPU can still produce incorrect geometry, depth or materials.
 ## Inspect the scene before frame generation
 
 With frame generation enabled, set `VICTORY_CAPTURE_SCENE_BEFORE_FRAMEGEN=1`
-along with the capture folder and frame list above. The selected PNGs show
-the scene before interpolation and HUD composition. The swap chain still
-composes the HUD and presents with frame generation when its input is ready.
-Use the frame number in the log to compare the PNG with the recorded output.
+and the capture folder above. List specific frames or create an empty
+`scene-next` file in that folder while the title is running. The next
+eligible present consumes the file. Each `scene-<frame>.png` shows the
+scene at full output resolution before interpolation and HUD composition.
+The swap chain still composes the HUD and presents with frame generation
+when its input is ready. Match the frame number and timestamp in the log to
+the recorded output. Exclude the synchronous readback from timing samples.
 
 ## Recording
 

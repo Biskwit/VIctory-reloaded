@@ -11009,11 +11009,13 @@ impl Host {
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let (save_frame, capture_scene, read_now) = {
+                let listed = crate::capture::listed(frame);
+                let (save_frame, capture_scene) = crate::capture::requested(frame, listed, p.framegen);
+                (save_frame, capture_scene, save_frame || listed)
+            };
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
-            #[cfg(feature = "diagnostics")]
-            let capture_scene = p.framegen && read_now && crate::capture::scene_before_framegen(frame);
             #[cfg(not(feature = "diagnostics"))]
             let capture_scene = false;
             let game_ui = if p.framegen && planes.is_some() && (!read_now || capture_scene) {
@@ -11136,7 +11138,7 @@ impl Host {
                 tracing::warn!(frame, "could not separate the scene for capture before frame generation");
             }
             #[cfg(feature = "diagnostics")]
-            let capture = (crate::capture::wanted(frame) && scene_available)
+            let capture = (save_frame && scene_available)
                 .then(|| {
                     if capture_scene {
                         tracing::info!(frame, "capturing the scene before frame generation");
@@ -11219,7 +11221,7 @@ impl Host {
             let _ = (flown, fence);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+                crate::capture::save_read_back(frame, capture_scene, &buffer, &footprint);
             }
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
