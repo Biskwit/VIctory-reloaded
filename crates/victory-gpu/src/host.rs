@@ -2728,6 +2728,49 @@ struct CardTake {
 }
 
 /// A published submission ([`split_send`]), for [`sender`].
+/// The lists of a submission in the calls to ExecuteCommandLists they go in:
+/// each joined part ([`Host::submit`]'s `parts`) in a call of its own, and the
+/// compare of copies in the card's memory from `compare_at` on (with the
+/// timestamp lists after it) in one more. Buffers decay to COMMON between
+/// calls, not between the lists of one call: a title list that promoted a
+/// copy to COPY_DEST left it there for the compare, which reads it as a
+/// shader resource. (After Vice-Tay fa8fc1d4.)
+fn submission_batches<'a, T>(
+    lists: &'a [T],
+    firsts: &'a [usize],
+    parts: &'a [usize],
+    compare_at: Option<usize>,
+) -> impl Iterator<Item = &'a [T]> {
+    let ends = parts.iter().filter_map(move |&part| firsts.get(part).copied());
+    let mut from = 0;
+    ends.chain(compare_at).chain([lists.len()]).filter_map(move |to| {
+        let batch = &lists[from..to];
+        from = to;
+        (!batch.is_empty()).then_some(batch)
+    })
+}
+
+#[cfg(test)]
+mod submission_tests {
+    use super::submission_batches;
+
+    #[test]
+    fn joined_parts_run_before_the_comparison_and_end_markers() {
+        let lists = [
+            "span start", "timeline start", "first", "prelude", "second", "compare", "timeline end", "span end",
+        ];
+        let batches: Vec<_> = submission_batches(&lists, &[2, 3], &[1], Some(5)).collect();
+        assert_eq!(batches, [&lists[..3], &lists[3..5], &lists[5..]]);
+    }
+
+    #[test]
+    fn a_submission_without_comparison_keeps_the_end_markers_with_the_last_part() {
+        let lists = ["timeline start", "first", "second", "timeline end"];
+        let batches: Vec<_> = submission_batches(&lists, &[1, 2], &[1], None).collect();
+        assert_eq!(batches, [&lists[..2], &lists[2..]]);
+    }
+}
+
 struct Handoff {
     /// Its number among the submissions started, and its fence value.
     number: u64,
@@ -5676,9 +5719,10 @@ impl Host {
             SEND_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         let card = h.take.take().and_then(|take| self.card_record(take, None, h.flown));
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+        let compare_at = card.as_ref().and_then(|c| c.check.clone()).map(|check| {
             h.lists.push(Some(check));
-        }
+            h.lists.len() - 1
+        });
         // The plan goes with its flight before the card can reach it.
         if let Some(card) = card {
             let mut line = line();
@@ -5704,27 +5748,30 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let stamp = stamps::take();
         #[cfg(feature = "diagnostics")]
-        if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
+        let compare_at = if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
             h.lists.insert(0, Some(ahead));
             h.lists.push(Some(behind));
             h.firsts.iter_mut().for_each(|first| *first += 1);
-        }
+            compare_at.map(|at| at + 1)
+        } else {
+            compare_at
+        };
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
         #[cfg(feature = "diagnostics")]
-        if let Some([front, behind]) = self.span_lists() {
+        let compare_at = if let Some([front, behind]) = self.span_lists() {
             h.lists.insert(0, Some(front));
             h.lists.push(Some(behind));
             h.firsts.iter_mut().for_each(|first| *first += 1);
-        }
-        let cuts: Vec<usize> = h.parts.iter().filter_map(|&n| h.firsts.get(n).copied()).collect();
+            compare_at.map(|at| at + 1)
+        } else {
+            compare_at
+        };
         // SAFETY: closed lists; the fence is ours, and its value was given
         // under the submission lock, in the order of this thread's sends.
         let signalled = unsafe {
-            let mut from = 0;
-            for to in cuts.into_iter().chain([h.lists.len()]) {
-                self.queue.ExecuteCommandLists(&h.lists[from..to]);
-                from = to;
+            for batch in submission_batches(&h.lists, &h.firsts, &h.parts, compare_at) {
+                self.queue.ExecuteCommandLists(batch);
             }
             self.queue.Signal(&self.fence, h.fence)
         };
@@ -6170,9 +6217,10 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+        let compare_at = card.as_ref().and_then(|c| c.check.clone()).map(|check| {
             lists.push(Some(check));
-        }
+            lists.len() - 1
+        });
         #[cfg(feature = "diagnostics")]
         split.part(4);
         if publish {
@@ -6224,28 +6272,31 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let stamp = stamps::take();
         #[cfg(feature = "diagnostics")]
-        if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
+        let compare_at = if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
             lists.insert(0, Some(ahead));
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
-        }
+            compare_at.map(|at| at + 1)
+        } else {
+            compare_at
+        };
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
-            if let Some([front, behind]) = self.span_lists() {
+            let compare_at = if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
-            }
-            let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+                compare_at.map(|at| at + 1)
+            } else {
+                compare_at
+            };
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
+                for batch in submission_batches(&lists, &firsts, &parts, compare_at) {
+                    self.queue.ExecuteCommandLists(batch);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -6281,19 +6332,22 @@ impl Host {
             working(was_working);
             return Some((submitted, sent));
         }
+        // The compare in a call of its own (`submission_batches`), after the
+        // last group.
+        let (title, comparison) = lists.split_at(compare_at.unwrap_or(lists.len()));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
             firsts
                 .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
+                .zip(firsts.iter().skip(1).chain([&title.len()]))
+                .map(|(&a, &b)| &title[a..b])
                 .collect()
         } else {
-            vec![&lists[..]]
+            vec![title]
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups = [title];
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -6301,6 +6355,9 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len() && !comparison.is_empty() {
+                    self.queue.ExecuteCommandLists(comparison);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
