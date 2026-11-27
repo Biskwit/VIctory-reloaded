@@ -168,6 +168,12 @@ Then play on the Series S profile, the one every session above uses:
 scripts\play.ps1 -Exe <path of your copy's executable> -Console series-s
 ```
 
+If the shader cache contains fewer than 1,000 stored translations,
+`play.ps1` runs `victory shaders` before launching the title. It scans the
+configured game directory when available, or the executable's directory.
+The driver may still build pipelines during the first run. Use `-SkipShaders`
+to skip the translation step.
+
 `Play-VIctory.cmd` takes the same options from a Command Prompt; on a double-click
 PowerShell asks for the executable's path.
 
