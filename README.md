@@ -1,11 +1,17 @@
 # Vice-Tay
 
+> [!IMPORTANT]
+> **Development Paused Until Monday, November 30 (AI Usage Limit Reached)**
+>
+> Active development on Vice-Tay is taking a brief pit stop until **Monday, November 30**: the AI copilot behind our workflow has reached its usage limit for the current cycle, and we are waiting for the quota to recharge before jumping back into the codebase.
+>
+> **Nothing is expected or required.** Development will resume as soon as the limit is available again. If you would like to **optionally** help accelerate development and get us back to work earlier, voluntary donations go directly toward extra AI credits so we can return ahead of schedule; otherwise, the project will stay paused until Monday.
+>
+> **Ethereum (USDC, ERC-20):** `0x813E922837A7508d9A6838F171C63463f31A4717`
+
 **Xbox Series compatibility on Windows, tuned on a GeForce RTX 4090.**
 
 Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory) to run an Xbox Series title from your own files. The title's x86-64 code runs on the host CPU. The compatibility layer provides the console APIs it calls and translates its graphics work to Direct3D 12.
-
-> [!NOTE]
-> Development is paused until Monday, November 30. The AI tool I use for this project has reached its weekly limit.
 
 [Quick start](#getting-started) · [Measurements](#measurements) · [Measurements on GitHub Pages](https://taynangt.github.io/Vice-Tay/)
 
