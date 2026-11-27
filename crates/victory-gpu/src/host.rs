@@ -866,9 +866,8 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
 /// About host lists, for the memory line: lists made by the host since the
 /// start; preludes made (a list's second allocator and list, made when it
 /// first needs one, [`lazy_prelude`]); and, in diagnostics builds, the
-/// bytes the process's private memory grew by while lists were being made
-/// (what a list costs: host objects with the driver's command memory; 631
-/// lists were alive in run 65, each with a prelude it may never use).
+/// sum of process-wide private-byte deltas around list creation. Samples
+/// include other threads' work and can overlap across concurrent calls.
 /// Then the lists alive that were never reset since they were made: the
 /// host sides of title lists the title made and has not used (a host list
 /// cost 0.68 MB of private memory in run 69: 431 MB for the 632 the title
@@ -4790,8 +4789,7 @@ impl Host {
         let before = private_bytes();
         let list = self.make_list();
         LISTS[0].fetch_add(1, Ordering::Relaxed);
-        // (May shrink while a list is made, on another thread's account:
-        // added as it is, the sum is what counts.)
+        // Keep the sign of each process-wide change in the sum.
         #[cfg(feature = "diagnostics")]
         LISTS[2].fetch_add(private_bytes().wrapping_sub(before), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]

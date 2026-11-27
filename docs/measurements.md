@@ -14,6 +14,11 @@ weight. P10 is the nearest-rank 10th percentile of their rendered FPS. A draw
 threshold can exclude menu samples. Keep the same scene and check the sample
 count in both runs.
 
+In the diagnostics memory report, the private-byte delta near the host-list
+counts sums process-wide changes sampled during list creation. Concurrent
+calls can overlap, and other threads can allocate or free memory in the same
+intervals. Measure allocator cost in a separate run.
+
 ## Series S frame generation
 
 On November 27, 2026, I measured a boat traversal on the RTX 4090 and Ryzen 9
