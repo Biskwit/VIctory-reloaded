@@ -138,6 +138,9 @@ Run these steps separately from the repository root to warm the shader cache and
 
 Pass an archive path to `shaders` to scan just that archive. `-SkipShaders` skips pretranslation at launch.
 `-WarmPipelines` runs the same `warm --used` command after pretranslation.
+When comparing warm-up times, `warm --used --batch-size 80` tests longer batches and
+`warm --used --normal-priority` tests normal worker priority. Change one option
+at a time. The defaults are 40 pipelines per worker process and idle priority.
 
 </details>
 
