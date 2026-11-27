@@ -46,6 +46,13 @@ nothing from the game goes in the tree.*
   - compute pipelines a dispatch asks for made first, and waited for within
     a cap, instead of dropped behind the draws' (`VICTORY_COMPUTE_FIRST=0`,
     `VICTORY_COMPUTE_WAIT`): cold launches kept the main character's head;
+  - clears of unordered access views (`ClearUnorderedAccessViewUint` and
+    `...Float`) are list methods; a clear did nothing before. The title
+    clears two things that way, once, when the world begins: FSR4's 21 MB
+    scratch block and an 80x45 texture with a value per 16x16 tile of the
+    picture. What they held instead is read: with bytes 0xff in them every
+    frame is white (`VICTORY_CLEAR_UAV=0`: left out, as before;
+    `=poison[:<byte>[:buffer|:texture]]`: that byte instead, diagnostics);
   - the control file, live switches, the texture view and window shots
     (diagnostics builds);
   - PIX captures taken from inside the run (diagnostics builds);
