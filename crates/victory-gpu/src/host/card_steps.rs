@@ -7,6 +7,9 @@ use std::sync::Arc;
 use super::*;
 use crate::shadow::Shadow;
 
+#[cfg(feature = "diagnostics")]
+mod redirect_stats;
+
 /// The stage (`VICTORY_CARD_STEPS`; off by default): `1` constant buffers
 /// of descriptor tables (`Step::Fill` with a slot of its own), `2` the
 /// title's buffer copies (`Step::Copy`) too, with the steps of the same
@@ -111,11 +114,28 @@ fn redirect_fills() -> bool {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILL_REDIRECT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILL_REDIRECT").is_some_and(|v| v == "1"))
 }
 
 /// Why [`plan`] refuses for [`place`].
 const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads, or reads or writes what it writes";
+const ELIGIBLE_CPU_FILL: &str = "remaining_cpu_fill_eligible";
+
+/// A planner observation stays local until this decision is actually used.
+#[derive(Default)]
+struct Behind {
+    steps: Option<(usize, usize)>,
+    cause: Option<&'static str>,
+    retry_chosen: Vec<Planned>,
+}
+
+impl Behind {
+    fn refuse(&mut self, steps: Option<(usize, usize)>, cause: &'static str) -> &'static str {
+        self.steps = steps;
+        self.cause = Some(cause);
+        BEHIND_PLACED
+    }
+}
 
 /// The bytes of our buffer between reading and writing: what one submission
 /// may do this way (each place read once, however many fills take it).
@@ -288,7 +308,7 @@ fn plan(
     stage: u32,
     by_order: bool,
     redirect_fills: bool,
-    behind: &mut Option<(usize, usize)>,
+    behind: &mut Behind,
 ) -> Result<Vec<Planned>, &'static str> {
     let takes = |d: &Does| match *d {
         Does::Copy { .. } if stage < 2 => Err("a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)"),
@@ -361,10 +381,11 @@ fn plan(
             };
             if !by_order || !redirect_fills {
                 let found = (p + 1..does.len()).find(|&i| taken[i] && in_the_way(i));
-                *behind = found.map(|i| (p, i));
                 if !by_order || found.is_some() {
-                    return Err(BEHIND_PLACED);
+                    let cause = if by_order { "redirect_disabled" } else { "ordering_disabled" };
+                    return Err(behind.refuse(found.map(|i| (p, i)), cause));
                 }
+                behind.steps = None;
                 continue;
             }
             let src_clean = || {
@@ -387,8 +408,7 @@ fn plan(
             for r in p + 1..does.len() {
                 if taken[r] && in_the_way(r) {
                     let Does::Fill { src: f_src, len: f_len, .. } = does[r] else {
-                        *behind = Some((p, r));
-                        return Err(BEHIND_PLACED);
+                        return Err(behind.refuse(Some((p, r)), "consumer_is_copy"));
                     };
                     let f_range = (f_src, f_src + f_len);
                     // If a later placed copy before `r` also writes `f_range`,
@@ -398,15 +418,23 @@ fn plan(
                         if f_src >= ld && f_src + f_len <= le {
                             continue;
                         }
-                        *behind = Some((p, r));
-                        return Err(BEHIND_PLACED);
+                        return Err(behind.refuse(Some((p, r)), "partial_newer_copy"));
                     }
                     let inside = f_src >= dst && f_src + f_len <= dst + len;
                     let dst_clean_between = !writes_between.iter().any(|&w| meet(w, f_range));
-                    let ok = !from_cpu && inside && dst_clean_between && *src_checked.get_or_insert_with(src_clean);
-                    if !ok {
-                        *behind = Some((p, r));
-                        return Err(BEHIND_PLACED);
+                    let cause = if from_cpu {
+                        Some("upload_source")
+                    } else if !inside {
+                        Some("partial_coverage")
+                    } else if !dst_clean_between {
+                        Some("destination_overwritten")
+                    } else if !*src_checked.get_or_insert_with(src_clean) {
+                        Some("source_overwritten")
+                    } else {
+                        None
+                    };
+                    if let Some(cause) = cause {
+                        return Err(behind.refuse(Some((p, r)), cause));
                     }
                     redirects[r] = Some(Redirect { address: src + (f_src - dst), placed: p });
                     continue;
@@ -489,11 +517,13 @@ fn plan(
 /// A placed copy whose bytes still depend on a flight does not update
 /// title memory during CPU preparation. Any CPU reader of its destination
 /// must wait, even if another fill was redirected to the card.
+/// A CPU upload source blocked directly by a flight cannot be promoted.
 fn remaining_cpu_reader(
     does: &[Does],
     chosen: &[Planned],
     written: &[(usize, usize)],
     readers_before_copy: bool,
+    mut stop: impl FnMut(usize) -> bool,
 ) -> Option<(usize, usize)> {
     let mut pending = Vec::new();
     for (i, step) in does.iter().enumerate() {
@@ -524,11 +554,29 @@ fn remaining_cpu_reader(
         };
         if let Some(&(placed, _)) = pending.iter().find(|&&(placed, dst)| {
             (readers_before_copy || placed < i) && meet(read, dst)
-        }) {
+        }) && stop(i) {
             return Some((placed, i));
         }
     }
     None
+}
+
+/// A fill has a GPU destination and the last placed copy touching it covers
+/// the full range. The planner still checks intervening writes and the host
+/// verifies the recorded backing and aliases before recording anything.
+fn can_promote_fill(does: &[Does], step: usize) -> bool {
+    let Does::Fill { src, len, to: true, .. } = does[step] else {
+        return false;
+    };
+    if len == 0 {
+        return false;
+    }
+    let read = (src, src + len);
+    let previous = does[..step].iter().rev().find(|d| {
+        matches!(**d, Does::Placed { dst, len, .. } if meet(read, (dst, dst + len)))
+    });
+    matches!(previous, Some(Does::Placed { dst, len, from_cpu: false, .. })
+        if *dst <= read.0 && read.1 <= *dst + *len)
 }
 
 fn plan_with_flights(
@@ -537,16 +585,76 @@ fn plan_with_flights(
     stage: u32,
     by_order: bool,
     redirect_fills: bool,
-    behind: &mut Option<(usize, usize)>,
+    behind: &mut Behind,
 ) -> Result<Vec<Planned>, &'static str> {
     let chosen = plan(does, stage, by_order, redirect_fills, behind)?;
     if !chosen.is_empty()
-        && let Some(reader) = remaining_cpu_reader(does, &chosen, written, place::readers_before_copy())
+        && let Some(reader) = remaining_cpu_reader(does, &chosen, written, place::readers_before_copy(), |_| true)
     {
-        *behind = Some(reader);
-        return Err(BEHIND_PLACED);
+        let (placed, step) = reader;
+        let cause = if placed == step {
+            "pending_upload_source"
+        } else {
+            match does[step] {
+                Does::Copy { .. } => "remaining_cpu_copy",
+                Does::Fill { to: false, .. } => "remaining_cpu_fill_cpu_only",
+                Does::Fill { .. } if can_promote_fill(does, step) => ELIGIBLE_CPU_FILL,
+                Does::Fill { .. } => "remaining_cpu_fill_without_covering_copy",
+                Does::Placed { .. } => "remaining_cpu_placed_copy",
+                _ => "remaining_cpu_read",
+            }
+        };
+        if by_order && redirect_fills && cause == ELIGIBLE_CPU_FILL {
+            behind.retry_chosen = chosen;
+        }
+        return Err(behind.refuse(Some(reader), cause));
     }
     Ok(chosen)
+}
+
+/// Re-plan once, keeping the original refusal if any CPU dependency or
+/// placed-copy restriction remains. Called only by preparation, after the
+/// original split decision has been used or ruled out.
+fn retry_cpu_fills(
+    does: &[Does],
+    written: &[(usize, usize)],
+    stage: u32,
+    by_order: bool,
+    redirect_fills: bool,
+    original: &Behind,
+) -> Option<(Vec<Planned>, u64)> {
+    if !by_order || !redirect_fills || original.cause != Some(ELIGIBLE_CPU_FILL) {
+        return None;
+    }
+    let mut promoted = Vec::new();
+    let still_waits = remaining_cpu_reader(
+        does, &original.retry_chosen, written, place::readers_before_copy(), |i| {
+            if matches!(does[i], Does::Fill { asked: false, .. }) && can_promote_fill(does, i) {
+                promoted.push(i);
+                false
+            } else {
+                true
+            }
+        },
+    );
+    if still_waits.is_some() || promoted.is_empty() {
+        return None;
+    }
+    let mut retry = does.to_vec();
+    for &i in &promoted {
+        if let Does::Fill { asked, .. } = &mut retry[i] {
+            *asked = true;
+        }
+    }
+    let chosen = plan_with_flights(
+        &retry, written, stage, by_order, redirect_fills, &mut Behind::default(),
+    ).ok()?;
+    if !promoted.iter().all(|i| {
+        chosen.binary_search_by_key(i, |p| p.index).is_ok_and(|at| chosen[at].redirect.is_some())
+    }) {
+        return None;
+    }
+    Some((chosen, promoted.len() as u64))
 }
 
 /// Whether a refresh of `does` brings a host copy other than `shadow` up to
@@ -644,12 +752,43 @@ pub(super) struct Preplan {
     steps: Vec<(usize, usize)>,
     redirect_fills: bool,
     chosen: Result<Vec<Planned>, &'static str>,
+    behind: Behind,
+}
+
+pub(super) struct Cut {
+    pub(super) at: usize,
+    #[cfg(feature = "diagnostics")]
+    trace: (bool, Option<&'static str>),
+}
+
+impl Cut {
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn applied(&self) {
+        PLACED_STATS[1].fetch_add(1, Ordering::Relaxed);
+        let (on, cause) = self.trace;
+        if let Some(cause) = cause {
+            redirect_stats::cut(on, cause);
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(super) struct RedirectWait {
+    on: bool,
+    why: &'static str,
+}
+
+#[cfg(feature = "diagnostics")]
+impl RedirectWait {
+    pub(super) fn finished(self, elapsed: std::time::Duration) {
+        redirect_stats::wait(self.on, self.why, elapsed);
+    }
 }
 
 /// What [`cut_or_plan`] found.
 pub(super) enum CutOrPlan {
     /// The submission is cut before this one of its lists.
-    Cut(usize),
+    Cut(Cut),
     /// It is not cut; its steps and their plan, for [`Host::card_steps`].
     Plan(Preplan),
     /// It is not cut, and nothing was worked out.
@@ -678,17 +817,21 @@ pub(super) fn cut_or_plan(runs: &[&HostList]) -> CutOrPlan {
         return CutOrPlan::None;
     }
     let (does, steps) = does_of(&written, runs);
-    let mut behind = None;
+    let mut behind = Behind::default();
     let redirect_fills = redirect_fills();
     let chosen = plan_with_flights(&does, &written, stage(), true, redirect_fills, &mut behind);
     if chosen == Err(BEHIND_PLACED) {
-        let cut = behind.and_then(|(placed, reader)| {
+        let cut = behind.steps.and_then(|(placed, reader)| {
             let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
             let cut = place(placed)? + 1;
             (place(reader)? >= cut).then_some(cut)
         });
-        if let Some(cut) = cut {
-            return CutOrPlan::Cut(cut);
+        if let Some(at) = cut {
+            return CutOrPlan::Cut(Cut {
+                at,
+                #[cfg(feature = "diagnostics")]
+                trace: (redirect_fills, behind.cause),
+            });
         }
     }
     if fill_title_mode() != 0 {
@@ -698,13 +841,7 @@ pub(super) fn cut_or_plan(runs: &[&HostList]) -> CutOrPlan {
     if crate::ab::bit("VICTORY_FILL_TITLE").is_some() {
         return CutOrPlan::None;
     }
-    CutOrPlan::Plan(Preplan { written, does, steps, redirect_fills, chosen })
-}
-
-/// Diagnostics: record a submission cut performed behind a placed copy.
-#[cfg(feature = "diagnostics")]
-pub(super) fn note_cut() {
-    PLACED_STATS[1].fetch_add(1, Ordering::Relaxed);
+    CutOrPlan::Plan(Preplan { written, does, steps, redirect_fills, chosen, behind })
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
@@ -913,7 +1050,12 @@ impl Host {
     /// now is reads of title memory that can all be done on the card
     /// ([`stage`]), the list that does them. `None` if nothing is in the
     /// way or the old wait is due. Under the submission lock.
-    pub(super) fn card_steps(&self, runs: &[&HostList], preplan: Option<Preplan>) -> Option<Taken> {
+    pub(super) fn card_steps(
+        &self,
+        runs: &[&HostList],
+        preplan: Option<Preplan>,
+        #[cfg(feature = "diagnostics")] wait: &mut Option<RedirectWait>,
+    ) -> Option<Taken> {
         if stage() == 0 || !relay_exact() {
             return None;
         }
@@ -935,7 +1077,16 @@ impl Host {
             let by_order = placed_order();
             let redirect_fills = redirect_fills();
             let preplan = preplan.filter(|p| p.written == written && by_order && p.redirect_fills == redirect_fills);
-            self.take_steps(&written, runs, preplan, by_order, redirect_fills)
+            #[cfg(feature = "diagnostics")]
+            let mut trace = redirect_stats::Attempt::new(redirect_fills);
+            let result = self.take_steps(
+                &written, runs, preplan, by_order, redirect_fills,
+                #[cfg(feature = "diagnostics")]
+                &mut trace,
+            );
+            #[cfg(feature = "diagnostics")]
+            { *wait = trace.finish(result.as_ref().err().copied()); }
+            result
         };
         match taken {
             Ok(taken) => taken,
@@ -956,21 +1107,43 @@ impl Host {
         preplan: Option<Preplan>,
         by_order: bool,
         redirect_fills: bool,
+        #[cfg(feature = "diagnostics")] trace: &mut redirect_stats::Attempt,
     ) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps, chosen) = match preplan {
-            Some(p) => (p.does, p.steps, p.chosen?),
+        let stage = stage();
+        let (does, steps, chosen, behind) = match preplan {
+            Some(p) => (p.does, p.steps, p.chosen, p.behind),
             None => {
                 let (does, steps) = does_of(written, runs);
-                let chosen = plan_with_flights(&does, written, stage(), by_order, redirect_fills, &mut None)?;
-                (does, steps, chosen)
+                let mut behind = Behind::default();
+                let chosen = plan_with_flights(&does, written, stage, by_order, redirect_fills, &mut behind);
+                (does, steps, chosen, behind)
             }
+        };
+        let chosen = match chosen {
+            Ok(chosen) => chosen,
+            Err(why) => match retry_cpu_fills(&does, written, stage, by_order, redirect_fills, &behind) {
+                Some((chosen, _promoted)) => {
+                    #[cfg(feature = "diagnostics")]
+                    { trace.promoted = _promoted; }
+                    chosen
+                }
+                None => {
+                    #[cfg(feature = "diagnostics")]
+                    { trace.cause = behind.cause; }
+                    return Err(why);
+                }
+            },
         };
         if chosen.is_empty() {
             return Ok(None);
         }
         let mapping = chosen.iter().any(|step| step.redirect.is_some())
             .then(crate::watch::changes);
+        #[cfg(feature = "diagnostics")]
+        if mapping.is_some() {
+            trace.planned(&chosen);
+        }
         spent.next("steps on the card: what holds their bytes");
         let mut writers = {
             let line = line();
@@ -982,6 +1155,8 @@ impl Host {
             all
         };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
+        #[cfg(feature = "diagnostics")]
+        let mut redirected_ops = 0u64;
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
         let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
@@ -1011,6 +1186,8 @@ impl Host {
             };
             if let Some(redirect) = redirect {
                 verify_redirect(runs, steps[redirect.placed], &from)?;
+                #[cfg(feature = "diagnostics")]
+                { trace.verified += 1; }
             }
             let place = (Arc::as_ptr(&from) as usize, read_src, len, level);
             let at = match places.get(&place) {
@@ -1051,9 +1228,22 @@ impl Host {
                 _ => match fill_to(runs, steps[i]) {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
-                    None => continue,
+                    None => {
+                        if redirect.is_some() {
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                trace.missing_target += 1;
+                            }
+                            return Err("a redirected fill has no recorded GPU destination");
+                        }
+                        continue;
+                    }
                 },
             };
+            #[cfg(feature = "diagnostics")]
+            if redirect.is_some() {
+                redirected_ops += 1;
+            }
             ops.push(Op {
                 from: (from, read_src),
                 len,
@@ -1139,9 +1329,9 @@ impl Host {
         DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         {
-            let redirected = chosen.iter().filter(|p| p.redirect.is_some()).count() as u64;
-            if redirected > 0 {
-                PLACED_STATS[0].fetch_add(redirected, Ordering::Relaxed);
+            if redirected_ops > 0 {
+                trace.executed = redirected_ops;
+                PLACED_STATS[0].fetch_add(redirected_ops, Ordering::Relaxed);
             }
             noted(&ops);
         }
@@ -1206,6 +1396,7 @@ pub(super) fn log(frames: f64) {
     );
     #[cfg(feature = "diagnostics")]
     {
+        redirect_stats::line();
         let redirected = PLACED_STATS[0].swap(0, Ordering::Relaxed) as f64 / frames;
         let cuts = PLACED_STATS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         if redirected > 0.0 || cuts > 0.0 {
@@ -1258,7 +1449,98 @@ mod tests {
         by_order: bool,
         behind: &mut Option<(usize, usize)>,
     ) -> Result<Vec<Planned>, &'static str> {
-        super::plan(does, stage, by_order, true, behind)
+        let mut observation = Behind {
+            steps: *behind,
+            ..Behind::default()
+        };
+        let result = super::plan(does, stage, by_order, true, &mut observation);
+        *behind = observation.steps;
+        result
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn redirect_refusals_explain_the_same_blocking_steps() {
+        let copy_on_card = Does::Placed { dst: 200, src: 100, len: 16, from_cpu: false };
+        let upload = Does::Placed { dst: 200, src: 100, len: 16, from_cpu: true };
+        let partial = Does::Placed { dst: 200, src: 500, len: 4, from_cpu: false };
+        type Case<'a> = (&'a [Does], &'a [(usize, usize)], (usize, usize), &'static str);
+        let cases: &[Case<'_>] = &[
+            (&[upload, fill(200, 8, true)], &[], (0, 1), "upload_source"),
+            (&[copy_on_card, fill(212, 8, true)], &[], (0, 1), "partial_coverage"),
+            (&[copy_on_card, partial, fill(200, 8, true)], &[], (0, 2), "partial_newer_copy"),
+            (&[upload, fill(400, 4, true)], &[(100, 116)], (0, 0), "pending_upload_source"),
+            (&[copy_on_card, fill(200, 4, true), fill(204, 4, false)], &[(100, 116)], (0, 2), ELIGIBLE_CPU_FILL),
+            (&[copy_on_card, fill(200, 4, true), stuck(204, 4)], &[(100, 116)], (0, 2), "remaining_cpu_fill_cpu_only"),
+            (&[copy_on_card, fill(200, 4, true), fill(212, 8, false)], &[(100, 116)], (0, 2), "remaining_cpu_fill_without_covering_copy"),
+        ];
+        for &(steps, air, pair, cause) in cases {
+            let mut behind = Behind::default();
+            assert_eq!(plan_with_flights(steps, air, 2, true, true, &mut behind), Err(BEHIND_PLACED));
+            assert_eq!(behind.steps, Some(pair));
+            assert_eq!(behind.cause, Some(cause));
+        }
+    }
+
+    #[test]
+    fn retry_redirects_a_second_fill_whose_range_is_not_in_the_flights() {
+        let placed = Does::Placed { dst: 200, src: 100, len: 16, from_cpu: false };
+        let does = [placed, fill(200, 4, true), fill(204, 4, false)];
+        let air = [(100, 116), (200, 204)];
+        assert!(!touches(&air, 204, 208));
+        let mut refusal = Behind::default();
+        assert_eq!(plan_with_flights(&does, &air, 2, true, true, &mut refusal), Err(BEHIND_PLACED));
+        assert_eq!(refusal.steps, Some((0, 2)));
+        let (chosen, promoted) = retry_cpu_fills(&does, &air, 2, true, true, &refusal).unwrap();
+        assert_eq!(promoted, 1);
+        assert_eq!(chosen, [
+            Planned { index: 1, level: 0, redirect: Some(Redirect { address: 100, placed: 0 }) },
+            Planned { index: 2, level: 0, redirect: Some(Redirect { address: 104, placed: 0 }) },
+        ]);
+        assert!(retry_cpu_fills(&does, &air, 2, true, false, &refusal).is_none());
+    }
+
+    #[test]
+    fn retry_keeps_the_original_refusal_if_a_cpu_only_fill_remains() {
+        let placed = Does::Placed { dst: 200, src: 100, len: 16, from_cpu: false };
+        let does = [placed, fill(200, 4, true), fill(204, 4, false), stuck(208, 4)];
+        let air = [(100, 116), (200, 204)];
+        let mut refusal = Behind::default();
+        assert_eq!(plan_with_flights(&does, &air, 2, true, true, &mut refusal), Err(BEHIND_PLACED));
+        assert_eq!(refusal.cause, Some(ELIGIBLE_CPU_FILL));
+        let promoted = retry_cpu_fills(&does, &air, 2, true, true, &refusal);
+        assert!(promoted.is_none());
+        assert_eq!(refusal.steps, Some((0, 2)));
+    }
+
+    #[test]
+    fn retry_counts_only_fills_left_out_of_the_first_plan() {
+        let placed = Does::Placed { dst: 200, src: 100, len: 16, from_cpu: false };
+        let does = [copy(200, 400, 4, true), placed, fill(200, 4, false), fill(204, 4, false)];
+        let air = [(100, 116), (400, 404)];
+        let mut refusal = Behind::default();
+        assert_eq!(plan_with_flights(&does, &air, 2, true, true, &mut refusal), Err(BEHIND_PLACED));
+        assert_eq!(refusal.steps, Some((1, 3)));
+        let (chosen, promoted) = retry_cpu_fills(&does, &air, 2, true, true, &refusal).unwrap();
+        assert_eq!(promoted, 1);
+        assert_eq!(chosen.iter().map(|p| p.index).collect::<Vec<_>>(), [0, 2, 3]);
+    }
+
+    #[test]
+    fn retry_never_skips_the_earlier_write_to_the_recorded_source() {
+        let placed = Does::Placed { dst: 200, src: 100, len: 16, from_cpu: false };
+        let does = [
+            Does::GpuWrite { from: 104, to: 108 },
+            fill(400, 4, true),
+            placed,
+            fill(204, 4, false),
+        ];
+        let air = [(100, 116), (400, 404)];
+        let mut refusal = Behind::default();
+        assert_eq!(plan_with_flights(&does, &air, 2, true, true, &mut refusal), Err(BEHIND_PLACED));
+        assert_eq!(refusal.steps, Some((2, 3)));
+        assert_eq!(refusal.cause, Some(ELIGIBLE_CPU_FILL));
+        assert!(retry_cpu_fills(&does, &air, 2, true, true, &refusal).is_none());
     }
 
     #[test]
@@ -1267,7 +1549,7 @@ mod tests {
         let redirected = fill(200, 4, true);
         let air = [(100, 116), (200, 204)];
         assert_eq!(
-            plan_with_flights(&[placed, redirected], &air, 2, true, true, &mut None),
+            plan_with_flights(&[placed, redirected], &air, 2, true, true, &mut Behind::default()),
             Ok(vec![Planned { index: 1, level: 0, redirect: Some(Redirect { address: 100, placed: 0 }) }]),
         );
         for reader in [
@@ -1276,13 +1558,13 @@ mod tests {
             copy(400, 204, 4, false),
             Does::Placed { dst: 400, src: 204, len: 4, from_cpu: true },
         ] {
-            let mut behind = None;
+            let mut behind = Behind::default();
             assert_eq!(
                 plan_with_flights(&[placed, redirected, reader], &air, 2, true, true, &mut behind),
                 Err(BEHIND_PLACED),
                 "{reader:?}",
             );
-            assert_eq!(behind, Some((0, 2)));
+            assert_eq!(behind.steps, Some((0, 2)));
         }
     }
 
@@ -1299,12 +1581,12 @@ mod tests {
     #[test]
     fn disabling_read_through_keeps_the_original_placed_copy_wait() {
         let placed = Does::Placed { dst: 200, src: 100, len: 16, from_cpu: false };
-        let mut behind = None;
+        let mut behind = Behind::default();
         assert_eq!(
             super::plan(&[placed, fill(200, 4, true)], 2, true, false, &mut behind),
             Err(BEHIND_PLACED),
         );
-        assert_eq!(behind, Some((0, 1)));
+        assert_eq!(behind.steps, Some((0, 1)));
     }
 
     fn copy(dst: usize, src: usize, len: usize, asked: bool) -> Does {

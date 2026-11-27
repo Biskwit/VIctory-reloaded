@@ -6857,11 +6857,12 @@ impl Host {
             // checks again, which costs a load for each list.)
             closed_for_execution(&runs);
             match card_steps::cut_or_plan(&runs) {
-                card_steps::CutOrPlan::Cut(cut) => {
+                card_steps::CutOrPlan::Cut(decision) => {
+                    let cut = decision.at;
                     match split(lists, order, cut) {
                         Ok([(lists, order), (more, behind)]) => {
                             #[cfg(feature = "diagnostics")]
-                            card_steps::note_cut();
+                            decision.applied();
                             let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
                             let second: Vec<usize> = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
                             self.execute_parts(lists, order, &first);
@@ -7234,7 +7235,17 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
-        let own = if late { self.card_steps(runs, preplan) } else { None };
+        #[cfg(feature = "diagnostics")]
+        let mut redirect_wait = None;
+        let own = if late {
+            self.card_steps(
+                runs, preplan,
+                #[cfg(feature = "diagnostics")]
+                &mut redirect_wait,
+            )
+        } else {
+            None
+        };
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
@@ -7243,6 +7254,8 @@ impl Host {
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            #[cfg(feature = "diagnostics")]
+            let timer = redirect_wait.map(|wait| (wait, std::time::Instant::now()));
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -7251,6 +7264,10 @@ impl Host {
                 });
             } else {
                 self.settle(&mut submitted, why);
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some((wait, began)) = timer {
+                wait.finished(began.elapsed());
             }
         }
         #[cfg(feature = "diagnostics")]
