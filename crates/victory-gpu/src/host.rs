@@ -4168,18 +4168,22 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 /// for the first time, is read as it was before that flight.
 fn fill_is_titles(src: usize, len: usize) -> bool {
     const SMALL: usize = 64 << 10;
-    static MODE: OnceLock<u32> = OnceLock::new();
-    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_TITLE").ok().as_deref() {
-        Some("1") => 1,
-        Some("2") => 2,
-        _ => 0,
-    });
+    let mode = fill_title_mode();
     #[cfg(feature = "diagnostics")]
     let mode = crate::ab::pick("VICTORY_FILL_TITLE").map_or(mode, |on| if on { 2 } else { 0 });
     if mode == 0 || len > SMALL {
         return false;
     }
     !crate::watch::landed_lately(src, len, 600) || mode == 1 && crate::watch::written_since_taken(src, len)
+}
+
+fn fill_title_mode() -> u32 {
+    static MODE: OnceLock<u32> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_TITLE").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
 }
 
 /// Diagnostics: the waits for flights, by what waited, why it was not done

@@ -460,10 +460,9 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
 
 /// What [`cut_or_plan`] worked out for a submission it did not cut: the
 /// steps and the plan of them, which [`Host::card_steps`] takes as they are
-/// if the flights still write what they wrote then (`written`), and works
-/// out again if not. (With `VICTORY_FILL_TITLE=1` `read_blocked` also asks
-/// the watch: that answer is the one from just before the submission lock
-/// was taken.)
+/// when the flights still write the same ranges (`written`) and the
+/// title-memory fill heuristic is off. With the heuristic enabled, the
+/// watch's answer can change while the flight ranges stay the same.
 pub(super) struct Preplan {
     written: Vec<(usize, usize)>,
     does: Vec<Does>,
@@ -514,6 +513,13 @@ pub(super) fn cut_or_plan(runs: &[&HostList]) -> CutOrPlan {
         if let Some(cut) = cut {
             return CutOrPlan::Cut(cut);
         }
+    }
+    if fill_title_mode() != 0 {
+        return CutOrPlan::None;
+    }
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::bit("VICTORY_FILL_TITLE").is_some() {
+        return CutOrPlan::None;
     }
     CutOrPlan::Plan(Preplan { written, does, steps, chosen })
 }
@@ -705,8 +711,8 @@ impl Host {
         let taken = if read {
             Err("a copy done on the card is read through another host copy")
         } else {
-            // (Only for the flights it was made for.)
-            self.take_steps(&written, runs, preplan.filter(|p| p.written == written))
+            let preplan = preplan.filter(|p| p.written == written);
+            self.take_steps(&written, runs, preplan)
         };
         match taken {
             Ok(taken) => taken,
