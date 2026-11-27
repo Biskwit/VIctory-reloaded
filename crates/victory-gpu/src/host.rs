@@ -10412,11 +10412,20 @@ impl Batch {
 /// Copies mapped title memory, preserving overlap and the standing
 /// write-watch query for a successful, covered private write.
 fn copy_raw_title(dst: usize, src: usize, len: usize) {
+    copy_raw_title_using_mapping(dst, src, len, crate::watch::title_memory_reading_now);
+}
+
+fn copy_raw_title_using_mapping(
+    dst: usize,
+    src: usize,
+    len: usize,
+    read_mapping: impl FnOnce() -> Option<crate::watch::Reading>,
+) {
     if len == 0 || dst.checked_add(len).is_none() || src.checked_add(len).is_none() {
         return;
     }
     let reading = if len <= crate::watch::RAW_COPY_WATCH_LIMIT {
-        crate::watch::title_memory_reading_now()
+        read_mapping()
     } else {
         None
     };
@@ -12571,7 +12580,11 @@ mod refresh_tests {
         let _tracked = shadow.track_carded_test();
         crate::watch::ask_once(&[(dst, dst + PAGE)]);
         let before = crate::watch::asked(dst, dst + PAGE).unwrap().0;
-        super::copy_raw_title(dst, value.as_ptr() as usize, value.len());
+        // This case exercises a covered copy with a stable mapping.
+        // Other GPU fixtures can be remapping unrelated pages concurrently.
+        super::copy_raw_title_using_mapping(dst, value.as_ptr() as usize, value.len(), || {
+            Some(crate::watch::title_memory_reading())
+        });
         let after = crate::watch::asked(dst, dst + PAGE);
         crate::watch::ask_once_end();
         let (asking, notes) = after.expect("the copy preserves the query");
