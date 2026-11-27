@@ -303,6 +303,11 @@ pub(crate) fn amd(device: &ID3D12Device) -> bool {
     vendor(device) == Some(0x1002)
 }
 
+/// Whether `device` is an NVIDIA card's.
+pub(crate) fn nvidia(device: &ID3D12Device) -> bool {
+    vendor(device) == Some(0x10DE)
+}
+
 /// Whether `device`'s card runs indirect dispatches of more than 65,535
 /// groups ([`widest`]): AMD's and NVIDIA's.
 fn runs_wide(device: &ID3D12Device) -> bool {

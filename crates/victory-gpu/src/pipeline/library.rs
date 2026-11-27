@@ -277,11 +277,22 @@ pub(crate) static UNSTORED: AtomicU64 = AtomicU64::new(0);
 /// compile with that sampler made a point sampler does. The library refuses
 /// an entry to a root signature with other samplers, so it is the stored
 /// binary itself. `VICTORY_LIBRARY_COMPARISON=1` stores them as before.
+///
+/// Where the library holds no pipeline with static samplers at all
+/// ([`SAMPLERS_OUT`]), any of them stays out.
 pub(crate) fn kept_out(samplers: &[D3D12_STATIC_SAMPLER_DESC]) -> bool {
+    // (Opened first: that decides `SAMPLERS_OUT`.)
+    let _ = library();
+    kept_out_with(samplers, SAMPLERS_OUT.load(Ordering::Relaxed))
+}
+
+/// [`kept_out`], `samplers_out` as [`SAMPLERS_OUT`] says.
+fn kept_out_with(samplers: &[D3D12_STATIC_SAMPLER_DESC], samplers_out: bool) -> bool {
     static STORE: OnceLock<bool> = OnceLock::new();
     const COMPARISON: i32 = 0x80;
-    !*STORE.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_COMPARISON").is_some_and(|v| v == "1"))
-        && samplers.iter().any(|s| s.Filter.0 & COMPARISON != 0)
+    (samplers_out && !samplers.is_empty())
+        || (!*STORE.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_COMPARISON").is_some_and(|v| v == "1"))
+            && samplers.iter().any(|s| s.Filter.0 & COMPARISON != 0))
 }
 
 /// While the guard lives, the pipelines this thread makes stay out of the
@@ -489,19 +500,37 @@ const EARLY_MAX: usize = 100_000;
 /// set when the library is opened ([`loads_from`]).
 static LOADS: AtomicBool = AtomicBool::new(true);
 
-/// Whether pipelines come from the library: `VICTORY_LIBRARY_LOAD=1` or `0`,
-/// else only on an AMD card. On NVIDIA (RTX 4090) the library's copies of
-/// pipelines draw wrong in a share of launches: the warm launches of the
-/// prologue's cell that loaded a library a cold launch had saved showed flat
-/// bands of colour (Vice-Tay's README lists them as unexplained) in 5 of 6
-/// launches, 1 of 3 with comparison pipelines kept out ([`kept_out`]), 1 of 3
-/// with a real shader hash too, and 0 of 6 that loaded none. Without it every
-/// pipeline is made, as on a first launch, and the early list still starts
-/// the early ones while the title loads: the cell came at 89 s instead of
-/// 75 and ran at 63.3 ms a frame instead of 62.1 (VIctory-reloaded runs
-/// vt-g-ss-nolib against fab5286's warm launch).
-fn loads_from(var: Option<&std::ffi::OsStr>, amd: bool) -> bool {
-    var.map_or(amd, |v| v == "1")
+/// Whether the pipelines with static samplers stay out of a library that
+/// loads ([`kept_out`]); set when the library is opened ([`loads_from`]).
+static SAMPLERS_OUT: AtomicBool = AtomicBool::new(false);
+
+/// Whether pipelines come from the library, and whether those with static
+/// samplers stay out of it: `VICTORY_LIBRARY_LOAD=1` loads all, `samplers`
+/// all but those, any other value none; unset, all on an AMD card, all but
+/// those on NVIDIA, none on others.
+///
+/// On NVIDIA (RTX 4090) the library's copies of pipelines drew wrong in a
+/// share of launches: the warm launches of the prologue's cell that loaded a
+/// library a cold launch had saved showed flat bands of colour (Vice-Tay's
+/// README lists them as unexplained) in 5 of 6 launches, 1 of 3 with
+/// comparison pipelines kept out ([`kept_out`]), 1 of 3 with a real shader
+/// hash too, and 0 of 6 that loaded none; so none was loaded there. Vice-Tay
+/// (fa8fc1d4) found the cause narrower: the driver restores a pipeline's
+/// static samplers by the indices of the process that stored it, and a
+/// process that makes its samplers in another order gets other filters or
+/// address modes (our pale picture was such a copy, a point sampler where a
+/// comparison was). Only the pipelines with static samplers are made every
+/// launch now; the others load. Loading none, every pipeline was made as on
+/// a first launch: the cell came at 89 s instead of 75 and ran at 63.3 ms a
+/// frame instead of 62.1 (VIctory-reloaded runs vt-g-ss-nolib against
+/// fab5286's warm launch).
+fn loads_from(var: Option<&std::ffi::OsStr>, amd: bool, nvidia: bool) -> (bool, bool) {
+    match var.map(|v| v.to_str()) {
+        Some(Some("1")) => (true, false),
+        Some(Some("samplers")) => (true, true),
+        Some(_) => (false, false),
+        None => (amd || nvidia, nvidia),
+    }
 }
 
 /// Whether this run loads pipelines from the library ([`loads_from`]).
@@ -515,10 +544,17 @@ fn library() -> Option<&'static Library> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let loads = loads_from(std::env::var_os("VICTORY_LIBRARY_LOAD").as_deref(), crate::indirect::amd(&device));
+            let (loads, samplers_out) = loads_from(
+                std::env::var_os("VICTORY_LIBRARY_LOAD").as_deref(),
+                crate::indirect::amd(&device),
+                crate::indirect::nvidia(&device),
+            );
             LOADS.store(loads, Ordering::Relaxed);
+            SAMPLERS_OUT.store(samplers_out, Ordering::Relaxed);
             if !loads {
                 tracing::info!("host pipeline library not loaded on this card (VICTORY_LIBRARY_LOAD=1 loads it)");
+            } else if samplers_out {
+                tracing::info!("host pipelines with static samplers stay out of the library on this card (VICTORY_LIBRARY_LOAD=1 puts them in)");
             }
             // An empty library without loads: it stores nothing, so only the
             // early list is saved.
@@ -870,30 +906,36 @@ pub(crate) fn note_used(key: &str) {
 mod tests {
     use super::*;
 
-    /// The library is loaded on AMD cards and not on others, unless
-    /// `VICTORY_LIBRARY_LOAD` says.
+    /// The library is loaded on AMD cards, and on NVIDIA's without the
+    /// pipelines with static samplers, unless `VICTORY_LIBRARY_LOAD` says.
     #[test]
-    fn the_library_loads_on_amd_alone_unless_asked() {
+    fn the_library_loads_on_amd_and_nvidia_unless_asked() {
         let var = |v: &'static str| Some(std::ffi::OsStr::new(v));
-        assert!(loads_from(None, true));
-        assert!(!loads_from(None, false));
-        assert!(loads_from(var("1"), false));
-        assert!(!loads_from(var("0"), true));
+        assert_eq!(loads_from(None, true, false), (true, false));
+        assert_eq!(loads_from(None, false, true), (true, true));
+        assert_eq!(loads_from(None, false, false), (false, false));
+        assert_eq!(loads_from(var("1"), false, true), (true, false));
+        assert_eq!(loads_from(var("samplers"), true, false), (true, true));
+        assert_eq!(loads_from(var("0"), true, true), (false, false));
     }
 
     /// Pipelines with a static comparison sampler stay out of the library
-    /// (`kept_out`), the others go in.
+    /// (`kept_out`), the others go in; where those with static samplers stay
+    /// out, every one with any.
     #[test]
     fn comparison_samplers_keep_a_pipeline_out() {
         let sampler = |filter: i32| D3D12_STATIC_SAMPLER_DESC { Filter: D3D12_FILTER(filter), ..Default::default() };
         // The deferred lighting's: linear, linear, point, comparison, point.
         let lighting = [sampler(0x15), sampler(0x14), sampler(0), sampler(0x95), sampler(0)];
-        assert!(kept_out(&lighting));
-        assert!(kept_out(&[sampler(0x80)]));
-        assert!(kept_out(&[sampler(0x180)]), "the maximum reduction has the bit too");
-        assert!(!kept_out(&lighting[..3]));
-        assert!(!kept_out(&[sampler(0x55), sampler(0x100)]));
-        assert!(!kept_out(&[]));
+        assert!(kept_out_with(&lighting, false));
+        assert!(kept_out_with(&[sampler(0x80)], false));
+        assert!(kept_out_with(&[sampler(0x180)], false), "the maximum reduction has the bit too");
+        assert!(!kept_out_with(&lighting[..3], false));
+        assert!(!kept_out_with(&[sampler(0x55), sampler(0x100)], false));
+        assert!(!kept_out_with(&[], false));
+        assert!(kept_out_with(&lighting[..3], true));
+        assert!(kept_out_with(&[sampler(0x55)], true));
+        assert!(!kept_out_with(&[], true));
     }
 
     #[test]
