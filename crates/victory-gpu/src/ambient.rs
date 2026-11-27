@@ -328,9 +328,12 @@ fn shade() -> [f32; 2] {
 
 const SOURCE: &str = r#"
 #ifdef HOLD_INDIRECT
-#define RS "RootConstants(num32BitConstants=17, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3), SRV(t1)"
+#define RS "RootConstants(num32BitConstants=17, b0), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3), SRV(t1)"
+#elif defined(PLACE) || defined(GATHER) || defined(RAISE)
+#define RESOLVE_DEPTH
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3), DescriptorTable(SRV(t0))"
 #else
-#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #endif
 #define CX 64
 #define CY 36
@@ -346,7 +349,6 @@ cbuffer Set : register(b0) {
     uint indirect_at;
 #endif
 };
-Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
 // CELLS + 1 on where they are.
 RWStructuredBuffer<float4> cells : register(u1);
@@ -357,6 +359,8 @@ RWStructuredBuffer<float4> points : register(u2);
 RWByteAddressBuffer stats : register(u3);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
+#ifdef RESOLVE_DEPTH
+Texture2D<float> depth : register(t0);
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
     float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
@@ -364,6 +368,7 @@ float3 seen(int2 p, float2 size) {
     float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
     return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
 }
+#endif
 
 #ifdef KEEP
 RWTexture2D<float3> radiance : register(u0);
@@ -612,6 +617,7 @@ pub(crate) const CELLS_AT: u32 = CELLS as u32;
 
 struct Pass {
     root: ID3D12RootSignature,
+    resolve_root: ID3D12RootSignature,
     keep: ID3D12PipelineState,
     mean: ID3D12PipelineState,
     place: ID3D12PipelineState,
@@ -636,10 +642,15 @@ fn make(
     reflection_hold: bool,
 ) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
+    let mut resolve_root: Option<ID3D12RootSignature> = None;
     let mut indirect_root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
         let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
-        let root = if part == "HOLD_INDIRECT" { &mut indirect_root } else { &mut root };
+        let root = match part {
+            "PLACE" | "GATHER" | "RAISE" => &mut resolve_root,
+            "HOLD_INDIRECT" => &mut indirect_root,
+            _ => &mut root,
+        };
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
@@ -678,6 +689,7 @@ fn make(
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
+        resolve_root: resolve_root.ok_or_else(windows::core::Error::empty)?,
         keep,
         mean,
         place,
@@ -815,7 +827,7 @@ pub(crate) struct Views {
     /// The image the title's program just wrote.
     pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
     /// The scene's depth, for [`Role::Resolve`].
-    pub(crate) depth: D3D12_GPU_DESCRIPTOR_HANDLE,
+    pub(crate) depth: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
     /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) slices: u32,
@@ -837,7 +849,7 @@ impl IndirectHold<'_> {
         unsafe {
             list.ResourceBarrier(&[transition(self.buffer, arguments, readable)]);
             list.SetComputeRoot32BitConstant(0, self.at, 16);
-            list.SetComputeRootShaderResourceView(6, self.buffer.GetGPUVirtualAddress());
+            list.SetComputeRootShaderResourceView(5, self.buffer.GetGPUVirtualAddress());
             list.SetPipelineState(pso);
             list.Dispatch(groups[0], groups[1], 1);
             list.ResourceBarrier(&[transition(self.buffer, readable, arguments)]);
@@ -916,19 +928,25 @@ pub(crate) fn after(
     words[14] = (frame_ms(role) / 1000.0).to_bits();
     let l = &list.list;
     let indirect = indirect.and_then(|args| pass.hold_indirect.as_ref().map(|(root, pso)| (args, root, pso)));
-    let root = indirect.map_or(&pass.root, |(_, root, _)| root);
+    let root = if views.depth.is_some() {
+        &pass.resolve_root
+    } else {
+        indirect.map_or(&pass.root, |(_, root, _)| root)
+    };
     // SAFETY: an open list with the heap of the views set; the title's
-    // program has just used both views, so their textures are in the states
-    // these views need; buffers the list keeps.
+    // program has just used the bound views, so the textures are in the
+    // states these views need; buffers the list keeps.
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(root);
         l.SetComputeRoot32BitConstants(0, words.len() as u32, words.as_ptr().cast(), 0);
-        l.SetComputeRootDescriptorTable(1, views.depth);
-        l.SetComputeRootDescriptorTable(2, views.image);
-        l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
-        l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
-        l.SetComputeRootUnorderedAccessView(5, pass.stats.GetGPUVirtualAddress());
+        l.SetComputeRootDescriptorTable(1, views.image);
+        l.SetComputeRootUnorderedAccessView(2, pass.cells.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(3, pass.points.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(4, pass.stats.GetGPUVirtualAddress());
+        if let Some(depth) = views.depth {
+            l.SetComputeRootDescriptorTable(5, depth);
+        }
         let run = |pso: &ID3D12PipelineState, x, y, z| {
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);
@@ -1139,9 +1157,10 @@ mod tests {
                 list.SetDescriptorHeaps(&[Some(heap.clone())]);
                 list.SetComputeRootSignature(root);
                 list.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
-                list.SetComputeRootDescriptorTable(2, heap.GetGPUDescriptorHandleForHeapStart());
-                list.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
-                list.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+                list.SetComputeRootDescriptorTable(1, heap.GetGPUDescriptorHandleForHeapStart());
+                list.SetComputeRootUnorderedAccessView(2, pass.cells.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(3, pass.points.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(4, pass.stats.GetGPUVirtualAddress());
                 args.run(list, pso, [1, 1]);
                 list.ResourceBarrier(&[transition(
                     &texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE,
