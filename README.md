@@ -190,6 +190,71 @@ PowerShell asks for the executable's path.
 | `-Safe` | Leave out the changes still on trial; try it first when something goes wrong |
 | `-RayTracing` | Build the ray-traced structures, so the title's ray-traced indirect light runs |
 | `-Build release` | Run `target\release\victory.exe` (`cargo build --release --locked -p victory`); it has no panel |
+| `-Fsr4K quality` / `balanced` / `performance` | Upscale to 3840×2160 with AMD's PC FSR 4.1.2 (below) |
+| `-Dlss4K quality` / `balanced` / `performance` | The same 4K profiles upscaled by NVIDIA DLSS on an RTX card (below) |
+
+For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
+`VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed
+`amd_fidelityfx_upscaler_dx12.dll`. Use the DirectX 12 upscaler in
+`Kits/FidelityFX/signedbin`. [AMD FSR SDK 2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
+
+`scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
+the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
+and `performance` selects 1920×1080. All three output 3840×2160. With
+`victory run` directly, set `VICTORY_FSR_4K` to the preset name.
+The log reports the provider at context creation and the actual input and
+output sizes at the first successful temporal dispatch. The title profile
+and PC FidelityFX bridge were ported from [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).
+
+`-Dlss4K` (`VICTORY_DLSS_4K` for `victory run`) uses the same profiles and
+render sizes, with DLSS Super Resolution serving the title's FidelityFX
+calls. It loads the NGX runtime that ships with the NVIDIA driver, so
+nothing of NVIDIA's SDK is needed to build. To pick the `nvngx_dlss.dll`
+NGX loads, set `[paths].dlss_dir` or `VICTORY_DLSS_DIR` to its folder
+(from the [DLSS SDK](https://github.com/NVIDIA/DLSS) releases); without one
+NGX uses the driver's copy. NGX's updater may still pick a newer model it
+downloaded; `VICTORY_DLSS_NO_UPDATE=1` turns the updater off so the
+folder's DLL runs. The log names the DLL that actually ran. The DLSS 4.5
+model (preset M, L for ultra performance) runs unless `VICTORY_DLSS_PRESET`
+names another (`j`, `k`, `l`, `m`, or `default` for the DLL's own choice).
+If DLSS cannot start, the log says why and FSR runs if its folder is set,
+else the stock profile. With the FSR folder set, FSR also takes over if
+DLSS fails later on. For A/B runs, `VICTORY_DLSS_JITTER_SIGN=-1` (or
+`1,-1` per axis) flips the jitter DLSS gets, and `VICTORY_DLSS_REACTIVE=0`
+leaves the title's reactive mask out of DLSS.
+
+### Series S upscaling and frame generation
+
+Pass `VICTORY_DLSS='quality'` or `VICTORY_FSR='quality'` through the
+launcher's `-More` option to select a PC upscaler at the Series S output
+size. Both accept `quality`, `balanced`, and `performance`. FSR uses the
+analytical 3.1.6 provider in the AMD upscaler DLL. Set its path with
+`VICTORY_FIDELITYFX_DIR` or `[paths].fidelityfx_dir`.
+
+Enable 2× frame generation with `VICTORY_FRAMEGEN='1'`. Set
+`VICTORY_FFX_FG_DIR` to the SDK 2.4.0 `Kits/FidelityFX/signedbin` folder
+containing `amd_fidelityfx_loader_dx12.dll` and
+`amd_fidelityfx_framegeneration_dx12.dll`. This uses the analytical 3.1.6
+frame generation provider. For example, on an RTX card with DLSS set up:
+
+```powershell
+scripts\play.ps1 -Exe <path> -Console series-s -More @{
+    VICTORY_DLSS='quality'; VICTORY_FRAMEGEN='1'; VICTORY_FFX_FG_DIR='<SDK signedbin>'
+}
+```
+
+With neither PC upscaler selected, frame generation uses depth and motion
+vectors from the title's native FidelityFX loader. In the diagnostics
+panel, `RENDER FPS` counts rendered frames and `FG OUTPUT FPS` counts
+swap-chain presentations. The frame generation bridge follows
+[PastiiJay's DirectX 12 integration](https://github.com/PastiiJay/klbf-lab/commit/793c56c36fda760b027122418b922fc359abf580).
+
+On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
+high-performance adapter with Shader Model 6.6. The runtime logs its adapter
+name, PCI vendor and device IDs, and dedicated VRAM. Set
+`VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
+name to select it explicitly. With the launcher, pass
+`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
 
 Every `VICTORY_...` switch is described in a comment where the code reads it.
 More commands and debugging switches:

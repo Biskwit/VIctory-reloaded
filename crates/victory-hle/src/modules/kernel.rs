@@ -238,6 +238,8 @@ pub extern "system" fn OutputDebugStringW(text: *const u16) {
 /// the code and the caller, then exits on the host.
 pub extern "C" fn exit(code: i32) -> ! {
     tracing::warn!(code, from = %host::callers(), "title exits");
+    #[cfg(windows)]
+    crate::modules::fidelityfx::shut_down();
     host::exit(code)
 }
 
