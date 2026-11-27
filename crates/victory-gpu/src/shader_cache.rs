@@ -121,7 +121,20 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => {
+            // A container whose wave-wide policy is not the global one
+            // (`victory_shader::emit::wave_wide_cache_override`) has a key of
+            // its own (after Vice-Tay 0367bf95).
+            let build = victory_shader::emit::wave_wide_cache_override(container).map_or_else(build, |enabled| {
+                *blake3::Hasher::new()
+                    .update(&build())
+                    .update(b"wave-wide-shader-v1\0")
+                    .update(&[u8::from(enabled)])
+                    .finalize()
+                    .as_bytes()
+            });
+            cached(cache, &build, container, translate)
+        }
         None => translate(container),
     }
 }

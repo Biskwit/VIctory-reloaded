@@ -91,12 +91,6 @@ if ($Machine -eq '7900xtx') {
         # frame as it was.
         $settings.VICTORY_STORE_BESIDE = '1'; $settings.VICTORY_COPY_BESIDE = '1'
     }
-    # The console wave64 programs a 32-lane card takes only in the wave-wide
-    # form; this list of them ran without a lost device on this card for 30
-    # minutes (the losses of runs 121-124 had the form on for every program).
-    # Kept under -Safe too: without it those programs do not translate and
-    # their draws are dropped, the picture -Safe is there to check.
-    $settings.VICTORY_WAVE_WIDE_ONLY = '6f225b641c5b0708,5dc3b25986622949,369cbe906ea72764,2cc4c197ee29e291'
 }
 # -Safe leaves out every way still on trial, and the newest faster ones.
 if ($Safe) {

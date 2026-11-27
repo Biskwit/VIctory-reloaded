@@ -430,6 +430,74 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// The console wave64 programs a 32-lane host takes in the wave-wide form
+/// by default (`widen`), by the log's shader hash: in the Series S cell
+/// 6f225b641c5b0708 and 5dc3b25986622949 did not translate without it, and
+/// their dispatches were dropped. These four ran without a lost device on an
+/// RTX 4090 for 30 minutes (the losses of runs 121-124 had the form on for
+/// every program). After Vice-Tay 0367bf95.
+const DEFAULT_WAVE_WIDE_HASHES: [&str; 4] = ["6f225b641c5b0708", "5dc3b25986622949", "369cbe906ea72764", "2cc4c197ee29e291"];
+
+/// Whether the comma-separated `list` names the shader `hash`.
+fn wave_wide_hash_matches(list: &std::ffi::OsStr, hash: &str) -> bool {
+    list.to_str().is_some_and(|list| list.split(',').any(|name| name.trim().eq_ignore_ascii_case(hash)))
+}
+
+/// What a container's own policy makes of the global wave-wide setting
+/// (`VICTORY_WAVE_WIDE`), `None` where it is the global one: unset, the form
+/// for [`DEFAULT_WAVE_WIDE_HASHES`] and for those `VICTORY_WAVE_WIDE_ONLY`
+/// adds; `=1` with a list, the form only for those listed. After Vice-Tay
+/// 538bf963, 37e9f348 and 0367bf95.
+fn wave_wide_override(setting: Option<&std::ffi::OsStr>, list: Option<&std::ffi::OsStr>, input: &[u8]) -> Option<bool> {
+    let list = list.filter(|list| !list.is_empty());
+    match setting {
+        None => {
+            let digest = blake3::hash(input).to_hex();
+            let hash = &digest[..16];
+            (DEFAULT_WAVE_WIDE_HASHES.contains(&hash) || list.is_some_and(|list| wave_wide_hash_matches(list, hash))).then_some(true)
+        }
+        Some(value) if value == "1" => {
+            let list = list?;
+            let digest = blake3::hash(input).to_hex();
+            (!wave_wide_hash_matches(list, &digest[..16])).then_some(false)
+        }
+        Some(_) => None,
+    }
+}
+
+/// The container's [`wave_wide_override`] on a 32-lane host (the only one the
+/// form is for), for the shader cache's key: `None` where the global
+/// setting decides.
+pub fn wave_wide_cache_override(input: &[u8]) -> Option<bool> {
+    if lower::host_max_wave() != 32 {
+        return None;
+    }
+    wave_wide_override(
+        std::env::var_os("VICTORY_WAVE_WIDE").as_deref(),
+        std::env::var_os("VICTORY_WAVE_WIDE_ONLY").as_deref(),
+        input,
+    )
+}
+
+/// Whether the wave-wide form and the driver's loop are allowed, in that
+/// order: an unlisted program keeps the driver's loop.
+fn wave_wide_routes(
+    setting: Option<&std::ffi::OsStr>,
+    list: Option<&std::ffi::OsStr>,
+    input: &[u8],
+    scene_kernel: bool,
+) -> (bool, bool) {
+    let picked = wave_wide_override(setting, list, input);
+    match setting {
+        None => (picked.unwrap_or(scene_kernel), picked.is_none()),
+        Some(value) if value == "1" => {
+            let enabled = picked.unwrap_or(true);
+            (enabled, !enabled)
+        }
+        Some(_) => (false, false),
+    }
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -535,11 +603,12 @@ pub fn emit(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
-        // lost the card in a submission of two programs that had just moved to it
+        // For the programs named only ([`wave_wide_routes`]), for a console wave run as two
+        // host waves: this form puts group barriers inside branches and loops, and runs
+        // 121-124 lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
+        // has no barrier, stays on. `VICTORY_WAVE_WIDE=1` takes it for every program (or,
+        // with `VICTORY_WAVE_WIDE_ONLY`, for those listed), another value for none.
         let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
         // Both archived kernels use one logical wave per group and have
         // validated wave32 PSOs on RTX. Explicit policy wins.
@@ -549,11 +618,16 @@ pub fn emit(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        let (wide_on, driver_loop_allowed) = wave_wide_routes(
+            wide_option.as_deref(),
+            std::env::var_os("VICTORY_WAVE_WIDE_ONLY").as_deref(),
+            c.input,
+            scene_kernel,
+        );
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
-        let driver_loop = wide_option.is_none()
+        let driver_loop = driver_loop_allowed
             && c.part(FourCC::DXIL).is_none()
             && c.part(FourCC::ACCC).is_some()
             && matches!(&original, Err(ShaderError::Unsupported { what, .. })
@@ -1083,6 +1157,50 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn wave_wide_list_names_containers_by_their_log_hash() {
+        use std::ffi::OsStr;
+
+        let water = b"selected compute container";
+        let other = b"another compute container";
+        let hash = blake3::hash(water).to_hex();
+        let list = format!("invalid, {}", hash[..16].to_ascii_uppercase());
+        assert!(super::wave_wide_hash_matches(OsStr::new(&list), &hash[..16]));
+        let hash = blake3::hash(other).to_hex();
+        assert!(!super::wave_wide_hash_matches(OsStr::new(&list), &hash[..16]));
+        assert!(!super::wave_wide_hash_matches(OsStr::new("invalid"), &hash[..16]));
+    }
+
+    #[test]
+    fn wave_wide_routes_keep_the_driver_loop_for_unlisted_shaders() {
+        use std::ffi::OsStr;
+
+        let listed = b"listed shader";
+        let unlisted = b"unlisted shader";
+        let hash = blake3::hash(listed).to_hex();
+        let allowlist = Some(OsStr::new(&hash[..16]));
+        let on = Some(OsStr::new("1"));
+        let off = Some(OsStr::new("0"));
+        let routes = super::wave_wide_routes;
+
+        assert_eq!(routes(None, allowlist, unlisted, false), (false, true));
+        assert_eq!(routes(None, allowlist, listed, false), (true, false));
+        assert_eq!(routes(None, allowlist, unlisted, true), (true, true));
+        assert_eq!(routes(on, allowlist, listed, false), (true, false));
+        assert_eq!(routes(on, allowlist, unlisted, false), (false, true));
+        assert_eq!(routes(on, None, unlisted, false), (true, false));
+        assert_eq!(routes(on, Some(OsStr::new("")), unlisted, false), (true, false));
+        assert_eq!(routes(off, allowlist, unlisted, false), (false, false));
+        assert_eq!(routes(off, allowlist, listed, true), (false, false));
+
+        let key = super::wave_wide_override;
+        assert_eq!(key(None, allowlist, listed), Some(true));
+        assert_eq!(key(None, allowlist, unlisted), key(None, None, unlisted));
+        assert_eq!(key(on, allowlist, listed), key(on, None, listed));
+        assert_eq!(key(on, allowlist, unlisted), Some(false));
+        assert_eq!(key(off, allowlist, listed), key(off, None, listed));
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.

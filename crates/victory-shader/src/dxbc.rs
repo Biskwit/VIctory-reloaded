@@ -61,6 +61,9 @@ pub struct Container<'a> {
     pub digest: [u8; 16],
     pub version: (u16, u16),
     pub parts: Vec<Part<'a>>,
+    /// The bytes as given, before the cut to the container's size: what the
+    /// log's shader hashes are of.
+    pub(crate) input: &'a [u8],
 }
 
 const HEADER_SIZE: usize = 0x20;
@@ -77,6 +80,7 @@ impl<'a> Container<'a> {
         if total > data.len() || total < HEADER_SIZE {
             return Err(ShaderError::Malformed("container size disagrees with data"));
         }
+        let input = data;
         let data = &data[..total];
         let count = u32_at(data, 0x1C)? as usize;
         if count > MAX_PARTS {
@@ -105,6 +109,7 @@ impl<'a> Container<'a> {
             digest,
             version,
             parts,
+            input,
         })
     }
 
