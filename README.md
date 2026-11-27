@@ -29,12 +29,19 @@ nothing from the game goes in the tree.*
     library, as our earlier tree did: the driver's stored copies sample
     without the comparison (`VICTORY_LIBRARY_COMPARISON=1` stores them as
     before);
-  - on NVIDIA the pipeline library is not loaded at all: warm launches that
-    loaded it drew the flat bands of colour listed below in 5 of 6 launches,
-    and in 1 of 3 even with the rule above and a real shader hash; launches
-    that loaded none never did (0 of 6). Every pipeline is made fresh, and
-    the early list still starts the early ones while the title loads: the
-    cell scene comes about 14 s later (`VICTORY_LIBRARY_LOAD=1` loads it);
+  - on NVIDIA only pipelines with static samplers skip the pipeline library
+    (Vice-Tay fa8fc1d4): warm launches that loaded every pipeline from it
+    drew the flat bands of colour listed below in 5 of 6 launches, and the
+    driver's stored copies of static-sampler pipelines were what went wrong.
+    Loading the others (about 950 of 1,800 in the cell) showed no banding
+    and no pale hair in 6 warm Series S launches and 3 warm Series X ones;
+    the cell comes about 10 s sooner (77 s median against 87), and frames
+    are as before, as the static-sampler half is still made every launch.
+    `VICTORY_LIBRARY_LOAD=0` loads none, `1` all, `samplers` this rule;
+  - the write watch's asked ranges are a sorted index instead of a list
+    walked at each look, and a submission's asking holds only its own
+    pages: a few tenths of a millisecond to a millisecond on the submitting
+    thread, not visible in the frame;
   - translated shaders carry a real shader hash part instead of zeros;
   - indirect dispatches of more than 65,535 groups run whole on NVIDIA too,
     as they did on AMD only: cut, the Series X cell scene showed rows of
@@ -52,7 +59,14 @@ nothing from the game goes in the tree.*
     scratch block and an 80x45 texture with a value per 16x16 tile of the
     picture. What they held instead is read: with bytes 0xff in them every
     frame is white (`VICTORY_CLEAR_UAV=0`: left out, as before;
-    `=poison[:<byte>[:buffer|:texture]]`: that byte instead, diagnostics);
+    `=poison[:<byte>[:buffer|:texture]]`: that byte instead, diagnostics).
+    Still open: in about 7% of launches the cell comes up with a dark,
+    stepped shape on its left wall (8 of 123 launches without the clears,
+    0 of 11 with them), and once in those 11 the whole interior was dark
+    instead; either state holds for the whole launch. What the title clears
+    is read at least once at the world's start (bytes 0xff in the tile
+    texture alone leave the picture white), but which pass reads it and
+    what keeps the per-launch state is not found;
   - the control file, live switches, the texture view and window shots
     (diagnostics builds);
   - PIX captures taken from inside the run (diagnostics builds);
@@ -133,6 +147,21 @@ nothing from the game goes in the tree.*
       25 fps). Also from Vice-Tay: a batch wakes only the helpers it can use
       (d60fc84f), and the frame meter's 5-second lines run on a thread of
       their own (f36a0fcf), about 30 ms every 5 s off the submitting thread;
+    - the ambient stand-in reads the title's depth: where it looked for depth
+      the title binds the stencil plane of its depth texture, so its creases
+      and depth-weighted interpolation worked from stencil bits. It now finds
+      the depth plane among the program's views (`VICTORY_AMBIENT_DEPTH=0`:
+      the old view), and binds depth only, no longer an image's UAV in an SRV
+      table (Vice-Tay fa8fc1d4). In-run A/B: the cell's wall, the whole frame
+      and the papers' colour each move slightly toward the reference, at the
+      same frame time;
+    - more of Vice-Tay's newer fixes: a new texture waits for the lists sent
+      before it (`VICTORY_SHOW_NEW_LATER`, 4cd2d133, 91018a5d; upstream
+      traced six device losses to this), a decoration bake's texture pass is
+      known per heap (7eef1436), dynamic slots go back to their own heap
+      (3fe48113, 5307ba7d), an upload no longer stops an alias copy
+      (7993c1bc), and a full texture-change queue keeps its ranges
+      (53a1f162);
     - the write watch's journal keeps its pages in 4 MiB pieces instead of
       one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
       of 111; the submitting thread about 1 ms less a frame;
