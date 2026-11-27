@@ -133,6 +133,10 @@ How each of these was found, with the numbers:
   host convolution path for phone calls and other filtered audio. Compare
   the same call with the option off and on, at the same volume.
   [Upstream test](https://github.com/Marvisak/VIctory/pull/3332)
+- **Mono DSP comparison.** Add `-More @{VICTORY_DSP_MONO_PASSTHROUGH='1'}`
+  to pass readable mono DSP input through at unity gain when convolution
+  cannot produce output. Compare the same phone call and audio settings
+  with passthrough off and on. [Dialogue report](https://github.com/TaynanGT/Vice-Tay/issues/259)
 
 ## Measuring
 
