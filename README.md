@@ -102,6 +102,19 @@ nothing from the game goes in the tree.*
       (Vice-Tay fa116500 + c2775339): it used to leave the title's guard page
       (a thread's stack, for one) without its guard, which upstream traced to
       silent exits a few minutes into the world;
+    - from Vice-Tay's newer main, translator and landing fixes: the console
+      wave64 programs `play.ps1` listed are translated in the wave-wide form
+      on a 32-lane card (538bf963, 37e9f348, 0367bf95). Before, nothing read
+      that list and two of them, the cell's volumetric transmission passes,
+      were dropped every frame; drawn, they change nothing measurable in the
+      cell, and their picture elsewhere is not checked yet. Also typed
+      stores keep their integer bits (189 programs change), four tiled
+      shadow programs take the exact form instead of an approximate one,
+      one interpolation mode per signature row (a fire program now
+      validates), a level query without an array slice, the relabelled
+      wave's group info, the card-copy compare in a call of its own, and the
+      first piece of a parallel compare kept (6f179dd1, b4c3ceb2, 4fd34fdd,
+      0dc5d1be, 41d3184e, 53c9ab5d, fa8fc1d4, 21ec8110);
     - the write watch's journal keeps its pages in 4 MiB pieces instead of
       one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
       of 111; the submitting thread about 1 ms less a frame;
