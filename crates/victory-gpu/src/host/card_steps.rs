@@ -106,7 +106,7 @@ fn placed_order() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
 }
 
-/// Disable read-through with `VICTORY_PLACED_FILL_REDIRECT=0`.
+/// Enable read-through with `VICTORY_PLACED_FILL_REDIRECT=1`.
 /// Diagnostic A/B runs can switch this without changing list recording.
 fn redirect_fills() -> bool {
     #[cfg(feature = "diagnostics")]
