@@ -112,6 +112,9 @@ enum Command {
     /// In diagnostics builds, VICTORY_LOG=debug shows skipped paths.
     Shaders {
         paths: Vec<PathBuf>,
+        /// Skip the scan if these paths have already been translated for this cache key.
+        #[arg(long, conflicts_with = "list")]
+        if_needed: bool,
         /// Worker threads (default: every logical core).
         #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
@@ -239,7 +242,7 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs, wave)
         }
-        Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
+        Command::Shaders { paths, jobs, list, if_needed } => translate::precompile(paths, jobs, list, if_needed),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {
