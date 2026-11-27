@@ -11,7 +11,8 @@
 # -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance)
 # -Dlss4K       NVIDIA DLSS at 3840x2160 (quality, balanced or performance); FSR if it cannot start
 # -Build        target\diag (the default, the build all measurements are of) or target\release
-# -Machine      auto (the default: by the graphics card), 7900xtx, 4070, 4070tisuper, 4090, 3060 or laptop
+# -Machine      auto (the default: by GPU vendor, with NVIDIA worker counts sized to the CPU),
+#               7900xtx, 4070, 4070tisuper, 4090, 3060 or laptop
 #               (3060: a six-core NVIDIA desktop with 16 GB of RAM and a 12 GB card, docs/rtx3060-16gb.md;
 #               laptop: an NVIDIA PC with 16 GB of RAM and a 6-8 GB card, docs/laptop-16gb.md)
 # -More         other settings: -More @{VICTORY_PANEL='1'} or -More @{VICTORY_AMBIENT='1.0'}
@@ -47,8 +48,9 @@ $controllers = @(if ($Machine -in 'auto', '7900xtx') {
     Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
 })
 $hasNvidia = [bool]($controllers.PNPDeviceID -match 'VEN_10DE')
+$autoNvidia = $Machine -eq 'auto' -and $hasNvidia
 if ($Machine -eq 'auto') {
-    # Use the existing vendor defaults. The 4070 / 7800X3D and 4070 Ti SUPER profiles are explicit.
+    # Keep the vendor defaults for memory and rendering. The measured machine profiles are explicit.
     $Machine = if ($hasNvidia) { '4090' } else { '7900xtx' }
 }
 if ($Machine -eq '7900xtx') {
@@ -76,9 +78,25 @@ if ($Machine -eq '7900xtx') {
     }
 } else {
     # RTX 4090, Ryzen 9 9950X3D (16 cores of one kind, two caches), 48 GB.
-    # NVIDIA sets its clocks by the driver's power mode: no spinner on the
-    # compute queue. 16 cores record and land, not 8.
-    $settings.VICTORY_THIN_THREADS = '12'; $settings.VICTORY_UNDER_THREADS = '8'; $settings.VICTORY_LAND_THREADS = '6'
+    # NVIDIA sets its clocks by the driver's power mode: no spinner on the compute queue.
+    $record, $update, $land = 12, 8, 6
+    if ($autoNvidia) {
+        $coreCount = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue |
+            Measure-Object -Property NumberOfCores -Sum).Sum
+        if (-not $coreCount) {
+            # The physical topology is unknown. Use the smaller desktop defaults.
+            $coreCount = [math]::Min(8, [Environment]::ProcessorCount)
+        }
+        $coreCount = [math]::Min($coreCount, [Environment]::ProcessorCount)
+        if ($coreCount -le 6) {
+            $record, $update, $land = $coreCount, [math]::Min(4, $coreCount), [math]::Min(3, $coreCount)
+        } elseif ($coreCount -lt 16) {
+            $record, $update, $land = [math]::Min(8, $coreCount), 6, 4
+        }
+    }
+    $settings.VICTORY_THIN_THREADS = [string]$record
+    $settings.VICTORY_UNDER_THREADS = [string]$update
+    $settings.VICTORY_LAND_THREADS = [string]$land
     if (-not $Safe) {
         # Pages are mapped by several threads only while the title streams
         # (not the default: one run behind it).
@@ -174,8 +192,9 @@ if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 if ($Dlss4K) { $settings.VICTORY_DLSS_4K = $Dlss4K.ToLowerInvariant() }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
-Write-Host "Settings for the $Machine$(if ($Safe) { ', safe' })$(if ($RayTracing) { ', with ray tracing' })."
-if ($Console -eq 'series-s' -and $Machine -in '4090', 'laptop') {
+$profile = if ($autoNvidia) { 'automatic NVIDIA profile' } else { $Machine }
+Write-Host "Settings for the $profile$(if ($Safe) { ', safe' })$(if ($RayTracing) { ', with ray tracing' })."
+if ($Console -eq 'series-s' -and $Machine -ne '7900xtx') {
     Write-Host ("Series S requests {0} list translation threads, {1} for memory updates, and {2} for landing." -f
         $settings.VICTORY_THIN_THREADS, $settings.VICTORY_UNDER_THREADS, $settings.VICTORY_LAND_THREADS)
 }

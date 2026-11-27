@@ -13,7 +13,8 @@ where there is one; the default is the behaviour described.
   screen while the title runs; the picture is stretched to either. DXGI's own
   Alt+Enter, which would make the swap chain exclusive full screen, is turned off.
 - **Settings for an RTX 4090 / Ryzen 9 9950X3D / 48 GB** (`scripts\play.ps1
-  -Machine 4090`, picked for any NVIDIA card; `-Machine laptop` for 16 GB of RAM,
+  -Machine 4090`; `-Machine auto` uses the same NVIDIA memory and rendering
+  settings with worker counts sized to the CPU; `-Machine laptop` for 16 GB of RAM,
   [laptop-16gb.md](laptop-16gb.md); `-Machine 3060` for a six-core desktop with
   16 GB, [rtx3060-16gb.md](rtx3060-16gb.md)): the thread counts and switches
   `scripts\play.ps1` sets. `-Safe` keeps the wave-wide list there: without it four
