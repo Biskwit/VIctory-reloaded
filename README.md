@@ -60,10 +60,11 @@ nothing from the game goes in the tree.*
     picture. What they held instead is read: with bytes 0xff in them every
     frame is white (`VICTORY_CLEAR_UAV=0`: left out, as before;
     `=poison[:<byte>[:buffer|:texture]]`: that byte instead, diagnostics).
-    Still open: in about 7% of launches the cell comes up with a dark,
-    stepped shape on its left wall (8 of 123 launches without the clears,
-    0 of 11 with them), and once in those 11 the whole interior was dark
-    instead; either state holds for the whole launch. What the title clears
+    Still open: in about 6% of launches the cell comes up with a dark,
+    stepped shape on its left wall (9 of 154 launches without the clears,
+    1 of 14 with them: the clears are not its cure), and once in those 14
+    the whole interior was dark instead; either state holds for the whole
+    launch. What the title clears
     is read at least once at the world's start (bytes 0xff in the tile
     texture alone leave the picture white), but which pass reads it and
     what keeps the per-launch state is not found;
@@ -167,6 +168,14 @@ nothing from the game goes in the tree.*
       `VICTORY_CARD_NEAR=0`: all, as before): the submitting thread's card
       copies 1.6-1.7 ms shorter, the frame 0.7-1.0 ms in-run; its gate ran at
       about 25 fps (25.8 over 12 minutes);
+    - the card steps' slot writes of a submission are done by the sending
+      thread after the heaps' records it waits for, on their pool, and empty
+      host lists are closed where they are reset (`VICTORY_OFF_LINE=0`: on
+      the submitting thread, as before). In-run over 3 launches 39.7 -> 38.0
+      ms a frame; the title's wait at presents 14.5 -> 11.8. A slot now gets
+      its fill after the title's records rather than before, as on the
+      console; in the cell no slot is both (a diagnostics count,
+      `VICTORY_SLOT_ORDER_COUNT=1`). Its gate ran at 37.8-40.0 ms a frame;
     - the write watch's journal keeps its pages in 4 MiB pieces instead of
       one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
       of 111; the submitting thread about 1 ms less a frame;
