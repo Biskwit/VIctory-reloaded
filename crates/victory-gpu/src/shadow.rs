@@ -1054,31 +1054,21 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         let Some(c) = shadow.card.as_ref() else {
             return true;
         };
-        let has_dirty = c.has_dirty.load(Ordering::Acquire);
-        let has_sent = relay_on && c.has_sent.load(Ordering::Acquire);
-        if !has_dirty && !has_sent {
+        if !c.has_dirty.load(Ordering::Acquire) {
             return true;
         }
-        let ranges = if has_dirty {
+        let ranges = {
             let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let ranges = joined(std::mem::take(&mut *dirty));
             if relay_on {
                 let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                 sent.forget(fetched);
                 sent.note_joined(sent_as, ranges.clone());
-                // Publish `has_sent` BEFORE clearing `has_dirty` so concurrent
-                // `card_merge_relay` / `land_card` readers checking `has_dirty`
-                // then `has_sent` never observe both false during handoff.
+                // Publish the sent ranges before clearing the dirty state.
                 c.has_sent.store(!sent.is_empty(), Ordering::Release);
             }
             c.has_dirty.store(false, Ordering::Release);
             ranges
-        } else {
-            // Only pruning stale `sent` entries (respects `dirty` -> `sent` lock order).
-            let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-            sent.forget(fetched);
-            c.has_sent.store(!sent.is_empty(), Ordering::Release);
-            Vec::new()
         };
         if !ranges.is_empty() {
             out.push((shadow, ranges));
@@ -4997,47 +4987,32 @@ impl Shadow {
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer. Plans coalesced runs under
-    /// `self.copied`, then releases the mutex before invoking memory copies.
+    /// asking), whole pages within the buffer. Keeps the page state locked
+    /// until the planned copies finish.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let light = crate::watch::light();
-        let (runs, again_at) = {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            // Pages the range holds in part are never noted in `copied`, and
-            // were copied again at every refresh of the range, written or not.
-            // A range that was taken whole, and not written since, is as it was.
-            let ranged = if light { self.ranged(from, to) } else { 0 };
-            let plan = copied.plan_stale(base, start, end, from, to, now, ranged, written);
-            if plan.0.is_empty() {
-                if light {
-                    // All of the range is in the copy as of this asking.
-                    let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
-                    ranged[0] = (from, to, now);
-                    if to - from >= ranged[1].1 - ranged[1].0 {
-                        ranged[1] = (from, to, now);
-                    }
-                }
-                return 0;
-            }
-            plan
-        };
-        let runs = if again_at.is_empty() {
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        // Pages held in part are copied on every refresh. Whole, unwritten
+        // pages and a range already covered by ranged can be left alone.
+        let ranged = if light { self.ranged(from, to) } else { 0 };
+        let (runs, again_at) = copied.plan_stale(base, start, end, from, to, now, ranged, written);
+        let runs = if runs.is_empty() || again_at.is_empty() {
             runs
         } else {
             by_parts(runs, &again_at, &crate::watch::parts_written(&again_at))
         };
         let bytes = self.take_all(runs);
         if light {
-            // All of the range is in the copy as of this asking (keep `copied` -> `ranged` order).
-            let _copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            // Publish the completed range with copied -> ranged lock order.
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
             ranged[0] = (from, to, now);
             if to - from >= ranged[1].1 - ranged[1].0 {
                 ranged[1] = (from, to, now);
             }
         }
+        drop(copied);
         bytes
     }
 
