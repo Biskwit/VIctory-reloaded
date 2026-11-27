@@ -97,6 +97,15 @@ if ($Safe) {
     # A dispatch does not end a batch of argument clamps before the title waits
     # for it: off by default, as other ways the title may wait are not known.
     $settings.VICTORY_INDIRECT_BATCH = '2'
+    # What FSR4's passes (fsr4_model_v07_fp8_no_scale_*, these 20 programs of
+    # this version of the title) write to their scratch, one 21 MB block whole
+    # every frame, stays on the card: the title's CPU never touches it (no
+    # access in a Series S cell launch with VICTORY_LAND_NOT_PROBE=1), and it
+    # was a third of what the relay fetched and merged into title memory.
+    $settings.VICTORY_LAND_NOT = 'f46117391dd81461,8e614708143ef917,3d147e8190574516,528278df1274cb33,f7fc6c984427fef3,' +
+        'c99e30956be0deaf,8cbd7f5b9ce7530c,85dea520c893a3d9,32aa8384586e0f12,f5ab5dcf95536794,47d8c225abfcb246,' +
+        '8fb5e4aa9c542c3f,55c46e739fa0796a,17af85f170e66f30,80a0178d3a9d8d12,477b52e73ddeb6f2,8b437ab61d8008fe,' +
+        'fdce2a0a9fb1521a,6a6c7b7fde59134f,ba578b59c8c28a57'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 # The whole screen, with no frame, as on the console.
