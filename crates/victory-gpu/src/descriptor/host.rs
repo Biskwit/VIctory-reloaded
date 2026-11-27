@@ -2810,7 +2810,7 @@ impl HostHeap {
         }
         self.put(index);
         self.clear_twin(index);
-        self.write_stride(index, 0);
+        self.write_view_metadata(index, 0, 0);
         self.keep(index, None);
     }
 
@@ -3023,10 +3023,7 @@ impl HostHeap {
             }
         }
         let (stride, kind) = view.map_or((None, 0), view_stride_and_kind);
-        self.write_stride(index, stride.unwrap_or(0) | kind);
-        if let Some((_, _, data)) = &self.strides {
-            write_view_address(*data, index, view);
-        }
+        self.write_view_metadata(index, stride.unwrap_or(0) | kind, view.and_then(view_address).unwrap_or(0));
         let was = if stride.is_some() {
             self.buffers.put(index);
             true
@@ -3039,10 +3036,9 @@ impl HostHeap {
         stale
     }
 
-    /// Writes `word` (stride | format kind) for view-heap slot `index` into
-    /// the host's [`victory_shader::emit::SLOT_STRIDES`] table.
+    /// Writes the stride, format kind and title address for a view-heap slot.
     #[inline]
-    fn write_stride(&self, index: u32, word: u32) {
+    fn write_view_metadata(&self, index: u32, word: u32, address: u64) {
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
@@ -3050,6 +3046,7 @@ impl HostHeap {
             // single aligned dword: either value is one the slot had, and
             // dynamic slots are exclusively owned until submission finishes).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+            write_view_address(*data, index, address);
         }
     }
 
@@ -3088,7 +3085,12 @@ impl HostHeap {
         }
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
-        self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
+        let (stride, address) = if kept.is_some() {
+            (view_stride_word(view), view_address(view).unwrap_or(0))
+        } else {
+            (0, 0)
+        };
+        self.write_view_metadata(index, stride, address);
         self.keep(index, kept.flatten());
     }
 
@@ -3122,13 +3124,14 @@ impl HostHeap {
                 let twin = twinned(&view);
                 let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
                 let stride_word = view_stride_word(&view);
+                let address = view_address(&view).unwrap_or(0);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, stride_word, kept, listed });
+                views.made.insert(words, ListView { view, at, twin, stride_word, address, kept, listed });
             }
             let made = &views.made[&words];
             self.copy_from(index, views.slot(made.at));
@@ -3138,7 +3141,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
-            self.write_stride(index, made.stride_word);
+            self.write_view_metadata(index, made.stride_word, made.address);
             self.keep(index, made.kept.clone());
             Some(made.listed)
         })
@@ -3163,7 +3166,7 @@ impl HostHeap {
         } else {
             null_view(self.at(index));
             self.put(index);
-            self.write_stride(index, 0);
+            self.write_view_metadata(index, 0, 0);
         }
         self.clear_twin(index);
         self.keep(index, None);
@@ -3250,7 +3253,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
-        self.write_stride(index, 1);
+        self.write_view_metadata(index, 1, 0);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -3260,7 +3263,7 @@ impl HostHeap {
         null_buffer_view(self.at(index));
         self.put(index);
         self.clear_twin(index);
-        self.write_stride(index, 0);
+        self.write_view_metadata(index, 0, 0);
         self.keep(index, None);
     }
 
@@ -3295,7 +3298,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
-        self.write_stride(index, 1);
+        self.write_view_metadata(index, 1, 0);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -3325,7 +3328,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
-        self.write_stride(index, 0);
+        self.write_view_metadata(index, 0, 0);
         self.keep(index, None);
     }
 
@@ -3383,7 +3386,7 @@ impl HostHeap {
             unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), twin) };
         }
         self.twin_made(index, twin.is_some());
-        self.write_stride(index, 0);
+        self.write_view_metadata(index, 0, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.keep(index, holds.then(|| buffer.clone()));
@@ -3436,7 +3439,7 @@ impl HostHeap {
         self.twin_made(index, true);
         // A constant buffer, as every other writer of a slot says: a slot
         // reused from a structured or typed view must not keep its word.
-        self.write_stride(index, 0);
+        self.write_view_metadata(index, 0, 0);
         self.keep(index, Some(buffer.clone()));
         true
     }
@@ -3958,17 +3961,15 @@ pub(crate) fn view_address(view: &View) -> Option<u64> {
     }
 }
 
-/// Enters the title address of `view` (0 for none, or a view that is no
-/// buffer's or structure's) at title slot `index` of the view addresses
+/// Enters `address` (0 for a view without a title address) at slot `index`
 /// after the strides in the mapping at `data`
 /// (`victory_shader::emit::VIEW_ADDRESSES`): shaders that pick a view at a
 /// computed index and read its address as a pointer read it there.
-fn write_view_address(data: usize, index: u32, view: Option<&View>) {
+fn write_view_address(data: usize, index: u32, address: u64) {
     use victory_shader::emit::{SLOT_STRIDES_COUNT, VIEW_ADDRESSES};
     if index >= SLOT_STRIDES_COUNT {
         return;
     }
-    let address = view.and_then(view_address).unwrap_or(0);
     let at = (data + VIEW_ADDRESSES as usize) as *mut u32;
     // SAFETY: inside the mapping (`SLOT_STRIDES_BYTES`); shaders read it
     // while we write (each dword is one the slot had or has).
@@ -5585,11 +5586,11 @@ mod tests {
         (desc[1], desc[4], desc[5]) = (STRUCTURE, 0x1234_5600, 0x42);
         let view = View::Shader(0, Some(desc));
         assert_eq!(view_address(&view), Some(0x42_1234_5600));
-        write_view_address(data, 7, Some(&view));
-        write_view_address(data, 8, None);
-        write_view_address(data, SLOT_STRIDES_COUNT - 1, Some(&view));
+        write_view_address(data, 7, 0x42_1234_5600);
+        write_view_address(data, 8, 0);
+        write_view_address(data, SLOT_STRIDES_COUNT - 1, 0x42_1234_5600);
         // Past the table: nothing written.
-        write_view_address(data, SLOT_STRIDES_COUNT, Some(&view));
+        write_view_address(data, SLOT_STRIDES_COUNT, 0x42_1234_5600);
         let at = VIEW_ADDRESSES as usize / 4;
         assert_eq!(table[at + 14..at + 18], [0x1234_5600, 0x42, 0, 0]);
         assert_eq!(table[at + 12..at + 14], [0xdead_beef; 2], "slot 6 untouched");
@@ -6395,8 +6396,8 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_slots_populate_and_clear_stride_table() {
-        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    fn dynamic_slots_populate_and_clear_view_metadata() {
+        use victory_shader::emit::{VIEW_ADDRESSES, VIEW_INTEGER, VIEW_SIGNED};
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
@@ -6406,6 +6407,12 @@ mod tests {
         let read_stride = |slot: u32| -> u32 {
             // SAFETY: inside `SLOT_STRIDES_COUNT` mapping of `heap.strides`.
             unsafe { *(data as *const u32).add(slot as usize) }
+        };
+        let read_address = |slot: u32| -> u64 {
+            let words = (data + VIEW_ADDRESSES as usize) as *const u32;
+            let index = 2 * slot as usize;
+            // SAFETY: both dwords are inside the heap's title-address table.
+            unsafe { u64::from(*words.add(index)) | (u64::from(*words.add(index + 1)) << 32) }
         };
         let memory = vec![0u64; 1 << 11];
         let addr = (memory.as_ptr() as u64).next_multiple_of(4096);
@@ -6428,6 +6435,7 @@ mod tests {
         let u16x4 = placed_typed(true, 12, 64);
         heap.make_at(s0, &u16x4);
         assert_eq!(read_stride(s0), 8 | VIEW_INTEGER);
+        assert_eq!(read_address(s0), addr);
 
         // R16_SINT (59): 2 bytes + VIEW_INTEGER | VIEW_SIGNED
         let s16 = placed_typed(false, 59, 64);
@@ -6442,10 +6450,13 @@ mod tests {
         // Clearing / nulling / raw views overwrite stale bits cleanly.
         heap.make_null(s0);
         assert_eq!(read_stride(s0), 0);
+        assert_eq!(read_address(s0), 0);
         heap.null_raw_at(s0 + 1);
         assert_eq!(read_stride(s0 + 1), 0);
+        assert_eq!(read_address(s0 + 1), 0);
         heap.null_raw_uav_at(s0 + 2);
         assert_eq!(read_stride(s0 + 2), 0);
+        assert_eq!(read_address(s0 + 2), 0);
 
         // `make_listed` (both cold creation and cached copy hit) must populate strides.
         let mut slot_mem = [0u32; 8];
@@ -6453,10 +6464,12 @@ mod tests {
         let rec = [slot_mem[0], slot_mem[1], slot_mem[2]];
         assert!(heap.make_listed(0x1234, rec, s0).is_some());
         assert_eq!(read_stride(s0), 8 | VIEW_INTEGER);
+        assert_eq!(read_address(s0), addr);
         heap.make_null(s0 + 3);
         assert_eq!(read_stride(s0 + 3), 0);
         assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
         assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
+        assert_eq!(read_address(s0 + 3), addr);
     }
 }
 
@@ -6479,6 +6492,7 @@ struct ListView {
     at: u32,
     twin: bool,
     stride_word: u32,
+    address: u64,
     kept: Kept,
     listed: Listed,
 }
