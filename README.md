@@ -82,7 +82,14 @@ nothing from the game goes in the tree.*
       `play.ps1`): the title's CPU never reads it (a diagnostics probe,
       `VICTORY_LAND_NOT_PROBE=1`, saw no access over a launch), and it was a
       third of what the relay fetched and merged into title memory. One launch
-      switching it on and off: 52.8 -> 49.7 ms a frame, landing 25.2 -> 18.2.
+      switching it on and off: 52.8 -> 49.7 ms a frame, landing 25.2 -> 18.2;
+    - the title's writes into guarded memory go in beside the guard
+      (`VICTORY_STORE_BESIDE`, `VICTORY_COPY_BESIDE`, both existing switches,
+      now on in `play.ps1`'s 4090 block): write faults that open a block
+      fell from about 300 to 200 a frame, and all threads' waits for the
+      guards' lock from 54-60 to 32-36 ms a frame, most of it the title's own
+      threads'. The frame does not move yet: the submitting thread is the
+      wall. Diagnostics builds name where that lock is held longest.
 - **Not brought over (yet)** from our earlier tree (fxceless's fork with about
   140 commits of ours): its FidelityFX SDK path for the Series S upscale
   (Vice-Tay translates FSR 4's own code) and its other rendering fixes, which
