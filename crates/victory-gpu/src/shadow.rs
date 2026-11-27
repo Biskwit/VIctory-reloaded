@@ -798,17 +798,24 @@ pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
 
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.len() < 2 {
+        return ranges;
+    }
     // (The sort that finds what is in order already: they come as a few
     // stretches of tens of thousands in order, put behind one another.)
     ranges.sort();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    let mut last = 0;
+    for index in 1..ranges.len() {
+        let (from, to) = ranges[index];
+        if from <= ranges[last].1 {
+            ranges[last].1 = ranges[last].1.max(to);
+        } else {
+            last += 1;
+            ranges[last] = (from, to);
         }
     }
-    out
+    ranges.truncate(last + 1);
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -1073,6 +1080,17 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
     let mut out = Vec::new();
+    for_outside(from, to, skip, |a, b| out.push((a, b)));
+    out
+}
+
+/// Visits the parts of `[from, to)` outside ranges sorted by their start.
+fn for_outside(
+    from: usize,
+    to: usize,
+    skip: impl IntoIterator<Item = (usize, usize)>,
+    mut part: impl FnMut(usize, usize),
+) {
     let mut at = from;
     for (a, b) in skip {
         if b <= at {
@@ -1082,14 +1100,13 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
             break;
         }
         if a > at {
-            out.push((at, a));
+            part(at, a);
         }
         at = at.max(b);
     }
     if at < to {
-        out.push((at, to));
+        part(at, to);
     }
-    out
 }
 
 #[cfg(test)]
@@ -4188,14 +4205,23 @@ impl Shadow {
             let mut changed: Vec<(usize, usize)> = Vec::new();
             let (mut runs_in, mut bytes_in) = (0u64, 0u64);
             for (i, runs) in done.into_iter().enumerate() {
-                let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
+                let Some(mut runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
                     continue;
                 };
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
                 runs_in += runs.len() as u64;
                 bytes_in += runs.iter().map(|r| r.1 as u64).sum::<u64>();
                 if self.card.is_some() {
-                    changed.extend(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
+                    let page_offset = lo - start;
+                    for (from, to) in &mut runs {
+                        *from += page_offset;
+                        *to += *from;
+                    }
+                    if changed.is_empty() {
+                        changed = runs;
+                    } else {
+                        changed.append(&mut runs);
+                    }
                 }
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
@@ -5133,14 +5159,19 @@ impl Shadow {
     /// # Safety
     /// The third of each piece is the address of its bytes, which stay as
     /// they are during the call.
-    pub(crate) unsafe fn land_card(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
+    pub(crate) unsafe fn land_card(
+        &self,
+        pieces: impl Iterator<Item = (usize, usize, usize)> + Clone,
+        fetched_after: u64,
+        notes: &mut crate::land::Notes,
+    ) -> u64 {
         let Some(card) = &self.card else {
             return 0;
         };
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
-        let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
+        let (from, to) = pieces.clone().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
@@ -5148,20 +5179,31 @@ impl Shadow {
             sent.near(fetched_after, from, to, &mut skip);
             skip
         };
+        // Both sources of protected bytes can overlap. Join them once so
+        // each piece can find its first overlapping range by end address.
+        let skip = if skip.len() > 1 { joined(skip) } else { skip };
+        let mut partial = Vec::new();
         let mut put = 0;
-        for &(lo, hi, now) in pieces {
+        for (lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
                 continue;
             }
-            let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
-            let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
+            let near = &skip[skip.partition_point(|&(_, end)| end <= lo)..];
+            let whole = [(0, hi - lo)];
+            let parts: &[(usize, usize)] = if near.first().is_none_or(|&(start, _)| start >= hi) {
+                &whole
+            } else {
+                partial.clear();
+                for_outside(lo, hi, near.iter().copied(), |a, b| partial.push((a - lo, b - lo)));
+                &partial
+            };
             // SAFETY: inside the mapping (checked above), in a range
             // declared and not done with, which no refresh writes; the
             // title's bytes are kept out by the lock; the caller's.
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
             let merged =
-                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), parts, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
@@ -5325,11 +5367,10 @@ mod land_tests {
                 for &(lo, hi) in &pieces {
                     one.card_merge_relay(lo, &now[lo..hi], after, &mut scratch);
                 }
-                let addressed: Vec<(usize, usize, usize)> =
-                    pieces.iter().map(|&(lo, hi)| (lo, hi, now.as_ptr() as usize + lo)).collect();
+                let addressed = pieces.iter().map(|&(lo, hi)| (lo, hi, now.as_ptr() as usize + lo));
                 let mut notes = crate::land::Notes::default();
                 // SAFETY: the fetched bytes are `now`'s.
-                unsafe { many.land_card(&addressed, after, &mut notes) };
+                unsafe { many.land_card(addressed, after, &mut notes) };
                 notes.flush();
                 assert!(bytes(a) == bytes(b), "title memory, round {round}");
                 assert!(bytes(one.data as usize) == bytes(many.data as usize), "the CPU's side, round {round}");
@@ -5392,7 +5433,7 @@ mod land_tests {
                     let mut notes = crate::land::Notes::default();
                     let (lo, hi) = (b * PIECE, (b + 1) * PIECE);
                     // SAFETY: the fetched bytes are `now`'s; each block once.
-                    unsafe { shadow.land_card(&[(lo, hi, at + lo)], 8, &mut notes) };
+                    unsafe { shadow.land_card(std::iter::once((lo, hi, at + lo)), 8, &mut notes) };
                     notes.flush();
                 });
                 for i in (3..LEN / 4).step_by(4 * 53) {
