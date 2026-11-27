@@ -55,6 +55,10 @@ How each of these was found, with the numbers:
   default. Making one holds a global lock; on a card whose view heap has no raw
   twins (NVIDIA) every such view took it, and the list threads queued on it down
   to 6 fps (`VICTORY_STRUCTURED_RAW=1` makes the copies).
+- **Constant buffers written by placed copies.** With
+  `VICTORY_PLACED_CONSTANTS=1`, a draw can bind a GPU snapshot of the bytes an
+  earlier placed copy wrote. The command list can reuse that snapshot across
+  draws until a write overlaps the same bytes. The option is off by default.
 - **Reuse lazy state preludes** with `VICTORY_PRELUDE_POOL=1`. The pool
   takes the allocator and command list back after the owning list resets,
   once its prior submission has finished. It holds up to 128 idle pairs.

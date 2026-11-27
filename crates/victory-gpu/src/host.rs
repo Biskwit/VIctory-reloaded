@@ -3216,6 +3216,14 @@ struct Deferred {
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
+    /// Disjoint placed copies that can supply constants in this recording, sorted by address.
+    placed_constants: Vec<place::ConstantSource>,
+    /// Reusable snapshots by title address and length.
+    constant_values: std::collections::BTreeMap<(usize, usize), place::ConstantSnapshot>,
+    /// Changes when a recorded write or reset can invalidate a pending snapshot.
+    constant_write_version: u64,
+    /// GPU snapshots of constant data, held through every use of the list.
+    constant_snapshots: Vec<ID3D12Resource>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Last GPU source copied into each aliased host texture in this list.
@@ -3272,12 +3280,19 @@ impl Deferred {
         self.uploads.push(buffer);
     }
 
-    /// The steps recorded last write title memory: what was brought up to
-    /// date before them is not any more.
-    fn title_written(&mut self) {
+    /// The steps recorded last write title memory. A copy already recorded on the GPU
+    /// only replaces sources it overlaps. Deferred CPU writes invalidate them all.
+    fn title_written(&mut self, placed: Option<(usize, usize)>) {
         self.refreshed.clear();
         self.gpu_written.clear();
         self.filled.clear();
+        if let Some((address, len)) = placed {
+            self.forget_placed_constants(address, len);
+        } else if !self.placed_constants.is_empty() || !self.constant_values.is_empty() {
+            self.constant_write_version = self.constant_write_version.wrapping_add(1);
+            self.placed_constants.clear();
+            self.constant_values.clear();
+        }
     }
 }
 
@@ -4933,6 +4948,8 @@ fn late_line(frames: f64) {
         );
     }
     crate::land::log(frames);
+    #[cfg(feature = "diagnostics")]
+    place::constant_snapshots_line(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -7753,6 +7770,7 @@ impl HostList {
         self.batches_common();
         self.card_budget_out();
         self.take_coming();
+        self.close_constant_snapshots();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -7812,7 +7830,9 @@ impl HostList {
         let texture_backs = {
             let mut deferred = self.deferred();
             let texture_backs = std::mem::take(&mut deferred.texture_backs);
+            let constant_write_version = deferred.constant_write_version.wrapping_add(1);
             *deferred = Deferred::default();
+            deferred.constant_write_version = constant_write_version;
             texture_backs
         };
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -8358,7 +8378,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.title_written();
+        deferred.title_written(None);
         self.changed_something();
     }
 
@@ -8430,6 +8450,7 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
+        deferred.forget_placed_constants(address, len);
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
@@ -8799,7 +8820,7 @@ impl HostList {
         }
         let mut deferred = self.deferred();
         deferred.copies.push(Step::RawCopy { dst, src, len });
-        deferred.title_written();
+        deferred.title_written(None);
         drop(deferred);
         self.changed_something();
     }
