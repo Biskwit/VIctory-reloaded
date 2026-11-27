@@ -77,7 +77,48 @@ Use [`Play-VIctory.cmd`](Play-VIctory.cmd) to pass the same options from Command
 | `-Safe` | Launch with the conservative settings when investigating a graphics or stability issue. |
 | `-Windowed` / `-NoPanel` | Start in a window or hide the diagnostics overlay at launch. |
 | `-RayTracing` | Enable the structures needed for the title's ray-traced indirect lighting. |
+| `-Fsr4K quality` / `-Dlss4K quality` | Upscale to 3840 × 2160 with PC FSR or DLSS on Series X. |
 | `-Build release` | Use the executable built with `cargo build --locked --release -p victory`. The overlay requires a diagnostics build. |
+
+<details>
+<summary>PC upscaling and Series S frame generation</summary>
+
+The Series X 4K profiles support `quality`, `balanced` and `performance` on
+build 1.0.2.1. They render at 2560 × 1440, 2258 × 1270 and 1920 × 1080
+respectively. For Series S, pass `VICTORY_DLSS='quality'` or
+`VICTORY_FSR='quality'` through `-More` to use a PC upscaler at the console
+profile's output size. Both accept the same three presets.
+
+For FSR, point `VICTORY_FIDELITYFX_DIR` or `[paths].fidelityfx_dir` at the
+folder containing `amd_fidelityfx_upscaler_dx12.dll`. The 4K mode uses
+FSR 4.1.2, and the Series S mode uses the analytical 3.1.6 provider.
+For DLSS on an RTX card, set `VICTORY_DLSS_DIR` or `[paths].dlss_dir` to
+select a folder with `nvngx_dlss.dll`. NGX uses the driver's copy by
+default. `VICTORY_DLSS_NO_UPDATE=1` uses the installed selection without
+an NGX update. [AMD FSR SDK](https://gpuopen.com/amd-fsr-sdk/) ·
+[NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS)
+
+For 2× Series S frame generation, set `VICTORY_FRAMEGEN='1'` and point
+`VICTORY_FFX_FG_DIR` at the SDK 2.4.0 `Kits/FidelityFX/signedbin` folder
+with `amd_fidelityfx_loader_dx12.dll` and
+`amd_fidelityfx_framegeneration_dx12.dll`. This uses AMD's analytical
+3.1.6 frame generation provider. The launch below uses DLSS on an RTX card.
+
+```powershell
+.\scripts\play.ps1 -Exe 'D:\victory-data\game\game.exe' -Console series-s -More @{
+    VICTORY_DLSS='quality'; VICTORY_FRAMEGEN='1'; VICTORY_FFX_FG_DIR='<SDK signedbin>'
+}
+```
+
+With neither PC upscaler selected, frame generation uses depth and motion
+vectors from the title's native FidelityFX loader. `RENDER FPS` in the
+diagnostics panel counts rendered frames, and `FG OUTPUT FPS` counts
+swap-chain presentations. The PC FSR bridge follows
+[DexNom's implementation](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e)
+through beloooo's port. The frame generation bridge follows
+[PastiiJay's DirectX 12 integration](https://github.com/PastiiJay/klbf-lab/commit/793c56c36fda760b027122418b922fc359abf580).
+
+</details>
 
 <details>
 <summary>Shader cache and pipeline warm-up</summary>

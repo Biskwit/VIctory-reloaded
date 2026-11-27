@@ -706,6 +706,9 @@ fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+    // DLSS's features and NGX, before the device goes with the process.
+    #[cfg(windows)]
+    crate::modules::fidelityfx::shut_down();
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }
