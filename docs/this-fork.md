@@ -53,6 +53,19 @@ How each of these was found, with the numbers:
   default. Making one holds a global lock; on a card whose view heap has no raw
   twins (NVIDIA) every such view took it, and the list threads queued on it down
   to 6 fps (`VICTORY_STRUCTURED_RAW=1` makes the copies).
+- **Reuse lazy state preludes** with `VICTORY_PRELUDE_POOL=1`. The pool
+  takes the allocator and command list back after the owning list resets,
+  once its prior submission has finished. It holds up to 128 idle pairs.
+  To try it on the reported RX 6900 XT setup, add
+  `-More @{VICTORY_PRELUDE_POOL='1'}` to the same Series S launch. The pool-on
+  run loaded the world, and the creation count stayed at 155 for 67 seconds
+  under memory pressure.
+  A separate Windows Sandbox test on an RTX 5090 D v2 made 831 preludes with
+  the pool off and 186 with it on. These are endpoint counts for allocator
+  reuse. Keep the save, relay settings, resolution and cache the same when
+  comparing stability or frame times.
+  [RX 6900 XT report](https://github.com/TaynanGT/Vice-Tay/issues/93#issuecomment-7217111392) ·
+  [RTX 5090 D v2 report](https://github.com/TaynanGT/Vice-Tay/pull/211#issuecomment-7218626007)
 
 ## Picture
 
