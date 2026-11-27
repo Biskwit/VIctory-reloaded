@@ -3017,7 +3017,11 @@ impl<'a> Lower<'a> {
                 let wave: u32 = if self.x.native.wave64 { 64 } else { 32 };
                 let threads = cs.threads.iter().product::<u32>();
                 let (e, i32t) = (self.s.entry, self.s.t.i32);
-                let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+                // On relabelled waves, use the same base as the console thread ID.
+                // A host wave's physical IDs need not be in one contiguous range.
+                let flat = self.wave_base().unwrap_or_else(|| {
+                    self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[])
+                });
                 let w = self.s.m.i32(wave.trailing_zeros());
                 let index = self.s.m.bin(e, Bin::LShr, flat, w);
                 let six = self.s.m.i32(6);
