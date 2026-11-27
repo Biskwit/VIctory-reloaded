@@ -11012,7 +11012,11 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
-            let game_ui = if p.framegen && planes.is_some() && !read_now {
+            #[cfg(feature = "diagnostics")]
+            let capture_scene = p.framegen && read_now && crate::capture::scene_before_framegen(frame);
+            #[cfg(not(feature = "diagnostics"))]
+            let capture_scene = false;
+            let game_ui = if p.framegen && planes.is_some() && (!read_now || capture_scene) {
                 if p.game_ui.as_ref().is_none_or(|ui| ui.size != (width, height)) {
                     p.game_ui = crate::compose::UiFrames::new(self, (width, height));
                 }
@@ -11126,8 +11130,17 @@ impl Host {
                 list.CopyResource(&back, texture);
             }
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
+            let scene_available = !capture_scene || planes.is_none() || game_ui.is_some();
+            #[cfg(feature = "diagnostics")]
+            if capture_scene && !scene_available {
+                tracing::warn!(frame, "could not separate the scene for capture before frame generation");
+            }
+            #[cfg(feature = "diagnostics")]
+            let capture = (crate::capture::wanted(frame) && scene_available)
                 .then(|| {
+                    if capture_scene {
+                        tracing::info!(frame, "capturing the scene before frame generation");
+                    }
                     if composed {
                         list.ResourceBarrier(&[transition(
                             &back,

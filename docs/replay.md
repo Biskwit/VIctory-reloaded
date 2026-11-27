@@ -19,6 +19,14 @@ direct draw, indexed draw or mesh dispatch includes the reason, pipeline
 recipe key and guest shader hashes when a pipeline was set. Draws that reach
 the GPU can still produce incorrect geometry, depth or materials.
 
+## Inspect the scene before frame generation
+
+With frame generation enabled, set `VICTORY_CAPTURE_SCENE_BEFORE_FRAMEGEN=1`
+along with the capture folder and frame list above. The selected PNGs show
+the scene before interpolation and HUD composition. The swap chain still
+composes the HUD and presents with frame generation when its input is ready.
+Use the frame number in the log to compare the PNG with the recorded output.
+
 ## Recording
 
 Off unless `VICTORY_RECORD` is set. Build with

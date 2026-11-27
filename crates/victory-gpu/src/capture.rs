@@ -144,6 +144,9 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    if scene_capture_on() {
+        return folder().is_some() && listed(n);
+    }
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
     let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
@@ -153,6 +156,16 @@ pub(crate) fn wanted(n: u64) -> bool {
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+}
+
+/// Save explicitly selected frames before interpolation and UI composition.
+pub(crate) fn scene_before_framegen(n: u64) -> bool {
+    scene_capture_on() && folder().is_some() && listed(n)
+}
+
+fn scene_capture_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CAPTURE_SCENE_BEFORE_FRAMEGEN"))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
