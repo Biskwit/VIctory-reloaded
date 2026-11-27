@@ -81,6 +81,15 @@ if ($Machine -eq '7900xtx') {
         # in the PC's memory. Series S cell, i9-12900K: card busy 27.2-32.5 ->
         # 21.4 ms a frame, the submitting thread as it was.
         $settings.VICTORY_WINDOWS_BAR_MB = '6144'
+        # The title's writes into guarded view memory go in beside the guard
+        # (victory-gpu titlewrite.rs): its memcpy, memmove and memset look at
+        # the guards first, and a store that faults is done through our own
+        # view of the page, or left out if it changes nothing. Series S cell,
+        # i9-12900K, two launches of an in-run A/B: write faults that open a
+        # block 298-307 -> 199-205 a frame, waits for the guards' lock 54-60 ->
+        # 32-36 ms a frame of all threads (most of them the title's), the
+        # frame as it was.
+        $settings.VICTORY_STORE_BESIDE = '1'; $settings.VICTORY_COPY_BESIDE = '1'
     }
     # The console wave64 programs a 32-lane card takes only in the wave-wide
     # form; this list of them ran without a lost device on this card for 30
