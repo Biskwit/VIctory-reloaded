@@ -211,9 +211,24 @@ Ryzen 9 9950X3D, are below the line.
 | after, the gate: 1 cold launch on a fresh cache and 3 warm ones | 19.8 (18.8) | 50.5 | 40.7 / 31.0 / 25.8 |
 | after, the gate's 15-minute warm session | 20.9 (19.9) | 47.8 | 37.9 / 29.6 / 21.5 |
 
+The next round (2026-11-27): the levers listed above from the windows in the
+card's memory on. Measured on a quiet machine, one build after the other,
+each with its own `play.ps1` settings and a warm-up launch first:
+
+| Build | fps: median (p10) | ms a frame | preparing / card busy / copying back |
+|---|---|---|---|
+| before (7cae3c5), 3 warm launches | 19.7 (19.2) | 50.7 | 40.8 / 28.9 / 24.0 |
+| after (0ae83d16), 3 warm launches | 27.0 (25.9) | 37.1 | 30.1 / 20.3 / 18.2 |
+| after, a 10-minute session | 26.9 (26.2) | 37.2 | 30.2 / 22.0 / 17.6 |
+
+The session held 36.5-38.0 ms a frame minute by minute, with the game's
+private memory flat at 24.4-25.6 GB. The frame is still set by the thread that
+prepares the submissions; the card is busy about 20 ms of it.
+
 The same settings on Series X, in the same cell: 73.0-80.7 ms a frame before
 (12.4-13.7 fps, 2 launches of 7d190fe), 57.6 ms after (17.4 fps, 1 launch);
-card busy 65-70 -> 47 ms.
+card busy 65-70 -> 47 ms. After the second round, 51.8-55.1 ms (about 19 fps,
+3 warm launches with the pipeline library).
 
 ## The overlay
 
