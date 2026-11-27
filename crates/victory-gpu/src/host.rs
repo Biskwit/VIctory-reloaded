@@ -3741,13 +3741,27 @@ fn joins_asked() -> (usize, usize) {
     (parts, lists)
 }
 
-/// Whether the part `next` can be prepared together with `ahead`, which goes
+#[derive(Clone, Copy)]
+pub(crate) enum JoinStop {
+    QueueBoundary,
+    FoldedWait,
+    Disabled,
+    BoundaryJob,
+    ValueWait,
+    FenceWait,
+    PartLimit,
+    ListLimit,
+    CpuCopy,
+    EarlierWrite,
+}
+
+/// Why the part `next` cannot be prepared together with `ahead`, which goes
 /// before it and has not been sent: nothing done on the CPU for it reads what
 /// those give their shaders, write back or write when they are done, and it
 /// changes no title memory that they read ([`Step::Copy`], [`Step::RawCopy`]).
-pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
+pub(crate) fn join_blocked<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> Option<JoinStop> {
     if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::RawCopy { .. }))) {
-        return false;
+        return Some(JoinStop::CpuCopy);
     }
     let ahead: Vec<&HostList> = ahead.collect();
     let mut written: Vec<(usize, usize)> = declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges).collect();
@@ -3758,7 +3772,7 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
     }
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
-    blocked_by(&joined, next, false).is_none()
+    blocked_by(&joined, next, false).map(|_| JoinStop::EarlierWrite)
 }
 
 /// Whether a bottom-of-pipe write of `list` meets `wait`.
