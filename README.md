@@ -162,6 +162,11 @@ nothing from the game goes in the tree.*
       (3fe48113, 5307ba7d), an upload no longer stops an alias copy
       (7993c1bc), and a full texture-change queue keeps its ranges
       (53a1f162);
+    - a submission looks only at the card copies it touched or overlaps
+      for what changed, not at every copy in the card's memory (about 3,700;
+      `VICTORY_CARD_NEAR=0`: all, as before): the submitting thread's card
+      copies 1.6-1.7 ms shorter, the frame 0.7-1.0 ms in-run; its gate ran at
+      about 25 fps (25.8 over 12 minutes);
     - the write watch's journal keeps its pages in 4 MiB pieces instead of
       one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
       of 111; the submitting thread about 1 ms less a frame;
