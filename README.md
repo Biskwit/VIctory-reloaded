@@ -70,7 +70,19 @@ nothing from the game goes in the tree.*
     - the frame replay makes the buffers of heaps opened from memory and of
       heaps made not resident (it lost the card on this capture), and with
       `--breadcrumbs` names the list, breadcrumb and resource a lost card
-      stopped at.
+      stopped at;
+    - windows of title memory in the card's memory, written by the CPU
+      through resizable BAR (Vice-Tay bd68f5e's `VICTORY_WINDOWS_BAR_MB`, at
+      most 6 GB in `play.ps1`'s 4090 block; a card with a budget under 20 GiB
+      or without resizable BAR keeps them in the PC's memory): the card was
+      busy 27-32 ms a frame, 18-21 with them, for about 5 GB more of its
+      memory. Measured in the cell only; a large outdoor scene is untested;
+    - what FSR4's passes write to their scratch, one 21 MB block every frame,
+      stays on the card (`VICTORY_LAND_NOT`, their 20 programs listed in
+      `play.ps1`): the title's CPU never reads it (a diagnostics probe,
+      `VICTORY_LAND_NOT_PROBE=1`, saw no access over a launch), and it was a
+      third of what the relay fetched and merged into title memory. One launch
+      switching it on and off: 52.8 -> 49.7 ms a frame, landing 25.2 -> 18.2.
 - **Not brought over (yet)** from our earlier tree (fxceless's fork with about
   140 commits of ours): its FidelityFX SDK path for the Series S upscale
   (Vice-Tay translates FSR 4's own code) and its other rendering fixes, which
