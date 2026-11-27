@@ -226,19 +226,13 @@ try {
         if ($LASTEXITCODE -eq 0) {
             $cache = $config | Select-String '^cache_dir\s*:\s*(.+)$' | Select-Object -First 1
             if ($cache) {
-                $shaders = Join-Path $cache.Matches[0].Groups[1].Value 'shaders'
-                $entries = Get-ChildItem -LiteralPath $shaders -File -Recurse -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -cmatch '^[0-9a-f]{62}$' } | Select-Object -First 1000
-                if (@($entries).Count -lt 1000) {
-                    $source = Split-Path -LiteralPath $Exe
-                    $game = $config | Select-String '^game_dir\s*:\s*(.+)$' | Select-Object -First 1
-                    if ($game -and (Test-Path -LiteralPath $game.Matches[0].Groups[1].Value -PathType Container)) {
-                        $source = $game.Matches[0].Groups[1].Value
-                    }
-                    Write-Host "The shader cache has fewer than 1,000 entries. Translating shaders before launch. Use -SkipShaders to start without this step."
-                    & $victory shaders $source
-                    if ($LASTEXITCODE -ne 0) { Write-Host "victory shaders ended with exit code $LASTEXITCODE; starting anyway." }
+                $source = Split-Path -LiteralPath $Exe
+                $game = $config | Select-String '^game_dir\s*:\s*(.+)$' | Select-Object -First 1
+                if ($game -and (Test-Path -LiteralPath $game.Matches[0].Groups[1].Value -PathType Container)) {
+                    $source = $game.Matches[0].Groups[1].Value
                 }
+                & $victory shaders --if-needed $source
+                if ($LASTEXITCODE -ne 0) { Write-Host "victory shaders ended with exit code $LASTEXITCODE; starting anyway." }
             }
         }
     }
