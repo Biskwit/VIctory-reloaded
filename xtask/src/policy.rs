@@ -13,7 +13,8 @@ use anyhow::{Context, Result, bail};
 // (The translator's one file is 570 KiB of source.)
 const MAX_FILE_SIZE: usize = 640 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
-const MAX_DECIMAL_BYTES: usize = MAX_ENCODED_RUN / 2;
+// The XMA decoder has a 272-entry decimal VLC table.
+const MAX_DECIMAL_BYTES: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
