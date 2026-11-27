@@ -4,11 +4,11 @@
 
 Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory) to run an Xbox Series title from your own files. The title's x86-64 code runs on the host CPU. The compatibility layer provides the console APIs it calls and translates its graphics work to Direct3D 12.
 
-[Quick start](#getting-started) · [Gameplay](#gameplay) · [Measurements](#measurements) · [Benchmark dashboard](https://taynangt.github.io/Vice-Tay/)
+[Quick start](#getting-started) · [Gameplay](#gameplay) · [Measurements](#measurements) · [Measurements on GitHub Pages](https://taynangt.github.io/Vice-Tay/)
 
 ## Measurements
 
-The goal is **30 rendered FPS in the open world with correct visuals**. Both sessions used the Series S profile.
+The goal is **30 rendered FPS in the open world with correct visuals**. The recorded sessions below used the Series S profile on the indicated revisions.
 
 | Session | Result |
 | --- | --- |
