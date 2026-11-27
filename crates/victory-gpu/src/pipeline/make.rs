@@ -81,6 +81,9 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
+    if super::skipped_in(shaders).is_some() {
+        return Some("skipped by VICTORY_SKIP_PIPELINES");
+    }
     None
 }
 
