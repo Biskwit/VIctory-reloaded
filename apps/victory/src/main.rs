@@ -232,11 +232,7 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            let wave = translate::host_wave::select(
-                std::env::var("VICTORY_HOST_WAVE").ok().as_deref(),
-                std::env::var("VICTORY_HOST_MAX_WAVE").ok().as_deref(),
-                |message| eprintln!("{message}"),
-            );
+            let wave = translate::host_wave::requested();
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs, wave);
             }
