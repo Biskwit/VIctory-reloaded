@@ -5805,11 +5805,12 @@ mod tests {
         assert_ne!(a.ptr, heap.cpu(index).ptr);
 
         // Verify what the GPU can read instead of dereferencing driver-owned
-        // CPU descriptor handles. Use a table so the SRV has bounds.
+        // CPU descriptor handles. A volatile table range keeps the SRV
+        // bounds checks with a version 1.1 root signature.
         const READ_VIEW: &str = r#"
             ByteAddressBuffer input : register(t0);
             RWByteAddressBuffer output : register(u0);
-            [RootSignature("DescriptorTable(SRV(t0)), UAV(u0)")]
+            [RootSignature("DescriptorTable(SRV(t0, flags=DESCRIPTORS_VOLATILE)), UAV(u0)")]
             [numthreads(1, 1, 1)]
             void main() {
                 output.Store3(0, uint3(input.Load(0), input.Load(1020), input.Load(1024)));
