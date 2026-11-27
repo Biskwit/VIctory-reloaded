@@ -12,6 +12,7 @@ use super::{
 };
 
 struct Api {
+    module: usize,
     create: Create,
     destroy: Destroy,
     dispatch: Call,
@@ -30,13 +31,14 @@ static CONTEXTS: Mutex<BTreeMap<usize, Arc<Context>>> = Mutex::new(BTreeMap::new
 ///
 /// # Safety
 /// The addresses must be the three FidelityFX exports, mapped for the whole run.
-pub unsafe fn install(create: usize, destroy: usize, dispatch: usize) -> Result<(), &'static str> {
-    if create == 0 || destroy == 0 || dispatch == 0 {
+pub unsafe fn install(module: usize, create: usize, destroy: usize, dispatch: usize) -> Result<(), &'static str> {
+    if module == 0 || create == 0 || destroy == 0 || dispatch == 0 {
         return Err("native FidelityFX entry point is missing");
     }
     // SAFETY: the caller supplies the mapped FidelityFX exports with these signatures.
     let api = unsafe {
         Api {
+            module,
             create: std::mem::transmute::<usize, Create>(create),
             destroy: std::mem::transmute::<usize, Destroy>(destroy),
             dispatch: std::mem::transmute::<usize, Call>(dispatch),
@@ -44,6 +46,10 @@ pub unsafe fn install(create: usize, destroy: usize, dispatch: usize) -> Result<
     };
     API.set(api)
         .map_err(|_| "native FidelityFX observer already installed")
+}
+
+pub(crate) fn observes(module: usize) -> bool {
+    API.get().is_some_and(|api| api.module == module)
 }
 
 pub fn replacement(name: &str) -> Option<usize> {
@@ -161,23 +167,30 @@ fn prepare(list: &external::Recording<'_>, ctx: &Context, upscale: &DispatchUpsc
     let output = dispatch_output(render, upscale.upscale_size, ctx.max_render, ctx.max_output)?;
     let depth = upscale.resources[1].resource.cast::<Object>().cast_const();
     let motion = upscale.resources[2].resource.cast::<Object>().cast_const();
-    let (depth_id, depth_state) = list.existing_texture_binding(depth)?;
-    let (motion_id, motion_state) = list.existing_texture_binding(motion)?;
-    let (depth_state, motion_state) = (depth_state?, motion_state?);
+    let (depth_id, depth_state) = list.texture_binding(depth)?;
+    let (motion_id, motion_state) = list.texture_binding(motion)?;
     if depth_id == motion_id {
         return None;
     }
     const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+    const PIXEL_AND_COMPUTE_READ: u32 = 0xc0;
     const FFX_COMPUTE_READ: u32 = 0x4;
-    let depth_read = list.texture(depth, NON_PIXEL_SHADER_RESOURCE);
-    let motion_read = list.texture(motion, NON_PIXEL_SHADER_RESOURCE);
+    const FFX_PIXEL_AND_COMPUTE_READ: u32 = 0xc;
+    let read = |resource, previous: Option<u32>| {
+        list.prepare_input(resource)?;
+        let state = previous.filter(|&state| state == PIXEL_AND_COMPUTE_READ)
+            .unwrap_or(NON_PIXEL_SHADER_RESOURCE);
+        let (texture, state) = list.texture(resource, state)?;
+        let ffx_state = match state {
+            PIXEL_AND_COMPUTE_READ => FFX_PIXEL_AND_COMPUTE_READ,
+            NON_PIXEL_SHADER_RESOURCE => FFX_COMPUTE_READ,
+            _ => return None,
+        };
+        Some((texture, ffx_state))
+    };
     let prepared = (|| {
-        let (depth, NON_PIXEL_SHADER_RESOURCE) = depth_read? else {
-            return None;
-        };
-        let (motion, NON_PIXEL_SHADER_RESOURCE) = motion_read? else {
-            return None;
-        };
+        let (depth, depth_read) = read(depth, depth_state)?;
+        let (motion, motion_read) = read(motion, motion_state)?;
         for (index, texture) in [(1, &depth), (2, &motion)] {
             let [width, height] = minimum_extent(index, ctx.flags, render, output);
             // SAFETY: a live host resource held by the command list.
@@ -198,11 +211,17 @@ fn prepare(list: &external::Recording<'_>, ctx: &Context, upscale: &DispatchUpsc
             ctx.max_render,
             ctx.flags,
             [&depth, &motion],
-            [FFX_COMPUTE_READ; 2],
+            [depth_read, motion_read],
         );
         Some(())
     })();
-    let _ = list.texture(motion, motion_state);
-    let _ = list.texture(depth, depth_state);
+    // When the list had no state for a texture, its prelude transitions
+    // from the real submitted state and later lists see the new state.
+    if let Some(state) = motion_state {
+        let _ = list.texture(motion, state);
+    }
+    if let Some(state) = depth_state {
+        let _ = list.texture(depth, state);
+    }
     prepared
 }

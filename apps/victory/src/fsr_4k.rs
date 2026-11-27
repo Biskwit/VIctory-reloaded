@@ -1,6 +1,6 @@
 //! Series X SDR 4K profiles for the title's PC FidelityFX dispatch.
 use anyhow::{Context, Result, ensure};
-use victory_loader::PreparedImage;
+use victory_loader::{PreparedImage, resolution};
 
 const RETAIL_BUILD: &str = "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
 const SDR_MODE: u32 = 0x0615_c100;
@@ -76,6 +76,17 @@ impl FsrPreset {
 
     pub(super) fn render_size(self) -> [u32; 2] {
         [3840.0, 2160.0].map(|size| (size * self.render_scale()) as u32)
+    }
+
+    /// The selector and render scale when a PC upscaler serves Series S.
+    pub(super) fn series_s_patches(self) -> [(&'static resolution::Site, Vec<u8>); 2] {
+        [
+            (
+                &resolution::FFX_SCALE,
+                resolution::ffx_scale_code(self.render_scale()),
+            ),
+            (&resolution::PICKER, resolution::picker_code(7)),
+        ]
     }
 }
 
@@ -184,6 +195,16 @@ mod tests {
             assert_eq!(preset.dlss_quality(), dlss);
         }
         assert_eq!(FsrPreset::from_name("ultra"), None);
+    }
+
+    #[test]
+    fn series_s_performance_uses_half_size_and_selects_fidelityfx() {
+        let [(scale_site, scale_code), (picker_site, picker_code)] =
+            FsrPreset::Performance.series_s_patches();
+        assert_eq!(scale_site.at, resolution::FFX_SCALE.at);
+        assert_eq!(&scale_code[0x64..0x68], &0.5f32.to_le_bytes());
+        assert_eq!(picker_site.at, resolution::PICKER.at);
+        assert_eq!(picker_code, [0xb8, 7, 0, 0, 0, 0xc3]);
     }
 
     #[test]

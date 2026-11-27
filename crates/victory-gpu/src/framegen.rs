@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -44,7 +44,6 @@ const SWAP_CHAIN_VERSION: u32 = 4 << 22;
 // The built-in analytical provider in SDK 2.4. Read its ID from the query below.
 const FSR3_PROVIDER: u64 = (0xf600_0000 << 32) | (3 << 22) | (1 << 12) | 6;
 const PREMULTIPLIED_UI_ALPHA: u32 = 1 << 0;
-const INTERNAL_UI_DOUBLE_BUFFERING: u32 = 1 << 1;
 const TEXTURE_2D: u32 = 2;
 const RGBA8_UNORM: u32 = 10;
 const RENDER_TARGET_USAGE: u32 = 1;
@@ -52,6 +51,8 @@ const PIXEL_COMPUTE_READ: u32 = 0xc;
 
 // AMD requires its callback-driven Present and the context API to be serialized.
 static SDK: Mutex<()> = Mutex::new(());
+static STOPPED: AtomicBool = AtomicBool::new(false);
+static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[repr(C)]
 struct Header {
@@ -217,7 +218,13 @@ struct Api {
 
 pub fn requested() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FRAMEGEN").is_some_and(|v| v == "1"))
+    !STOPPED.load(Ordering::Acquire)
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_FRAMEGEN").is_some_and(|v| v == "1"))
+}
+
+/// Configure the provider directory before the first swap chain or SDK call.
+pub fn set_dir(dir: &Path) {
+    let _ = DIR.set(dir.to_path_buf());
 }
 
 fn api() -> Option<&'static Api> {
@@ -233,8 +240,11 @@ fn api() -> Option<&'static Api> {
 }
 
 fn load_api() -> Result<Api, String> {
-    let dir = std::env::var_os("VICTORY_FFX_FG_DIR")
-        .map(PathBuf::from)
+    let dir = DIR
+        .get()
+        .cloned()
+        .or_else(|| std::env::var_os("VICTORY_FFX_FG_DIR").filter(|v| !v.is_empty()).map(PathBuf::from))
+        .or_else(|| std::env::var_os("VICTORY_FIDELITYFX_DIR").filter(|v| !v.is_empty()).map(PathBuf::from))
         .ok_or("set VICTORY_FFX_FG_DIR to the signed FidelityFX frame generation DLL folder")?;
     let load = |path: &Path| {
         let path = std::path::absolute(path).map_err(|e| e.to_string())?;
@@ -300,6 +310,7 @@ fn analytical_provider(api: &Api, device: &ID3D12Device) -> Option<u64> {
 
 struct Context {
     handle: UnsafeCell<*mut c_void>,
+    can_generate: AtomicBool,
     create: Box<CreateFramegen>,
     _backend: Box<Backend>,
     _version: Box<Version>,
@@ -324,6 +335,57 @@ impl Drop for Context {
     }
 }
 
+const RECORDED: u8 = 0;
+const SUBMITTED: u8 = 1;
+const DISCARDED: u8 = 2;
+
+struct PreparedFrame {
+    frame: u64,
+    title_list: usize,
+    token: Option<u64>,
+    enabled: bool,
+    submission: Arc<AtomicU8>,
+}
+
+impl PreparedFrame {
+    fn matches_present(&self, frame: u64, token: Option<u64>) -> bool {
+        self.frame == frame && token.is_some() && self.token == token && self.submitted()
+    }
+
+    fn submitted(&self) -> bool {
+        self.submission.load(Ordering::Acquire) == SUBMITTED
+    }
+}
+
+/// A host list owns the SDK resources it recorded through GPU completion.
+/// Resetting an unsent list frees its frame slot without touching the SDK.
+pub(crate) struct Preparation {
+    _context: Arc<Context>,
+    recording: Option<Recording>,
+}
+
+impl Preparation {
+    pub(crate) fn submitted(&self) {
+        if let Some(recording) = &self.recording {
+            recording.submitted();
+        }
+    }
+}
+
+struct Recording(Arc<AtomicU8>);
+
+impl Recording {
+    fn submitted(&self) {
+        self.0.store(SUBMITTED, Ordering::Release);
+    }
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        let _ = self.0.compare_exchange(RECORDED, DISCARDED, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
 #[derive(Default)]
 struct State {
     swap_context: usize,
@@ -334,28 +396,12 @@ struct State {
     provider: u64,
     context: Option<Arc<Context>>,
     refused_layout: Option<([u32; 2], u32)>,
-    prepared: Option<Prepared>,
+    prepared: Option<PreparedFrame>,
     last_present: Option<u64>,
     real: u64,
     sample: Option<(Instant, u64, u32, u64)>,
     #[cfg(feature = "diagnostics")]
     cadence: Cadence,
-}
-
-#[derive(Clone, Copy)]
-struct Prepared {
-    frame: u64,
-    title_list: usize,
-    host_list: usize,
-    token: Option<u64>,
-    submitted: bool,
-    enabled: bool,
-}
-
-impl Prepared {
-    fn matches_present(self, frame: u64, token: Option<u64>) -> bool {
-        self.frame == frame && token.is_some() && self.token == token && self.submitted
-    }
 }
 
 #[cfg(feature = "diagnostics")]
@@ -401,8 +447,8 @@ pub(crate) fn swap_chain(
 ) -> Option<IDXGISwapChain3> {
     let api = api()?;
     let format = surface_format(desc.Format.0)?;
-    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(provider) = analytical_provider(api, device) else {
         tracing::warn!("frame generation: AMD analytical provider 3.1.6 is unavailable");
         return None;
@@ -542,6 +588,7 @@ fn make_context(api: &Api, state: &State, input: &Inputs<'_>) -> Option<Arc<Cont
     tracing::info!(display = ?state.display, render = ?input.max_render, "frame generation: AMD 3.1.6 context created");
     Some(Arc::new(Context {
         handle: UnsafeCell::new(handle),
+        can_generate: AtomicBool::new(false),
         create,
         _backend: backend,
         _version: version,
@@ -554,13 +601,16 @@ pub(crate) fn prepare(
     list: &ID3D12GraphicsCommandList,
     title_list: crate::object::This,
     input: Inputs<'_>,
-) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+) -> Option<Preparation> {
     if !requested() {
         return None;
     }
     let api = api()?;
     // The title increments this number before it queues the host Present.
     let frame = crate::queue::presented() + 1;
+    // Drop retired contexts after the SDK guard, since Context::drop takes it.
+    let _retired;
+    let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "diagnostics")]
     {
@@ -574,6 +624,9 @@ pub(crate) fn prepare(
             state.cadence.no_swap_chain += 1;
         }
         return None;
+    }
+    if state.prepared.as_ref().is_some_and(|p| p.submission.load(Ordering::Acquire) == DISCARDED) {
+        state.prepared = None;
     }
     if state.prepared.is_some() {
         #[cfg(feature = "diagnostics")]
@@ -601,8 +654,22 @@ pub(crate) fn prepare(
         }
         return None;
     }
-    let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
     let layout = (input.max_render, input.upscale_flags & 0b1_1110);
+    if state.context.as_ref().is_some_and(|context| {
+        (context.create.max_render, context.create.flags) != layout
+            || context.create.display != state.display
+            || context.create.format != state.format
+    }) {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.layout_changed += 1;
+        }
+        if !disable_and_drain(api, &state, frame) {
+            return None;
+        }
+        _retired = state.context.take();
+        state.refused_layout = None;
+    }
     if state.context.is_none() && state.refused_layout != Some(layout) {
         state.context = make_context(api, &state, &input);
         if state.context.is_none() {
@@ -616,20 +683,6 @@ pub(crate) fn prepare(
         }
         return None;
     };
-    if (context.create.max_render, context.create.flags) != layout {
-        #[cfg(feature = "diagnostics")]
-        {
-            state.cadence.layout_changed += 1;
-        }
-        static REPORTED: std::sync::Once = std::sync::Once::new();
-        REPORTED.call_once(|| {
-            tracing::warn!(
-                ?layout,
-                "frame generation: upscaler layout changed before the swap chain"
-            );
-        });
-        return None;
-    }
     let enabled = !input.reset;
     if !configure(api, &state, frame, enabled) {
         #[cfg(feature = "diagnostics")]
@@ -675,15 +728,15 @@ pub(crate) fn prepare(
             tracing::warn!(result, "frame generation: AMD prepare refused the frame")
         });
         // The SDK may already have recorded work before a failed return.
-        return Some(context);
+        return Some(Preparation { _context: context, recording: None });
     }
-    state.prepared = Some(Prepared {
+    let submission = Arc::new(AtomicU8::new(RECORDED));
+    state.prepared = Some(PreparedFrame {
         frame,
         title_list: title_list as usize,
-        host_list: list.as_raw() as usize,
         token: None,
-        submitted: false,
         enabled,
+        submission: submission.clone(),
     });
     #[cfg(feature = "diagnostics")]
     {
@@ -691,7 +744,7 @@ pub(crate) fn prepare(
     }
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| tracing::info!(frame, render = ?input.render_size, "frame generation: first AMD prepare recorded"));
-    Some(context)
+    Some(Preparation { _context: context, recording: Some(Recording(submission)) })
 }
 
 /// Bind the recorded upscaler input to the token supplied by the title on
@@ -700,6 +753,7 @@ pub(crate) fn bind_submission(lists: &[crate::object::This], token: u64) {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(prepared) = state.prepared.as_mut()
         && prepared.token.is_none()
+        && prepared.submission.load(Ordering::Acquire) != DISCARDED
         && lists
             .iter()
             .any(|&list| list as usize == prepared.title_list)
@@ -708,33 +762,25 @@ pub(crate) fn bind_submission(lists: &[crate::object::This], token: u64) {
     }
 }
 
-/// Mark the input only after the graphics list was sent to the host queue.
-pub(crate) fn mark_submitted(lists: &[&crate::host::HostList]) {
-    if !requested() {
-        return;
-    }
-    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(prepared) = state.prepared.as_mut()
-        && !prepared.submitted
-        && lists
-            .iter()
-            .any(|list| list.list.as_raw() as usize == prepared.host_list)
-    {
-        prepared.submitted = true;
-    }
-}
-
 unsafe extern "C" fn generate(params: *mut Header, context: *mut c_void) -> u32 {
     let Some(api) = api() else { return ERROR };
-    // SAFETY: the SDK passes the context slot configured for its callback.
-    let result = unsafe { (api.dispatch)(context.cast(), params) };
+    // SAFETY: the SDK passes a live generation descriptor to this callback.
+    if !unsafe { params.as_ref() }.is_some_and(|header| header.kind == DISPATCH_FRAMEGEN) {
+        return ERROR;
+    }
+    // SAFETY: the configured Context stays live until the proxy is drained.
+    let Some(context) = (unsafe { context.cast::<Context>().as_ref() }) else { return ERROR };
+    if !context.can_generate.load(Ordering::Acquire) {
+        // SAFETY: the callback receives the SDK's generation descriptor.
+        unsafe { (*params.cast::<GenerateArgs>()).generated = 0 };
+        return OK;
+    }
+    // SAFETY: the SDK calls back from Present, which owns the SDK guard.
+    let result = unsafe { (api.dispatch)(context.handle.get(), params) };
     if result == OK {
-        // SAFETY: the callback's header identifies the SDK's dispatch descriptor.
-        if unsafe { (*params).kind } == DISPATCH_FRAMEGEN {
-            // SAFETY: the checked descriptor type includes the generated count.
-            let count = unsafe { (*params.cast::<GenerateArgs>()).generated };
-            GENERATED.fetch_add(u64::from(count), Ordering::Relaxed);
-        }
+        // SAFETY: the checked descriptor type includes the generated count.
+        let count = unsafe { (*params.cast::<GenerateArgs>()).generated };
+        GENERATED.fetch_add(u64::from(count), Ordering::Relaxed);
         static FIRST: std::sync::Once = std::sync::Once::new();
         FIRST.call_once(|| {
             tracing::info!("frame generation: first AMD generation callback succeeded")
@@ -748,17 +794,14 @@ unsafe extern "C" fn generate(params: *mut Header, context: *mut c_void) -> u32 
     result
 }
 
-fn configure(api: &Api, state: &State, frame: u64, enabled: bool) -> bool {
-    let Some(context) = &state.context else {
-        return false;
-    };
-    let mut desc = ConfigureFramegen {
+fn configuration(state: &State, context: *mut c_void, frame: u64, enabled: bool) -> ConfigureFramegen {
+    ConfigureFramegen {
         header: header(CONFIGURE_FRAMEGEN),
         swap_chain: state.swap_chain as *mut c_void,
         present_callback: null(),
         present_context: null_mut(),
-        generate_callback: Some(generate),
-        generate_context: context.handle.get().cast(),
+        generate_callback: enabled.then_some(generate as Generate),
+        generate_context: if enabled { context } else { null_mut() },
         enabled,
         async_workloads: false,
         hudless: NO_RESOURCE,
@@ -766,7 +809,14 @@ fn configure(api: &Api, state: &State, frame: u64, enabled: bool) -> bool {
         only_generated: false,
         rect: [0, 0, state.display[0] as i32, state.display[1] as i32],
         frame,
+    }
+}
+
+fn configure(api: &Api, state: &State, frame: u64, enabled: bool) -> bool {
+    let Some(context) = &state.context else {
+        return false;
     };
+    let mut desc = configuration(state, Arc::as_ptr(context).cast_mut().cast(), frame, enabled);
     // SAFETY: the presenter owns the live swap chain and the context survives its callback.
     let result = unsafe { (api.configure)(context.handle.get(), &raw mut desc.header) };
     if result != OK {
@@ -777,9 +827,27 @@ fn configure(api: &Api, state: &State, frame: u64, enabled: bool) -> bool {
     result == OK
 }
 
-/// Set the optional image that the proxy composites after interpolation.
-/// With internal buffering, Present consumes this registration and copies
-/// the image before the game queue can update it again.
+fn wait_for_presents(api: &Api, state: &State) -> bool {
+    let mut context = state.swap_context as *mut c_void;
+    // SAFETY: the SDK guard protects the live swap chain and its owner.
+    let result = unsafe { (api.dispatch)(&mut context, &mut header(WAIT_FOR_PRESENTS)) };
+    if result != OK {
+        tracing::warn!(result, "frame generation: AMD could not drain the swap chain");
+    }
+    result == OK
+}
+
+fn disable_and_drain(api: &Api, state: &State, frame: u64) -> bool {
+    let disabled = state.context.as_ref().is_none_or(|context| {
+        context.can_generate.store(false, Ordering::Release);
+        configure(api, state, frame, false)
+    });
+    let drained = wait_for_presents(api, state);
+    disabled && drained
+}
+
+/// Set the optional premultiplied image the proxy composites. The presenter
+/// supplies alternating images so the proxy can read the previous one.
 fn register_ui(api: &Api, state: &mut State, ui: Option<&ID3D12Resource>) -> bool {
     if ui.is_none() && state.ui.is_none() {
         return true;
@@ -801,7 +869,7 @@ fn register_ui(api: &Api, state: &mut State, ui: Option<&ID3D12Resource>) -> boo
             ],
             state: PIXEL_COMPUTE_READ,
         }),
-        flags: ui.map_or(0, |_| PREMULTIPLIED_UI_ALPHA | INTERNAL_UI_DOUBLE_BUFFERING),
+        flags: ui.map_or(0, |_| PREMULTIPLIED_UI_ALPHA),
     };
     let mut context = state.swap_context as *mut c_void;
     // SAFETY: the swap-chain context is live and the panel owns this image.
@@ -811,7 +879,7 @@ fn register_ui(api: &Api, state: &mut State, ui: Option<&ID3D12Resource>) -> boo
         REPORTED.call_once(|| {
             tracing::warn!(
                 result,
-                "frame generation: AMD could not register the performance panel"
+                "frame generation: AMD could not register the UI plane"
             )
         });
         return false;
@@ -820,7 +888,7 @@ fn register_ui(api: &Api, state: &mut State, ui: Option<&ID3D12Resource>) -> boo
         static FIRST: std::sync::Once = std::sync::Once::new();
         FIRST.call_once(|| {
             tracing::info!(
-                "frame generation: performance panel registered for separate composition"
+                "frame generation: UI plane registered for separate composition"
             )
         });
     }
@@ -828,43 +896,58 @@ fn register_ui(api: &Api, state: &mut State, ui: Option<&ID3D12Resource>) -> boo
     true
 }
 
+pub(crate) fn set_ui(ui: Option<&ID3D12Resource>) -> bool {
+    let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    api().is_some_and(|api| register_ui(api, &mut state, ui))
+}
+
 pub(crate) fn present(
     swap_chain: &IDXGISwapChain3,
     frame: u64,
     token: Option<u64>,
-    ui: Option<&ID3D12Resource>,
+    allow_generation: bool,
 ) -> HRESULT {
-    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
-    let enabled = match state.prepared.take() {
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let (enabled, disable) = match state.prepared.take() {
         Some(prepared) if prepared.matches_present(frame, token) => {
             #[cfg(feature = "diagnostics")]
             if !prepared.enabled {
                 state.cadence.present_reset += 1;
             }
-            prepared.enabled
+            (prepared.enabled && allow_generation, prepared.enabled && !allow_generation)
         }
         _unmatched => {
             #[cfg(feature = "diagnostics")]
             match _unmatched {
                 Some(prepared) if prepared.frame != frame => state.cadence.present_wrong_frame += 1,
-                Some(prepared) if prepared.token == token && !prepared.submitted => {
+                Some(prepared) if prepared.token == token && !prepared.submitted() => {
                     state.cadence.present_before_submission += 1;
                 }
                 Some(_) => state.cadence.present_wrong_token += 1,
                 None => state.cadence.present_no_prepare += 1,
             }
-            if let Some(api) = api() {
-                configure(api, &state, frame, false);
-            }
-            false
+            (false, true)
         }
     };
-    if let Some(api) = api() {
-        register_ui(api, &mut state, ui);
+    if disable && state.context.is_some()
+        && let Some(api) = api()
+    {
+        configure(api, &state, frame, false);
     }
+    if let Some(context) = &state.context {
+        context.can_generate.store(enabled, Ordering::Release);
+    }
+    // The SDK guard serializes the callback with other context calls. The
+    // state lock does not have to be held while the proxy paces presentation.
+    drop(state);
     // SAFETY: the caller holds the presenter and has submitted the back buffer.
     let status = unsafe { swap_chain.Present(0, DXGI_PRESENT(0)) };
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(context) = &state.context {
+        context.can_generate.store(false, Ordering::Release);
+    }
     state.last_present = Some(frame);
     if status == S_OK {
         // SAFETY: a live swap chain, serialized with the provider and resize.
@@ -956,30 +1039,19 @@ pub(crate) fn resize(
     height: u32,
     format: i32,
     resize_buffers: impl FnOnce() -> windows::core::Result<()>,
-) -> Option<windows::core::Result<()>> {
-    let api = api()?;
+) -> windows::core::Result<()> {
+    let _retired;
+    let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
-    if state.context.is_some() && !configure(api, &state, frame, false) {
-        return None;
-    }
-    let mut swap_context = state.swap_context as *mut c_void;
-    if !swap_context.is_null() {
-        // SAFETY: a live swap chain context. Wait before releasing the callback's owner.
-        let result = unsafe { (api.dispatch)(&mut swap_context, &mut header(WAIT_FOR_PRESENTS)) };
-        if result != OK {
-            tracing::warn!(
-                result,
-                "frame generation: AMD could not drain the swap chain for resize"
-            );
-            return None;
-        }
-    }
-    if !register_ui(api, &mut state, None) {
-        return None;
-    }
+    let drained = api().is_some_and(|api| {
+        let drained = disable_and_drain(api, &state, frame);
+        register_ui(api, &mut state, None);
+        drained
+    });
+    // The proxy also waits for presents during ResizeBuffers. Even if a
+    // preparatory call failed, try to restore the display and keep anything
+    // the proxy might still reference alive.
     let resized = resize_buffers();
-    drop(sdk);
     state.prepared = None;
     state.sample = None;
     #[cfg(feature = "diagnostics")]
@@ -987,36 +1059,87 @@ pub(crate) fn resize(
         FRAME_RATES.store(0, Ordering::Relaxed);
         state.cadence = Cadence::default();
     }
-    state.context = None;
+    if drained {
+        _retired = state.context.take();
+    }
     state.refused_layout = None;
     if resized.is_ok() {
         state.display = [width, height];
         state.format = surface_format(format).unwrap_or(0);
     }
-    Some(resized)
+    resized
+}
+
+/// Release the proxy and its registered resources while the device is live.
+pub fn shut_down() {
+    if !requested() || STOPPED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some(host) = crate::host::made_host() else { return };
+    crate::external::finish_submitted();
+    host.release_framegen_presenter();
+}
+
+pub(crate) fn release_swap_chain(release_presenter: impl FnOnce()) {
+    STOPPED.store(true, Ordering::Release);
+    let Some(api) = api() else { return };
+    let _retired;
+    let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut context = state.swap_context as *mut c_void;
+    if context.is_null() {
+        return;
+    }
+    let frame = state.last_present.unwrap_or(0);
+    disable_and_drain(api, &state, frame);
+    register_ui(api, &mut state, None);
+    release_presenter();
+    // SAFETY: no further Present can acquire the discarded presenter. Keep
+    // the callback and UI owners alive through destruction of the proxy.
+    let result = unsafe { (api.destroy)(&mut context, null()) };
+    if result == OK {
+        _retired = std::mem::take(&mut *state);
+    } else {
+        tracing::warn!(result, "frame generation: AMD could not destroy the swap chain");
+        state.swap_chain = 0;
+        state.prepared = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Prepared;
+    use super::*;
 
     #[test]
-    fn generation_uses_only_the_submitted_list_for_the_presented_frame() {
-        let mut input = Prepared {
-            frame: 30,
-            title_list: 1,
-            host_list: 2,
-            token: None,
-            submitted: false,
-            enabled: true,
-        };
-        assert!(!input.matches_present(30, None));
-        input.token = Some(450);
-        assert!(!input.matches_present(30, Some(450)));
-        input.submitted = true;
-        assert!(input.matches_present(30, Some(450)));
-        assert!(!input.matches_present(31, Some(450)));
-        assert!(!input.matches_present(30, Some(451)));
-        assert!(!input.matches_present(30, None));
+    fn only_a_submitted_preparation_for_this_frame_can_generate() {
+        let submission = Arc::new(AtomicU8::new(RECORDED));
+        let recorded = Recording(submission.clone());
+        let frame = PreparedFrame { frame: 7, title_list: 1, token: Some(10), enabled: true, submission };
+        assert!(!frame.matches_present(7, Some(10)));
+        recorded.submitted();
+        drop(recorded);
+        assert!(frame.matches_present(7, Some(10)));
+        assert!(!frame.matches_present(8, Some(10)));
+        assert!(!frame.matches_present(7, Some(11)));
+        assert!(!frame.matches_present(7, None));
+    }
+
+    #[test]
+    fn discarding_a_recording_frees_its_prepared_frame() {
+        let submission = Arc::new(AtomicU8::new(RECORDED));
+        drop(Recording(submission.clone()));
+        assert_eq!(submission.load(Ordering::Acquire), DISCARDED);
+    }
+
+    #[test]
+    fn disabled_configuration_unregisters_the_callback_and_its_context() {
+        let state = State { display: [1920, 1080], ..State::default() };
+        let context = std::ptr::dangling_mut::<c_void>();
+        let enabled = configuration(&state, context, 7, true);
+        assert!(enabled.generate_callback.is_some());
+        assert_eq!(enabled.generate_context, context);
+        let disabled = configuration(&state, context, 7, false);
+        assert!(disabled.generate_callback.is_none());
+        assert!(disabled.generate_context.is_null());
     }
 }

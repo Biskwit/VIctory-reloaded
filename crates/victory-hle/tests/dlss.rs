@@ -175,6 +175,9 @@ fn dlss_runs_the_titles_upscaler() {
     if let Err(error) = victory_hle::modules::fidelityfx::use_dlss(dir.as_deref(), logs.path(), 2) {
         panic!("DLSS did not start: {error}");
     }
+    let fallback = std::env::var_os("VICTORY_FIDELITYFX_DIR").map(|dir| {
+        victory_hle::modules::fidelityfx::use_host_dir(std::path::Path::new(&dir)).unwrap()
+    });
     let host = victory_gpu::external::host_device().unwrap();
 
     // The title's import binding.
@@ -631,6 +634,24 @@ fn dlss_runs_the_titles_upscaler() {
                 "pixel {i} channel {c}: {got}, not {want}"
             );
         }
+    }
+    if let Some(version) = fallback {
+        // Refused dispatches hand off this context to its FSR standby.
+        upscaling.resources[6].resource = null();
+        let mut active = String::new();
+        for _ in 0..16 {
+            assert_eq!(dispatch(&mut context, &mut upscaling.header), 6);
+            assert_eq!(query(&mut context, &mut provider.header), 0);
+            // SAFETY: the provider owns the returned name.
+            active = unsafe { std::ffi::CStr::from_ptr(provider.name) }
+                .to_string_lossy()
+                .into_owned();
+            if active.trim_start_matches("FSR ").starts_with(version) {
+                break;
+            }
+        }
+        assert!(active.trim_start_matches("FSR ").starts_with(version), "{active}");
+        eprintln!("standby provider after DLSS refused dispatches: {active}");
     }
     assert_eq!(destroy(&mut context, null()), 0);
 }

@@ -157,6 +157,13 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     } else {
         module
     };
+    #[cfg(windows)]
+    if crate::modules::fidelityfx::native_framegen::observes(module as usize)
+        && name as usize >= 0x1_0000
+        && let Some(address) = crate::modules::fidelityfx::native_framegen::replacement(&narrow(name))
+    {
+        return address as *mut c_void;
+    }
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
