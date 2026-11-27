@@ -6418,6 +6418,75 @@ mod tests {
         }
     }
 
+    fn assert_texture_changes_covered(pending: &[(u64, u64)], changes: &[(u64, u64)]) {
+        let mut coverage = pending.to_vec();
+        coverage.sort_unstable();
+        let mut furthest = 0;
+        for (_, end) in &mut coverage {
+            furthest = furthest.max(*end);
+            *end = furthest;
+        }
+        for &(start, end) in changes {
+            let at = coverage.partition_point(|&(lo, _)| lo <= start);
+            assert!(
+                at > 0 && coverage[at - 1].1 >= end,
+                "texture change [{start}, {end}) was lost"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_texture_changes_survive_repeated_compactions() {
+        let mut pending = Vec::new();
+        let mut changes = Vec::new();
+        let mut compactions = 0;
+        for batch in 0..4 {
+            for i in 0..MAX_PENDING_TEXTURE_CHANGES {
+                // An odd multiplier permutes each power-of-two-sized batch.
+                let offset = (i * 13_573) & (MAX_PENDING_TEXTURE_CHANGES - 1);
+                let start = ((batch * MAX_PENDING_TEXTURE_CHANGES + offset) as u64) * 8 + 4;
+                changes.push((start, start + 2));
+                compactions +=
+                    usize::from(remember_texture_change(&mut pending, start, start + 2) != 0);
+                assert!(pending.len() <= MAX_PENDING_TEXTURE_CHANGES);
+            }
+            assert_texture_changes_covered(&pending, &changes);
+        }
+        assert!(
+            compactions > 1,
+            "the test must cross more than one queue compaction"
+        );
+    }
+
+    #[test]
+    fn pending_texture_changes_keep_high_addresses() {
+        let mut pending = Vec::new();
+        let mut changes = vec![(0, 2), (u64::MAX - 1, u64::MAX)];
+        for i in 0..MAX_PENDING_TEXTURE_CHANGES + 31 {
+            let start = u64::MAX - (i as u64) * 8 - 4;
+            changes.push((start, start + 2));
+        }
+        for &(start, end) in &changes {
+            remember_texture_change(&mut pending, start, end);
+            assert!(pending.len() <= MAX_PENDING_TEXTURE_CHANGES);
+        }
+        assert_texture_changes_covered(&pending, &changes);
+    }
+
+    #[test]
+    fn pending_texture_changes_keep_overlapping_writes() {
+        let mut pending = Vec::new();
+        let mut changes = Vec::new();
+        for i in 0..MAX_PENDING_TEXTURE_CHANGES + 31 {
+            let start = (i as u64 % 4096) * 4;
+            let end = start + if i % 3 == 0 { 100_000 } else { 1 };
+            changes.push((start, end));
+            remember_texture_change(&mut pending, start, end);
+            assert!(pending.len() <= MAX_PENDING_TEXTURE_CHANGES);
+        }
+        assert_texture_changes_covered(&pending, &changes);
+    }
+
     /// Memory the runtime maps under a slot's texture makes the slot due
     /// again from the next frame; a stale slot leaves the queue.
     #[test]
