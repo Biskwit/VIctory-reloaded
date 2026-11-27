@@ -2704,6 +2704,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// What a host library's commands in the list use (a DLSS feature):
+    /// [`HostList::keep_shared`].
+    shared: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -7117,6 +7120,20 @@ impl HostList {
             || !self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// The backing's identity and the last state this list recorded for it.
+    pub(crate) fn texture_binding(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) -> (usize, Option<u32>) {
+        let state = self
+            .states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(std::sync::Arc::as_ptr(copy) as usize))
+            .map(|(_, last, _)| *last);
+        (copy.texture.as_raw() as usize, state)
+    }
+
     /// Moves a title texture's host copy to `wanted` (a host state) in this
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
@@ -7529,6 +7546,7 @@ impl HostList {
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
+                && deferred.shared.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty()
@@ -7985,6 +8003,12 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    /// Holds a reference to `object` until the list is reset, which is
+    /// after its last submission has run.
+    pub(crate) fn keep_shared(&self, object: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        self.deferred().shared.push(object);
     }
 
     #[cfg(test)]
@@ -9721,6 +9745,7 @@ const BUFFERS: u32 = 2;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
+    framegen: bool,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -10191,7 +10216,7 @@ impl Host {
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
+            *presenter = match self.presenter(width, height, format, frame) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::warn!(error = %e, "no swap chain");
@@ -10214,10 +10239,17 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
-            // SAFETY: no back buffer is held; every submission was waited for.
-            let resized = unsafe {
-                p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+            let resize_buffers = || {
+                // SAFETY: no back buffer is held; every submission was waited for.
+                unsafe {
+                    p.swap_chain
+                        .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                }
+            };
+            let resized = if p.framegen {
+                crate::framegen::resize(frame, width, height, format.0, resize_buffers)?
+            } else {
+                resize_buffers()
             };
             match resized {
                 Ok(()) => {
@@ -10387,7 +10419,7 @@ impl Host {
                 crate::popwatch::take(&self.device, list, texture)
             };
             #[cfg(feature = "diagnostics")]
-            let panel_copy = p.panel.draw(self, copy, &back, (width, height), format);
+            let panel_copy = p.panel.draw(self, copy, &back, (width, height), format, p.framegen);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -10418,7 +10450,7 @@ impl Host {
                 None => (0, self.execute(&[copy])),
             };
             #[cfg(feature = "diagnostics")]
-            p.panel.submitted(panel_copy, fence);
+            p.panel.submitted(panel_copy.as_ref(), fence);
             #[cfg(feature = "diagnostics")]
             if let Some(taken) = watched {
                 crate::popwatch::sent(taken, flown, frame);
@@ -10432,7 +10464,15 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let status = if p.framegen {
+                #[cfg(feature = "diagnostics")]
+                let ui = panel_copy.as_ref().and_then(|panel| panel.ui.as_ref());
+                #[cfg(not(feature = "diagnostics"))]
+                let ui = None;
+                crate::framegen::present(&p.swap_chain, frame, ui)
+            } else {
+                p.swap_chain.Present(0, DXGI_PRESENT(0))
+            };
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
@@ -10453,6 +10493,7 @@ impl Host {
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
+        frame: u64,
     ) -> windows::core::Result<Presenter> {
         let title = title_window();
         let hwnd = match title {
@@ -10476,9 +10517,16 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let generated = crate::framegen::requested()
+                .then(|| crate::framegen::swap_chain(hwnd, &desc, &factory, &self.queue, &self.device, frame))
+                .flatten();
+            let framegen = generated.is_some();
+            let swap_chain = match generated {
+                Some(swap_chain) => swap_chain,
+                None => factory
+                    .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                    .cast::<IDXGISwapChain3>()?,
+            };
             // Alt+Enter is the title window's own switch to and from full
             // screen (frameless, the swap chain stretched); DXGI's would make
             // it exclusive full screen, whose buffers nothing resizes.
@@ -10491,6 +10539,7 @@ impl Host {
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
+                framegen,
                 width,
                 height,
                 format,

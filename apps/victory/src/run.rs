@@ -4,6 +4,10 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+#[cfg(windows)]
+#[path = "fsr_4k.rs"]
+mod fsr_4k;
+
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
 
@@ -35,6 +39,51 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// Selects the host upscaler for a 4K profile: NVIDIA DLSS when `dlss`
+/// (falling back to FSR, then to the stock profile, with the reason
+/// logged), else AMD FSR 4.1.2. Whether one serves the title.
+#[cfg(windows)]
+fn host_upscaler(cfg: &victory_core::Config, preset: fsr_4k::FsrPreset, dlss: bool) -> Result<bool> {
+    use victory_hle::modules::fidelityfx;
+    if dlss {
+        let logs = cfg.cache_subdir("ngx")?;
+        match fidelityfx::use_dlss(cfg.dlss_dir.as_deref(), &logs, preset.dlss_quality()) {
+            Ok(()) => {
+                // FSR stands by for a context whose DLSS feature fails.
+                if let Some(dir) = cfg.fidelityfx_dir.as_deref() {
+                    match fidelityfx::use_host_dir(dir) {
+                        Ok(()) => tracing::info!("DLSS 4K: AMD FSR 4.1.2 stands by"),
+                        Err(error) => tracing::warn!(%error, "DLSS 4K: no FSR to fall back on"),
+                    }
+                }
+                return Ok(true);
+            }
+            Err(error) => tracing::warn!(%error, "DLSS 4K: NVIDIA DLSS did not start"),
+        }
+        let Some(dir) = cfg.fidelityfx_dir.as_deref() else {
+            tracing::warn!("DLSS 4K: no FSR folder either; the title's own upscaling runs");
+            return Ok(false);
+        };
+        return match fidelityfx::use_host_dir(dir) {
+            Ok(()) => {
+                tracing::warn!("DLSS 4K: AMD FSR 4.1.2 upscales instead");
+                Ok(true)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "DLSS 4K: FSR did not load either; the title's own upscaling runs");
+                Ok(false)
+            }
+        };
+    }
+    let dir = cfg.fidelityfx_dir.as_deref().context(
+        "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
+    )?;
+    fidelityfx::use_host_dir(dir)
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("loading FSR 4.1.2 from {}", dir.display()))?;
+    Ok(true)
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -53,8 +102,28 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    let fsr = fsr_4k::FsrPreset::requested("VICTORY_FSR_4K")?;
+    let dlss = fsr_4k::FsrPreset::requested("VICTORY_DLSS_4K")?;
+    let series_s_dlss = fsr_4k::FsrPreset::requested("VICTORY_DLSS")?;
+    let series_s_fsr = fsr_4k::FsrPreset::requested("VICTORY_FSR")?;
+    let framegen = victory_hle::modules::fidelityfx::framegen_requested();
+    anyhow::ensure!(
+        !framegen || matches!(console, Console::SeriesS),
+        "VICTORY_FRAMEGEN requires Series S"
+    );
+    if series_s_fsr.is_some() {
+        anyhow::ensure!(
+            matches!(console, Console::SeriesS) && fsr.is_none() && dlss.is_none() && series_s_dlss.is_none(),
+            "VICTORY_FSR requires Series S with no other host upscaler"
+        );
+        anyhow::ensure!(
+            std::env::var_os("VICTORY_FFX_SCALE").is_none() && std::env::var_os("VICTORY_UPSCALER").is_none(),
+            "VICTORY_FSR sets the FidelityFX scale and upscaler. Clear VICTORY_FFX_SCALE and VICTORY_UPSCALER."
+        );
+    }
+    let native_framegen = framegen && series_s_dlss.is_none() && series_s_fsr.is_none() && execute;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
@@ -63,7 +132,58 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let image = victory_loader::load(&prepared, &images)?;
+    // A 4K profile renders smaller and has a host upscaler (DLSS first
+    // when asked, else FSR) fill the 3840x2160 output; without a host
+    // upscaler the stock profile runs.
+    let mut profile = None;
+    if let Some(preset) = series_s_dlss {
+        anyhow::ensure!(
+            matches!(console, Console::SeriesS) && fsr.is_none() && dlss.is_none(),
+            "VICTORY_DLSS requires Series S mode without a 4K profile"
+        );
+        // Replace the upscaler with the original Series S render and output sizes.
+        let logs = cfg.cache_subdir("ngx")?;
+        victory_hle::modules::fidelityfx::use_dlss(cfg.dlss_dir.as_deref(), &logs, preset.dlss_quality())
+            .map_err(anyhow::Error::msg)
+            .context("initializing DLSS for Series S")?;
+        tracing::info!(preset = preset.name(), "Series S: DLSS selected at the title's resolution");
+    }
+    if let Some(preset) = dlss.or(fsr) {
+        anyhow::ensure!(matches!(console, Console::SeriesX), "4K upscaling requires Series X mode");
+        // Select the provider before the first lookup builds the import registry.
+        if host_upscaler(&cfg, preset, dlss.is_some())? {
+            profile = Some(preset);
+        }
+    }
+    let image = if let Some(preset) = profile {
+        fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
+        // SAFETY: Windows supports setting the environment across threads.
+        // No title code has run or queried DXGI yet.
+        unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160") };
+        let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
+        victory_loader::load(&prepared, &cache)?
+    } else {
+        victory_loader::load(&prepared, &images)?
+    };
+    if let Some(preset) = series_s_fsr {
+        let dir = cfg.fidelityfx_dir.as_deref().context(
+            "VICTORY_FSR requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
+        )?;
+        if execute {
+            use victory_loader::frame_rate::Patched;
+            use victory_loader::resolution::{FFX_SCALE, PICKER, ffx_scale_code, picker_code, write};
+            let size = image.info().size_of_image as usize;
+            for (site, code) in [(&FFX_SCALE, ffx_scale_code(preset.render_scale())), (&PICKER, picker_code(7))] {
+                // SAFETY: the image stays mapped and the title has not run.
+                let patched = unsafe { write(image.base(), size, site, &code) };
+                anyhow::ensure!(patched == Patched::Done, "Series S FSR: could not patch {} ({patched:?})", site.what);
+            }
+        }
+        victory_hle::modules::fidelityfx::use_host_fsr3(dir, u32::from(preset.mode()))
+            .map_err(anyhow::Error::msg)
+            .context("initializing FSR for Series S")?;
+        tracing::info!(preset = preset.name(), "Series S: AMD FSR 3.1.6 selected");
+    }
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
@@ -107,6 +227,25 @@ pub fn run(
     });
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
+    if native_framegen {
+        let (_, loader) = dlls
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(NATIVE_FIDELITYFX))
+            .context("frame generation requires the title's FidelityFX loader")?;
+        let export = |name| {
+            loader.export(name).with_context(|| format!("title's FidelityFX loader has no {name}"))
+        };
+        // SAFETY: these are the exports of the mapped title DLL, which lives for the run.
+        unsafe {
+            victory_hle::modules::fidelityfx::native_framegen::install(
+                export("ffxCreateContext")?,
+                export("ffxDestroyContext")?,
+                export("ffxDispatch")?,
+            )
+        }
+        .map_err(anyhow::Error::msg)?;
+        tracing::info!("frame generation: observing the title's native FidelityFX upscaler");
+    }
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
@@ -162,7 +301,10 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    let observer = NativeFramegenImports(&with_dlls);
+    let title_imports: &dyn victory_loader::ImportResolver =
+        if native_framegen { &observer } else { &with_dlls };
+    show(&exe_name, image.bind_imports(title_imports, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
@@ -225,7 +367,7 @@ pub fn run(
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
     // VICTORY_UPSCALER; each off without it).
     #[cfg(windows)]
-    if execute {
+    if execute && profile.is_none() {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
@@ -387,6 +529,30 @@ fn poke(base: usize, size: usize) {
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.
+#[cfg(windows)]
+const NATIVE_FIDELITYFX: &str = "amd_fidelityfx_loader_xbox.dll";
+
+#[cfg(windows)]
+struct NativeFramegenImports<'a>(&'a dyn victory_loader::ImportResolver);
+
+#[cfg(windows)]
+impl victory_loader::ImportResolver for NativeFramegenImports<'_> {
+    fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        use victory_loader::{Provenance, Resolution};
+
+        let resolved = self.0.resolve(dll, symbol);
+        if dll.eq_ignore_ascii_case(NATIVE_FIDELITYFX)
+            && matches!(resolved, Resolution::Found { provenance: Provenance::Title, .. })
+            && let victory_pe::ImportSymbol::Name { name, .. } = symbol
+            && let Some(address) =
+                victory_hle::modules::fidelityfx::native_framegen::replacement(name)
+        {
+            return Resolution::Found { address, provenance: Provenance::Hle };
+        }
+        resolved
+    }
+}
+
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
