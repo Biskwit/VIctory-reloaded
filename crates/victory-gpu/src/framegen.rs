@@ -325,12 +325,28 @@ unsafe impl Send for Context {}
 // SAFETY: as above. Recorded lists keep their own Arc through GPU completion.
 unsafe impl Sync for Context {}
 
+impl Context {
+    /// Requires the SDK guard and no live recordings or swap-chain callbacks.
+    fn destroy(&mut self, api: &Api) -> bool {
+        let handle = self.handle.get_mut();
+        // SAFETY: this is the sole owner and the caller has drained its work.
+        let result = unsafe { (api.destroy)(handle, null()) };
+        if result != OK {
+            tracing::warn!(result, "frame generation: AMD could not destroy the generation context");
+            return false;
+        }
+        *handle = null_mut();
+        true
+    }
+}
+
 impl Drop for Context {
     fn drop(&mut self) {
-        if let Some(api) = api() {
+        if !self.handle.get_mut().is_null()
+            && let Some(api) = api()
+        {
             let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
-            // SAFETY: destruction is after all recorded work and presenter references let go.
-            unsafe { (api.destroy)(self.handle.get(), null()) };
+            self.destroy(api);
         }
     }
 }
@@ -448,6 +464,9 @@ pub(crate) fn swap_chain(
     let api = api()?;
     let format = surface_format(desc.Format.0)?;
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+    if !requested() {
+        return None;
+    }
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(provider) = analytical_provider(api, device) else {
         tracing::warn!("frame generation: AMD analytical provider 3.1.6 is unavailable");
@@ -611,6 +630,11 @@ pub(crate) fn prepare(
     // Drop retired contexts after the SDK guard, since Context::drop takes it.
     let _retired;
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+    // An upscaler call could have been waiting on this guard when a
+    // presenter started retiring its proxy.
+    if !requested() {
+        return None;
+    }
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "diagnostics")]
     {
@@ -1072,7 +1096,9 @@ pub(crate) fn resize(
 
 /// Release the proxy and its registered resources while the device is live.
 pub fn shut_down() {
-    if !requested() || STOPPED.swap(true, Ordering::AcqRel) {
+    STOPPED.store(true, Ordering::Release);
+    // An earlier retirement may have left a live proxy to retry.
+    if STATE.lock().unwrap_or_else(|e| e.into_inner()).swap_context == 0 {
         return;
     }
     let Some(host) = crate::host::made_host() else { return };
@@ -1080,35 +1106,122 @@ pub fn shut_down() {
     host.release_framegen_presenter();
 }
 
-pub(crate) fn release_swap_chain(release_presenter: impl FnOnce()) {
+pub(crate) fn release_swap_chain(release_presenter: impl FnOnce()) -> bool {
     STOPPED.store(true, Ordering::Release);
-    let Some(api) = api() else { return };
-    let _retired;
+    let Some(api) = api() else { return false };
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    retire_swap_chain(api, &mut state, release_presenter)
+}
+
+fn retire_swap_chain(api: &Api, state: &mut State, release_presenter: impl FnOnce()) -> bool {
     let mut context = state.swap_context as *mut c_void;
     if context.is_null() {
-        return;
+        return false;
     }
     let frame = state.last_present.unwrap_or(0);
-    disable_and_drain(api, &state, frame);
-    register_ui(api, &mut state, None);
-    release_presenter();
-    // SAFETY: no further Present can acquire the discarded presenter. Keep
-    // the callback and UI owners alive through destruction of the proxy.
-    let result = unsafe { (api.destroy)(&mut context, null()) };
-    if result == OK {
-        _retired = std::mem::take(&mut *state);
-    } else {
-        tracing::warn!(result, "frame generation: AMD could not destroy the swap chain");
-        state.swap_chain = 0;
-        state.prepared = None;
+    state.prepared = None;
+    if !disable_and_drain(api, state, frame) {
+        return false;
     }
+    register_ui(api, state, None);
+    if let Some(active) = state.context.as_mut() {
+        // A recorded list can still own the provider's GPU resources even
+        // after its callback was detached. Keep the presenter for a retry.
+        let Some(active) = Arc::get_mut(active) else { return false };
+        if !active.destroy(api) {
+            return false;
+        }
+        state.context = None;
+    }
+    // SAFETY: the caller holds the presenter lock. AMD's DX12 shutdown
+    // destroys its contexts before releasing the final swap-chain reference.
+    let result = unsafe { (api.destroy)(&mut context, null()) };
+    if result != OK {
+        tracing::warn!(result, "frame generation: AMD could not destroy the swap chain");
+        return false;
+    }
+    release_presenter();
+    *state = State::default();
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct MockSwapChain {
+        calls: Vec<&'static str>,
+        wait_result: u32,
+        destroy_result: u32,
+    }
+
+    fn mock_api() -> Api {
+        unsafe extern "C" fn create(_: *mut *mut c_void, _: *mut Header, _: *const c_void) -> u32 {
+            ERROR
+        }
+        unsafe extern "C" fn call(_: *mut *mut c_void, _: *mut Header) -> u32 {
+            ERROR
+        }
+        unsafe extern "C" fn wait(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+            // SAFETY: the test supplies these live stack objects for the call.
+            let (mock, desc) = unsafe { (&mut *(*context).cast::<MockSwapChain>(), &*desc) };
+            if desc.kind != WAIT_FOR_PRESENTS {
+                return ERROR;
+            }
+            mock.calls.push("drain");
+            mock.wait_result
+        }
+        unsafe extern "C" fn destroy(context: *mut *mut c_void, _: *const c_void) -> u32 {
+            // SAFETY: the test supplies a live MockSwapChain as context.
+            let mock = unsafe { &mut *(*context).cast::<MockSwapChain>() };
+            mock.calls.push("destroy");
+            mock.destroy_result
+        }
+        Api { create, destroy, configure: call, query: call, dispatch: wait }
+    }
+
+    #[test]
+    fn presenter_survives_a_refused_proxy_shutdown() {
+        let api = mock_api();
+        let mut mock = MockSwapChain { destroy_result: ERROR, ..Default::default() };
+        let mock_ptr = &raw mut mock;
+        let mut state = State {
+            swap_context: mock_ptr as usize,
+            swap_chain: 1,
+            ..State::default()
+        };
+        let released = std::cell::Cell::new(false);
+        assert!(!retire_swap_chain(&api, &mut state, || released.set(true)));
+        assert!(!released.get());
+        assert_eq!(state.swap_chain, 1);
+        assert_eq!(mock.calls.as_slice(), ["drain", "destroy"]);
+
+        mock.destroy_result = OK;
+        assert!(retire_swap_chain(&api, &mut state, || {
+            released.set(true);
+            // SAFETY: the final SDK call completed before the release callback.
+            let calls = unsafe { &(*mock_ptr).calls };
+            assert_eq!(calls.as_slice(), ["drain", "destroy", "drain", "destroy"]);
+        }));
+        assert!(released.get());
+        assert_eq!(state.swap_context, 0);
+    }
+
+    #[test]
+    fn a_failed_drain_leaves_the_proxy_and_presenter_alive() {
+        let api = mock_api();
+        let mut mock = MockSwapChain { wait_result: ERROR, ..Default::default() };
+        let mut state = State {
+            swap_context: (&raw mut mock) as usize,
+            swap_chain: 1,
+            ..State::default()
+        };
+        assert!(!retire_swap_chain(&api, &mut state, || panic!("the SDK has live presents")));
+        assert_eq!(mock.calls.as_slice(), ["drain"]);
+        assert_eq!(state.swap_chain, 1);
+    }
 
     #[test]
     fn only_a_submitted_preparation_for_this_frame_can_generate() {

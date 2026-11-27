@@ -10476,7 +10476,9 @@ impl Host {
                     if p.framegen {
                         // The optional proxy should not prevent DXGI from
                         // presenting after a failed resize.
-                        crate::framegen::release_swap_chain(|| drop(presenter.take()));
+                        if !crate::framegen::release_swap_chain(|| drop(presenter.take())) {
+                            return None;
+                        }
                         drop(presenter);
                         return self.present_planes(texture, state_u32, overlay, frame, token);
                     }
@@ -10719,7 +10721,9 @@ impl Host {
                     // before retiring the presenter, then render both planes.
                     drop(back);
                     settle_now(WHY_SYNC);
-                    crate::framegen::release_swap_chain(|| drop(presenter.take()));
+                    if !crate::framegen::release_swap_chain(|| drop(presenter.take())) {
+                        return None;
+                    }
                     drop(presenter);
                     return self.present_planes(texture, state_u32, overlay, frame, token);
                 }
