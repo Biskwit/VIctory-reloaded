@@ -480,7 +480,7 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(windows)]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+pub(super) fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -500,12 +500,19 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 }
 
 #[cfg(windows)]
-pub(super) fn skipped_in(shaders: &[std::sync::Arc<Shader>]) -> Option<&str> {
+pub(super) fn skip_hashes() -> &'static [String] {
     static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
+    HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
-    });
+    })
+}
+
+#[cfg(windows)]
+pub(super) fn skipped_in_list<'a>(
+    shaders: &'a [std::sync::Arc<Shader>],
+    hashes: &[String],
+) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;
     }
@@ -517,7 +524,7 @@ pub(super) fn skipped_in(shaders: &[std::sync::Arc<Shader>]) -> Option<&str> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    skipped_in(&p.shaders)
+    skipped_in_list(&p.shaders, skip_hashes())
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
