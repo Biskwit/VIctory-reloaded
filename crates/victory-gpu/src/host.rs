@@ -4168,18 +4168,22 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 /// for the first time, is read as it was before that flight.
 fn fill_is_titles(src: usize, len: usize) -> bool {
     const SMALL: usize = 64 << 10;
-    static MODE: OnceLock<u32> = OnceLock::new();
-    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_TITLE").ok().as_deref() {
-        Some("1") => 1,
-        Some("2") => 2,
-        _ => 0,
-    });
+    let mode = fill_title_mode();
     #[cfg(feature = "diagnostics")]
     let mode = crate::ab::pick("VICTORY_FILL_TITLE").map_or(mode, |on| if on { 2 } else { 0 });
     if mode == 0 || len > SMALL {
         return false;
     }
     !crate::watch::landed_lately(src, len, 600) || mode == 1 && crate::watch::written_since_taken(src, len)
+}
+
+fn fill_title_mode() -> u32 {
+    static MODE: OnceLock<u32> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_TITLE").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
 }
 
 /// Diagnostics: the waits for flights, by what waited, why it was not done
@@ -5317,7 +5321,7 @@ mod late_tests {
         producer.defer_read_back(readback, title.as_mut_ptr(), [16, 2, 32]);
         producer.close();
 
-        let (submitted, sent) = host.submit(&[&producer], &[], true).ahead.unwrap();
+        let (submitted, sent) = host.submit(&[&producer], &[], true, None).ahead.unwrap();
         // SAFETY: the submission lock is held and the event and fence are
         // ours. The test keeps the producer, upload and destination alive.
         unsafe {
@@ -6818,7 +6822,7 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) -> u64 {
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
-        self.submit(runs, &[], false).fence
+        self.submit(runs, &[], false, None).fence
     }
 
     /// Runs a closed internal upload-only host list synchronously without
@@ -6826,7 +6830,7 @@ impl Host {
     /// when invoked from `VICTORY_THIN=1` worker threads. Settles in-flight
     /// GPU work and waits for the upload list's fence before returning.
     pub(crate) fn execute_sync_internal(&self, list: &HostList) {
-        let _ = self.submit(&[list], &[], false);
+        let _ = self.submit(&[list], &[], false, None);
     }
 
     /// A queue's submission with [`late`]: the host lists `lists`, taken
@@ -6847,31 +6851,44 @@ impl Host {
             return;
         }
         late_threads();
-        if let Some(cut) = {
+        let preplan = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             // (Before the lists' steps are looked at for a cut; `submit`
             // checks again, which costs a load for each list.)
             closed_for_execution(&runs);
-            card_steps::cut_for(&runs)
-        } {
-            match split(lists, order, cut) {
-                Ok([(lists, order), (more, behind)]) => {
-                    let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
-                    let second: Vec<usize> = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
-                    self.execute_parts(lists, order, &first);
-                    self.execute_parts(more, behind, &second);
+            match card_steps::cut_or_plan(&runs) {
+                card_steps::CutOrPlan::Cut(decision) => {
+                    let cut = decision.at;
+                    match split(lists, order, cut) {
+                        Ok([(lists, order), (more, behind)]) => {
+                            #[cfg(feature = "diagnostics")]
+                            decision.applied();
+                            let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
+                            let second: Vec<usize> = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
+                            self.execute_parts(lists, order, &first);
+                            self.execute_parts(more, behind, &second);
+                        }
+                        Err((lists, order)) => self.send_late(lists, order, parts, None),
+                    }
+                    return;
                 }
-                Err((lists, order)) => self.send_late(lists, order, parts),
+                card_steps::CutOrPlan::Plan(plan) => Some(plan),
+                card_steps::CutOrPlan::None => None,
             }
-            return;
-        }
-        self.send_late(lists, order, parts);
+        };
+        self.send_late(lists, order, parts, preplan);
     }
 
-    fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+    fn send_late(
+        &self,
+        lists: Vec<crate::list::Detached>,
+        order: Vec<usize>,
+        parts: &[usize],
+        preplan: Option<card_steps::Preplan>,
+    ) {
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            self.submit(&runs, parts, true).ahead
+            self.submit(&runs, parts, true, preplan).ahead
         };
         let Some((mut submitted, sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
@@ -6942,7 +6959,7 @@ impl Host {
     /// fence covering the list in either case.
     fn execute_own(&self, list: &HostList) -> (u64, u64) {
         late_threads();
-        let Submission { fence, ahead: flight } = self.submit(&[list], &[], true);
+        let Submission { fence, ahead: flight } = self.submit(&[list], &[], true, None);
         let Some((submitted, sent)) = flight else {
             return (0, fence);
         };
@@ -7190,9 +7207,14 @@ impl Host {
     /// `parts`: the lists of `runs` at which another part begins
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
-    fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Submission<'a> {
-        // Before anything looks at the lists' steps: a list is whole only
-        // when it is closed.
+    fn submit<'a>(
+        &'a self,
+        runs: &[&HostList],
+        parts: &[usize],
+        late: bool,
+        preplan: Option<card_steps::Preplan>,
+    ) -> Submission<'a> {
+        // A list is whole only when it is closed.
         closed_for_execution(runs);
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
@@ -7213,7 +7235,17 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
-        let own = if late { self.card_steps(runs) } else { None };
+        #[cfg(feature = "diagnostics")]
+        let mut redirect_wait = None;
+        let own = if late {
+            self.card_steps(
+                runs, preplan,
+                #[cfg(feature = "diagnostics")]
+                &mut redirect_wait,
+            )
+        } else {
+            None
+        };
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
@@ -7222,6 +7254,8 @@ impl Host {
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            #[cfg(feature = "diagnostics")]
+            let timer = redirect_wait.map(|wait| (wait, std::time::Instant::now()));
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -7230,6 +7264,10 @@ impl Host {
                 });
             } else {
                 self.settle(&mut submitted, why);
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some((wait, began)) = timer {
+                wait.finished(began.elapsed());
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -10374,11 +10412,20 @@ impl Batch {
 /// Copies mapped title memory, preserving overlap and the standing
 /// write-watch query for a successful, covered private write.
 fn copy_raw_title(dst: usize, src: usize, len: usize) {
+    copy_raw_title_using_mapping(dst, src, len, crate::watch::title_memory_reading_now);
+}
+
+fn copy_raw_title_using_mapping(
+    dst: usize,
+    src: usize,
+    len: usize,
+    read_mapping: impl FnOnce() -> Option<crate::watch::Reading>,
+) {
     if len == 0 || dst.checked_add(len).is_none() || src.checked_add(len).is_none() {
         return;
     }
     let reading = if len <= crate::watch::RAW_COPY_WATCH_LIMIT {
-        crate::watch::title_memory_reading_now()
+        read_mapping()
     } else {
         None
     };
@@ -12533,7 +12580,11 @@ mod refresh_tests {
         let _tracked = shadow.track_carded_test();
         crate::watch::ask_once(&[(dst, dst + PAGE)]);
         let before = crate::watch::asked(dst, dst + PAGE).unwrap().0;
-        super::copy_raw_title(dst, value.as_ptr() as usize, value.len());
+        // This case exercises a covered copy with a stable mapping.
+        // Other GPU fixtures can be remapping unrelated pages concurrently.
+        super::copy_raw_title_using_mapping(dst, value.as_ptr() as usize, value.len(), || {
+            Some(crate::watch::title_memory_reading())
+        });
         let after = crate::watch::asked(dst, dst + PAGE);
         crate::watch::ask_once_end();
         let (asking, notes) = after.expect("the copy preserves the query");
