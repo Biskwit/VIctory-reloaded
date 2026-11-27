@@ -70,6 +70,17 @@ if ($Machine -eq '7900xtx') {
         # into refused the whole submission to the card steps; in list order it is
         # taken (submit thread 104.7 -> 50.9 ms a frame, 12.1 -> 14.3 fps here).
         $settings.VICTORY_PLACED_ORDER = '1'
+        # Windows of title memory (what the title's own allocator hands its
+        # draws) lie in the card's memory, written by the CPU through the bus
+        # (Vice-Tay bd68f5e's switch): in the PC's memory every read a shader
+        # makes of them crosses it. Sized for this card's 24 GB: the cell's
+        # windows are about 5 GB, and the card's use went 7.6 -> 12.7 GB of
+        # 23.4; at most 6 GB go there, so that textures keep their room in
+        # bigger scenes (the windows past it stay in the PC's memory). A card
+        # with a budget under 20 GiB, or without resizable BAR, keeps them all
+        # in the PC's memory. Series S cell, i9-12900K: card busy 27.2-32.5 ->
+        # 21.4 ms a frame, the submitting thread as it was.
+        $settings.VICTORY_WINDOWS_BAR_MB = '6144'
     }
     # The console wave64 programs a 32-lane card takes only in the wave-wide
     # form; this list of them ran without a lost device on this card for 30

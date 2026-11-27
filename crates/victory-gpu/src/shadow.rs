@@ -488,7 +488,10 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// instead of 36; filling them costs the CPU what it did.
 ///
 /// Windows go there while a fifth of the card's budget is free, as with
-/// [`window_room_for`], which this comes before.
+/// [`window_room_for`], which this comes before, and only on a card whose
+/// budget is 20 GiB or more ([`WINDOWS_BAR_LEAST_BUDGET`]). Without such
+/// memory (no resizable BAR, a system or driver without the heap) or with
+/// a buffer refused, a window is made in the PC's memory as before.
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
@@ -499,6 +502,10 @@ fn window_mapped_most() -> u64 {
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// The least budget of the card's own memory with which windows go to card
+/// memory the CPU maps ([`window_mapped_for`]).
+const WINDOWS_BAR_LEAST_BUDGET: u64 = 20 << 30;
+
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
 fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -507,10 +514,24 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         return None;
     }
     let host = host()?;
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
-        return None;
+    if let Some([budget, used, ..]) = host.video_memory() {
+        // The windows of the Series S cell are some 5 GB: on an RTX 4090 the
+        // card's use goes from 7.6 to 12.7 GB of its 23.4 GB budget. On a
+        // card with less they would take the room the textures streamed in
+        // after them need, so there they stay in the PC's memory.
+        if budget < WINDOWS_BAR_LEAST_BUDGET {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::info!(
+                    budget_mb = budget >> 20,
+                    "windows stay in the PC's memory (VICTORY_WINDOWS_BAR_MB): the card's budget is under 20 GiB"
+                );
+            });
+            return None;
+        }
+        if used + size > budget / 10 * 8 {
+            return None;
+        }
     }
     if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
