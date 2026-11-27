@@ -89,7 +89,10 @@ nothing from the game goes in the tree.*
       fell from about 300 to 200 a frame, and all threads' waits for the
       guards' lock from 54-60 to 32-36 ms a frame, most of it the title's own
       threads'. The frame does not move yet: the submitting thread is the
-      wall. Diagnostics builds name where that lock is held longest.
+      wall. Diagnostics builds name where that lock is held longest;
+    - the write watch's journal keeps its pages in 4 MiB pieces instead of
+      one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
+      of 111; the submitting thread about 1 ms less a frame.
 - **Not brought over (yet)** from our earlier tree (fxceless's fork with about
   140 commits of ours): its FidelityFX SDK path for the Series S upscale
   (Vice-Tay translates FSR 4's own code) and its other rendering fixes, which
