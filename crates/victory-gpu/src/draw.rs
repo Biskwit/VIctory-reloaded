@@ -4245,6 +4245,10 @@ impl State {
                                 None => crate::port_cbv::copied(true),
                             }
                         }
+                        if let Some((buffer, gpu)) = list.snapshot_placed_constants(address, size) {
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;
