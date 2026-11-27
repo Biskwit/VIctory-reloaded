@@ -111,6 +111,11 @@ How each of these was found, with the numbers:
 - **Scripted keys** (`VICTORY_KEYS_FILE`): the file is taken by renaming it before
   it is read, so a batch written meanwhile is never deleted unread.
 
+- **Mono DSP comparison.** Add `-More @{VICTORY_DSP_MONO_PASSTHROUGH='1'}`
+  to pass mono DSP input to the output at unity gain. Use the same phone
+  call and audio settings when comparing dialogue with the option off and
+  on. [Dialogue report](https://github.com/TaynanGT/Vice-Tay/issues/259)
+
 ## Measuring
 
 - Every host list that ran is kept for reuse.
