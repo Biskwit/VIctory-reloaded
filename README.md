@@ -69,6 +69,8 @@ https://github.com/user-attachments/assets/bd07891c-c53f-4f46-9b7e-80463c379b84
 
 Use [`Play-VIctory.cmd`](Play-VIctory.cmd) to pass the same options from Command Prompt. Double-click it to enter the executable's path at a prompt. The launcher defaults to full screen, the Series X profile and an automatic GPU preset. **F11** or **Alt+Enter** toggles full screen during play.
 
+If the title reaches the menu but stops at world load, verify your title files before changing graphics settings. Compare the full file hashes against a trusted manifest for the exact release you own, using the algorithm listed in that manifest. An archive with missing or zero-filled data can still have the expected size. Re-copy any mismatched files from your verified source and check the hashes again before launching.
+
 | Option | Use it to |
 | --- | --- |
 | `-Console series-s` | Select the lighter console profile used in the sessions above. |
