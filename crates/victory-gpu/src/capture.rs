@@ -369,16 +369,24 @@ pub(crate) fn save_read_back(
         }
     };
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished (every submission is waited for); the
-    // mapping spans the footprint's rows.
+    // SAFETY: the copy finished (the capture forces a synchronous submission).
+    // The footprint is checked against the buffer before slicing its mapping.
     unsafe {
+        let Some(range) = rgba_readback_range(
+            footprint.Offset,
+            f.Width,
+            f.Height,
+            f.RowPitch,
+            buffer.GetDesc().Width,
+        ) else {
+            tracing::warn!(frame, "frame not saved: invalid readback footprint");
+            return;
+        };
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
         let pitch = f.RowPitch as usize;
-        // The footprint's final row does not need trailing padding.
-        let len = pitch * (f.Height as usize - 1) + f.Width as usize * 4;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>().add(range.start), range.len());
         let (name, step) = if scene {
             (format!("scene-{frame}"), 1)
         } else {
@@ -387,6 +395,28 @@ pub(crate) fn save_read_back(
         save_as(&name, f.Width, f.Height, pitch, bgra, rows, step);
         buffer.Unmap(0, None);
     }
+}
+
+fn rgba_readback_range(
+    offset: u64,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    buffer_size: u64,
+) -> Option<std::ops::Range<usize>> {
+    let row_bytes = u64::from(width) * 4;
+    if row_bytes == 0 || row_bytes > u64::from(pitch) {
+        return None;
+    }
+    // GetCopyableFootprints does not require padding after the final row.
+    let rows_before_last = u64::from(height.checked_sub(1)?);
+    let end = offset
+        .checked_add(rows_before_last * u64::from(pitch))?
+        .checked_add(row_bytes)?;
+    if end > buffer_size || end > isize::MAX as u64 {
+        return None;
+    }
+    Some(offset as usize..end as usize)
 }
 
 /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
@@ -910,6 +940,17 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rgba_capture_respects_the_placement_and_unpadded_last_row() {
+        let range = super::rgba_readback_range;
+        assert_eq!(range(512, 3, 2, 256, 780), Some(512..780));
+        assert_eq!(range(512, 3, 2, 256, 779), None);
+        assert_eq!(range(0, 1, 1, 256, 4), Some(0..4));
+        assert_eq!(range(0, 3, 0, 256, 780), None);
+        assert_eq!(range(0, 3, 2, 8, 780), None);
+        assert_eq!(range(u64::MAX, 1, 1, 256, u64::MAX), None);
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

@@ -11141,7 +11141,11 @@ impl Host {
             let capture = (save_frame && scene_available)
                 .then(|| {
                     if capture_scene {
-                        tracing::info!(frame, "capturing the scene before frame generation");
+                        tracing::info!(
+                            frame,
+                            title_ui_separate = game_ui.is_some(),
+                            "capturing the scene before frame generation"
+                        );
                     }
                     if composed {
                         list.ResourceBarrier(&[transition(

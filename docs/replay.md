@@ -24,11 +24,13 @@ the GPU can still produce incorrect geometry, depth or materials.
 With frame generation enabled, set `VICTORY_CAPTURE_SCENE_BEFORE_FRAMEGEN=1`
 and the capture folder above. List specific frames or create an empty
 `scene-next` file in that folder while the title is running. The next
-eligible present consumes the file. Each `scene-<frame>.png` shows the
-scene at full output resolution before interpolation and HUD composition.
-The swap chain still composes the HUD and presents with frame generation
-when its input is ready. Match the frame number and timestamp in the log to
-the recorded output. Exclude the synchronous readback from timing samples.
+eligible present consumes the file. This mode saves requested frames only.
+Each `scene-<frame>.png` shows the scene at full output resolution before
+interpolation. The diagnostics panel and any separately submitted title UI
+are composed afterwards. A HUD already drawn into the scene stays in the
+image. The swap chain still presents with frame generation when its input is
+ready. Match the frame number and timestamp in the log to the recorded
+output. Exclude the synchronous readback from timing samples.
 
 Use an empty `scene-trace` file to save the scene with
 `frame-<frame>-ops.txt`. The title drains recording work at the beginning
