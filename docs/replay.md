@@ -30,6 +30,12 @@ The swap chain still composes the HUD and presents with frame generation
 when its input is ready. Match the frame number and timestamp in the log to
 the recorded output. Exclude the synchronous readback from timing samples.
 
+Use an empty `scene-trace` file to save the scene with
+`frame-<frame>-ops.txt`. The title drains recording work at the beginning
+and end of the selected frame. With `VICTORY_DUMP_TARGETS=1`, the same
+request also saves the textures written during that frame. Match their
+resource IDs to the draws and dispatches in the operation list.
+
 ## Recording
 
 Off unless `VICTORY_RECORD` is set. Build with

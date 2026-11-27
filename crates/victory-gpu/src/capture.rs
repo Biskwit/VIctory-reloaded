@@ -4,6 +4,7 @@
 //! size. Only in builds with diagnostics.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -19,6 +20,9 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
+    if TRACE_FRAME.load(Ordering::Acquire) == n {
+        return true;
+    }
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let named = LIST
         .get_or_init(|| {
@@ -48,6 +52,35 @@ pub(crate) fn listed(n: u64) -> bool {
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
     named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+static TRACE_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn scene_capture_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CAPTURE_SCENE_BEFORE_FRAMEGEN"))
+}
+
+/// The title has reached a present. A trace request names the frame
+/// after it. The caller drains translation at both edges while operations
+/// are still numbered with the frame they belong to.
+pub(crate) fn trace_boundary(present: u64) -> bool {
+    if TRACE_FRAME.load(Ordering::Acquire) == present {
+        return true;
+    }
+    if !scene_capture_on() {
+        return false;
+    }
+    let (Some(folder), Some(frame)) = (folder(), present.checked_add(1)) else {
+        return false;
+    };
+    static TRIGGER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    if std::fs::remove_file(TRIGGER.get_or_init(|| folder.join("scene-trace"))).is_err() {
+        return false;
+    }
+    TRACE_FRAME.store(frame, Ordering::Release);
+    tracing::info!(frame, "scene trace requested");
+    true
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -145,8 +178,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 /// Whether to save this present, and whether to keep its UI separate.
 pub(crate) fn requested(n: u64, listed: bool, framegen: bool) -> (bool, bool) {
     let Some(folder) = folder() else { return (false, false) };
-    static SCENE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *SCENE.get_or_init(|| crate::switch::on("VICTORY_CAPTURE_SCENE_BEFORE_FRAMEGEN")) {
+    if scene_capture_on() {
         static TRIGGER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         let scene = framegen && (
             std::fs::remove_file(TRIGGER.get_or_init(|| folder.join("scene-next"))).is_ok() || listed
