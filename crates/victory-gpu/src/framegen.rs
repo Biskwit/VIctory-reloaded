@@ -910,13 +910,13 @@ pub(crate) fn present(
 ) -> HRESULT {
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let enabled = match state.prepared.take() {
+    let (enabled, disable) = match state.prepared.take() {
         Some(prepared) if prepared.matches_present(frame, token) => {
             #[cfg(feature = "diagnostics")]
             if !prepared.enabled {
                 state.cadence.present_reset += 1;
             }
-            prepared.enabled && allow_generation
+            (prepared.enabled && allow_generation, prepared.enabled && !allow_generation)
         }
         _unmatched => {
             #[cfg(feature = "diagnostics")]
@@ -928,10 +928,10 @@ pub(crate) fn present(
                 Some(_) => state.cadence.present_wrong_token += 1,
                 None => state.cadence.present_no_prepare += 1,
             }
-            false
+            (false, true)
         }
     };
-    if !enabled && state.context.is_some()
+    if disable && state.context.is_some()
         && let Some(api) = api()
     {
         configure(api, &state, frame, false);

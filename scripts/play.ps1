@@ -6,6 +6,8 @@
 # -NoPanel      without the performance panel (on by default, F3 hides it while playing)
 # -SkipShaders  start even when the shader cache is cold (otherwise every shader is translated first)
 # -Console      series-x (the default) or series-s: the console the title takes this PC for
+# -FrameGen     AMD frame generation
+# -Fsr / -Dlss  PC upscaling in Series S (quality, balanced or performance)
 # -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance)
 # -Dlss4K       NVIDIA DLSS at 3840x2160 (quality, balanced or performance); FSR if it cannot start
 # -Build        target\diag (the default, the build all measurements are of) or target\release
@@ -24,6 +26,9 @@ param(
     [switch]$NoPanel,
     [switch]$SkipShaders,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
+    [switch]$FrameGen,
+    [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr,
+    [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
@@ -113,6 +118,10 @@ if (-not $Windowed) { $settings.VICTORY_FULLSCREEN = '1' }
 # The performance panel (FPS, frame times, GPU, CPU, VRAM, RAM) in the upper left
 # corner, so clips and screenshots show what the build runs at and on what PC.
 if (-not $NoPanel) { $settings.VICTORY_PANEL = '1' }
+if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1' }
+if ($Fsr -or $Dlss) { $settings.Remove('VICTORY_UPSCALER') }
+if ($Fsr) { $settings.VICTORY_FSR = $Fsr.ToLowerInvariant() }
+if ($Dlss) { $settings.VICTORY_DLSS = $Dlss.ToLowerInvariant() }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 if ($Dlss4K) { $settings.VICTORY_DLSS_4K = $Dlss4K.ToLowerInvariant() }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }

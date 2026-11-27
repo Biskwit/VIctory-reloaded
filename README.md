@@ -85,9 +85,8 @@ Use [`Play-VIctory.cmd`](Play-VIctory.cmd) to pass the same options from Command
 
 The Series X 4K profiles support `quality`, `balanced` and `performance` on
 build 1.0.2.1. They render at 2560 × 1440, 2258 × 1270 and 1920 × 1080
-respectively. For Series S, pass `VICTORY_DLSS='quality'` or
-`VICTORY_FSR='quality'` through `-More` to use a PC upscaler at the console
-profile's output size. Both accept the same three presets.
+respectively. For Series S, use `-Dlss` or `-Fsr` with the same three
+presets to keep the console profile's output size.
 
 For FSR, point `VICTORY_FIDELITYFX_DIR` or `[paths].fidelityfx_dir` at the
 folder containing `amd_fidelityfx_upscaler_dx12.dll`. The 4K mode prefers
@@ -99,7 +98,7 @@ default. `VICTORY_DLSS_NO_UPDATE=1` uses the installed selection without
 an NGX update. [AMD FSR SDK](https://gpuopen.com/amd-fsr-sdk/) ·
 [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS)
 
-For 2× Series S frame generation, set `VICTORY_FRAMEGEN='1'`. Point
+For 2× Series S frame generation, pass `-FrameGen`. Point
 `VICTORY_FFX_FG_DIR` or `[paths].ffx_fg_dir` at the SDK 2.4.0
 `Kits/FidelityFX/signedbin` folder with `amd_fidelityfx_loader_dx12.dll`
 and `amd_fidelityfx_framegeneration_dx12.dll`. If neither is set, the FSR
@@ -107,9 +106,8 @@ upscaler folder is used. This uses AMD's analytical
 3.1.6 frame generation provider. The launch below uses DLSS on an RTX card.
 
 ```powershell
-.\scripts\play.ps1 -Exe 'D:\victory-data\game\game.exe' -Console series-s -More @{
-    VICTORY_DLSS='quality'; VICTORY_FRAMEGEN='1'; VICTORY_FFX_FG_DIR='<SDK signedbin>'
-}
+$env:VICTORY_FFX_FG_DIR = '<SDK signedbin>'
+.\scripts\play.ps1 -Exe 'D:\victory-data\game\game.exe' -Console series-s -Dlss quality -FrameGen
 ```
 
 With neither PC upscaler selected, frame generation uses depth and motion
