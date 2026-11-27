@@ -711,7 +711,8 @@ impl Host {
         let taken = if read {
             Err("a copy done on the card is read through another host copy")
         } else {
-            let preplan = preplan.filter(|p| p.written == written);
+            // The plan was made with placed-copy ordering enabled.
+            let preplan = preplan.filter(|p| p.written == written && placed_order());
             self.take_steps(&written, runs, preplan)
         };
         match taken {
