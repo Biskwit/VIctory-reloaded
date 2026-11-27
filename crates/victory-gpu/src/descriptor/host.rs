@@ -4719,7 +4719,7 @@ fn make_twinned(
                     from_base(desc, copy.base);
                 }
                 // Made whole from the store: all its levels.
-                let prefilled = copy.prefilled.load(std::sync::atomic::Ordering::Relaxed);
+                let prefilled = copy.prefill.as_deref().map_or(0, crate::texture::Prefill::published);
                 if prefilled > 0
                     && let Some(desc) = &mut desc
                 {
