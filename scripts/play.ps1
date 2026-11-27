@@ -11,7 +11,8 @@
 # -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance)
 # -Dlss4K       NVIDIA DLSS at 3840x2160 (quality, balanced or performance); FSR if it cannot start
 # -Build        target\diag (the default, the build all measurements are of) or target\release
-# -Machine      auto (the default: by GPU vendor, with NVIDIA worker counts sized to the CPU),
+# -Machine      auto (the default: by GPU vendor; on NVIDIA, worker counts sized to the CPU and,
+#               for a card of 10 to 19 GB, title buffers in the card's memory),
 #               7900xtx, 4070, 4070tisuper, 4090, 3060 or laptop
 #               (3060: a six-core NVIDIA desktop with 16 GB of RAM and a 12 GB card, docs/rtx3060-16gb.md;
 #               laptop: an NVIDIA PC with 16 GB of RAM and a 6-8 GB card, docs/laptop-16gb.md)
@@ -47,11 +48,47 @@ $ram = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Tota
 $controllers = @(if ($Machine -in 'auto', '7900xtx') {
     Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
 })
-$hasNvidia = [bool]($controllers.PNPDeviceID -match 'VEN_10DE')
+$nvidiaControllers = @($controllers | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' })
+$hasNvidia = $nvidiaControllers.Count -gt 0
 $autoNvidia = $Machine -eq 'auto' -and $hasNvidia
+$cardGb = 0
+$autoAdds = @{}
 if ($Machine -eq 'auto') {
-    # Keep the vendor defaults for memory and rendering. The measured machine profiles are explicit.
+    # Keep the vendor defaults for rendering. The measured machine profiles are explicit.
     $Machine = if ($hasNvidia) { '4090' } else { '7900xtx' }
+    # Read the driver key for the detected NVIDIA adapter. Old driver entries and
+    # ambiguous adapter selections must not determine the automatic memory profile.
+    if ($autoNvidia -and -not $Safe -and $nvidiaControllers.Count -eq 1 -and
+        -not $More.ContainsKey('VICTORY_D3D12_ADAPTER') -and
+        (Get-Command Get-PnpDeviceProperty -ErrorAction SilentlyContinue)) {
+        $driverKey = (Get-PnpDeviceProperty -InstanceId $nvidiaControllers[0].PNPDeviceID -KeyName 'DEVPKEY_Device_Driver' -ErrorAction SilentlyContinue).Data
+        if ($driverKey -match '^\{4d36e968-e325-11ce-bfc1-08002be10318\}\\\d+$') {
+            $entry = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control\Class\$driverKey" -Name 'HardwareInformation.qwMemorySize' -ErrorAction SilentlyContinue
+            $cardBytes = $entry.'HardwareInformation.qwMemorySize' -as [uint64]
+            $cardGb = [int][math]::Round($cardBytes / 1GB)
+        }
+    }
+}
+
+# What -Machine auto adds to the NVIDIA defaults for a card of $CardGb GB and a CPU of $Cores cores.
+# - 10 to 19 GB: the memory settings of -Machine 4070 (and, from 15 GB, of -Machine 4070tisuper).
+#   Under a 20 GiB budget the defaults leave title buffers under 4 MiB in the PC's memory, where
+#   every access a shader makes crosses the bus: 16 fps against 29 on an RTX 5080
+#   (docs/rtx5080-16gb.md), 7.4 against 14.7 on an RTX 3080 10 GB (docs/rtx4070-performance.md).
+#   Not under -Safe, as in those presets. Smaller cards keep the defaults: the laptop preset
+#   that fits them trades other things (docs/laptop-16gb.md).
+# - Up to eight cores: those presets' three pipeline workers. The default ten, next to the
+#   page-mapping threads, left 125 pipelines unmade at the start of the world on eight cores.
+function Get-AutoNvidiaSettings([int]$CardGb, [int]$Cores, [bool]$Safe) {
+    $adds = [ordered]@{}
+    if ($Cores -le 8) { $adds.VICTORY_PIPELINE_WORKERS = '3' }
+    if (-not $Safe -and $CardGb -ge 10 -and $CardGb -lt 20) {
+        $adds.VICTORY_CARD_RESERVE_BUDGETS = '1'
+        $adds.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $adds.VICTORY_CARD_BUFFERS_MB = '1536'
+        $adds.VICTORY_CARD_WINDOWS_MB = '1024'
+        if ($CardGb -ge 15) { $adds.VICTORY_WINDOWS_BAR_MB = '4096' }
+    }
+    $adds
 }
 if ($Machine -eq '7900xtx') {
     # i9-12900K, RX 7900 XTX, 64 GB: the page-mapping lock was fastest with one
@@ -105,6 +142,10 @@ if ($Machine -eq '7900xtx') {
         # into refused the whole submission to the card steps; in list order it is
         # taken (submit thread 104.7 -> 50.9 ms a frame, 12.1 -> 14.3 fps here).
         $settings.VICTORY_PLACED_ORDER = '1'
+    }
+    if ($autoNvidia) {
+        $autoAdds = Get-AutoNvidiaSettings $cardGb $coreCount ([bool]$Safe)
+        foreach ($k in $autoAdds.Keys) { $settings[$k] = $autoAdds[$k] }
     }
 }
 if ($Machine -in '4070', '3060') {
@@ -194,6 +235,11 @@ foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $profile = if ($autoNvidia) { 'automatic NVIDIA profile' } else { $Machine }
 Write-Host "Settings for the $profile$(if ($Safe) { ', safe' })$(if ($RayTracing) { ', with ray tracing' })."
+if ($autoAdds.Contains('VICTORY_CARD_BUFFERS_MIN_KB')) {
+    $preset = if ($cardGb -ge 15) { '4070tisuper' } else { '4070' }
+    Write-Host ("This NVIDIA card has $cardGb GB: title buffers go to the card's memory, with the memory settings of " +
+        "-Machine $preset (docs/rtx5080-16gb.md). -Machine 4090 keeps the buffers under 4 MiB in the PC's memory.")
+}
 if ($Console -eq 'series-s' -and $Machine -ne '7900xtx') {
     Write-Host ("Series S requests {0} list translation threads, {1} for memory updates, and {2} for landing." -f
         $settings.VICTORY_THIN_THREADS, $settings.VICTORY_UNDER_THREADS, $settings.VICTORY_LAND_THREADS)
