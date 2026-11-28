@@ -207,7 +207,11 @@ i9-12900K with an RTX 4090 unless it says otherwise. The
       submission's taking overlap the sending thread's recording of the one
       before, and the up-copy check's older values sent over the card's
       words rose from 0-2% of its looks to 9-18% (a bisection over the
-      merged builds); with the wait back, 1-5%, for ~0.36 ms of that thread;
+      merged builds); with the wait back, 1-5%, for ~0.36 ms of that thread.
+      Most of that rise was the check's own (a857fb5d, below); the one hazard
+      the overlap has, a copy's hashes made while they are read, is fixed on
+      branch `land-order` (~0.3 ms back), which still owes its launches
+      before it comes in;
     - the present's copy into the back buffer is sent by the sending
       thread like the other submissions, and that thread also makes the
       swap chain's Present behind it; every other call on the swap chain
@@ -263,6 +267,26 @@ i9-12900K with an RTX 4090 unless it says otherwise. The
   - with frame generation (`VICTORY_FRAMEGEN=1`) submissions and presents
     are sent by the line's thread (`VICTORY_SUBMIT_SPLIT` and
     `VICTORY_PRESENT_OFF_LINE` step aside).
+  The frame is the same within the noise (warm launches 35.0-37.5 ms, median
+  35.5, against main's 35.5); the submitting thread runs about 1.5 ms longer and the title's wait
+  at presents about 3 ms, not explained yet (suspects: the journal in pieces
+  given up, the present's path, DRED's `faults`).
+- **After the merge:**
+  - the presenter takes only a window the taskbar would count (f3e20a53):
+    launched from a terminal, the process also has the console's
+    zero-size "PseudoConsoleWindow", which it took first in about 40% of
+    launches, leaving the title's window frozen while the log showed normal
+    frame rates. The frame times were the same either way;
+  - the up-copy check takes a submission's refresh notes with its own sends
+    (a857fb5d): it took them when the sending thread recorded, by then a
+    later submission's, and counted the words of sends still to come as
+    older values;
+  - frame generation's trial switches, all off by default:
+    `VICTORY_FRAMEGEN_FLAGS`, `_ONLY_GENERATED`, `_VSYNC` and `_ASYNC`;
+    `VICTORY_DISPLAY_HZ` (a temporary display rate, put back when the app
+    ends); `VICTORY_FRAMEGEN_DEFER` (AMD prepares right before its own
+    present, from copies bound to the submission's token: a title held to
+    its frame cap had lost a third to half of its generated frames).
 - **Not brought over (yet)** from our earlier tree (fxceless's fork with about
   140 commits of ours): its FidelityFX SDK path for the Series S upscale
   (Vice-Tay translates FSR 4's own code) and its other rendering fixes, which

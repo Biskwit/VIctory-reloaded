@@ -188,6 +188,33 @@ For titles that use BCPack, set `VICTORY_BCPACK_TABLES` to the path of a local c
 
 Every `VICTORY_...` switch is described in a comment where the code reads it.
 
+### Frame generation and PC upscaling
+
+They come from Vice-Tay with the merge, and need DLLs this repository can't ship: download
+them from their makers' GitHub repositories, keep them outside the checkout, and check that
+`Get-AuthenticodeSignature` reports each one Valid.
+
+| Option | What it does | Needs |
+|---|---|---|
+| `-FrameGen` | AMD's frame generation: a picture made between each two the game renders | AMD FidelityFX SDK 2.4.0's `Kits/FidelityFX/signedbin`, in `VICTORY_FFX_FG_DIR` |
+| `-Fsr quality` | FidelityFX upscaling on the Series S profile (or `balanced`, `performance`) | the same folder, in `VICTORY_FIDELITYFX_DIR` |
+| `-Dlss quality` | NVIDIA DLSS upscaling instead | `nvngx_dlss.dll` from NVIDIA/DLSS 310.9.16, in `VICTORY_DLSS_DIR`, with `VICTORY_DLSS_NO_UPDATE=1` |
+| `-FrameIntervalMs 40` | Holds the game to a frame every 40 ms (25 fps) | |
+
+Measured with PresentMon on the RTX 4090 and a 60 Hz monitor without variable refresh:
+
+- Vice-Tay's build with `-FrameGen -Fsr quality` rendered 23.6 fps and showed 47.3, but AMD's
+  present tears on every frame on a display without variable refresh.
+- An even picture needs vsync and the game held to half the refresh rate. On trial, off by
+  default: `-FrameGen -FrameIntervalMs 40 -More @{VICTORY_FRAMEGEN_DEFER='1'; VICTORY_DISPLAY_HZ='50'}`
+  puts the monitor at 50 Hz for the run, presents with vsync and gives every rendered frame its
+  generated partner: 24.5 fps rendered, 49.0 shown, 96% of pictures held for exactly one refresh.
+  Each frame the game renders late repeats one refresh. The app puts the desktop's own mode
+  back when it ends; if a crash leaves it at 50 Hz, set it in Settings, Display, Advanced
+  display.
+- Frame generation takes about 3 ms of card time a frame and adds roughly 20-25 ms of latency;
+  hair and shoulders can show doubled edges during fast camera pans.
+
 ## The overlay
 
 On in every build (`VICTORY_OVERLAY=0` hides it): a compact table at the top left of the
