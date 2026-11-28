@@ -112,10 +112,43 @@ pub(super) fn split_send() -> bool {
     // submission sent here first waits for those published.
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_SUBMIT_SPLIT") {
-        return on && relay_exact() && relay_copy() && send::own();
+        return on && relay_exact() && relay_copy() && copy_queue_made() && send::own();
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBMIT_SPLIT").is_none_or(|v| v != "0") && relay_exact() && relay_copy() && send::own())
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_SUBMIT_SPLIT").is_none_or(|v| v != "0")
+            && relay_exact()
+            && relay_copy()
+            && copy_queue_made()
+            && send::own()
+    })
+}
+
+/// Whether a copy queue can be made, which [`split_send`] needs: the relay's
+/// fetches go there and know their order from their plans' numbers. Without
+/// one the relay fetches on the drawing queue, where a fetch counts every
+/// send numbered so far as ahead of it (`QUEUE_ORDER`), and a published one
+/// may not be on the queue yet: what the fetch brought back of its ranges
+/// would be the card's older bytes, landed as a shader's. Asked once the
+/// host is there.
+fn copy_queue_made() -> bool {
+    static MADE: OnceLock<bool> = OnceLock::new();
+    let Some(host) = host() else {
+        return false;
+    };
+    *MADE.get_or_init(|| {
+        // SAFETY: plain object creation; the queue is let go at once.
+        let made = unsafe {
+            host.device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                ..Default::default()
+            })
+        };
+        if let Err(e) = &made {
+            tracing::warn!(error = %e, "no copy queue: submissions are not published (VICTORY_SUBMIT_SPLIT)");
+        }
+        made.is_ok()
+    })
 }
 
 
