@@ -144,6 +144,8 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use host::restore_display;
 
 /// The process is ending in an orderly way (the title exits, or its window
 /// was closed): the pictures the capture thread still has in its line

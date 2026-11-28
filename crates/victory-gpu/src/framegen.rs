@@ -14,7 +14,9 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::{HWND, S_OK};
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12CommandQueue, ID3D12Device, ID3D12GraphicsCommandList, ID3D12Resource,
+    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
+    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATES, ID3D12CommandQueue, ID3D12Device,
+    ID3D12GraphicsCommandList, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC1, IDXGIFactory2, IDXGISwapChain3, IDXGISwapChain4,
@@ -227,35 +229,49 @@ pub fn requested() -> bool {
 ///   left edge of each generated frame; 16: pacing lines);
 /// - `VICTORY_FRAMEGEN_ONLY_GENERATED=1`: present only the generated frames;
 /// - `VICTORY_FRAMEGEN_VSYNC=1`: AMD presents both frames on the vblank,
-///   without tearing (otherwise with tearing allowed);
-/// - `VICTORY_FRAMEGEN_ASYNC=1`: generation on AMD's async compute queue.
+///   without tearing (otherwise with tearing allowed). On by default with
+///   `VICTORY_DISPLAY_HZ` (a fixed refresh the title is held to), `0` turns it off;
+/// - `VICTORY_FRAMEGEN_ASYNC=1`: generation on AMD's async compute queue;
+/// - `VICTORY_FRAMEGEN_DEFER=1`: AMD's preparation at the present of its
+///   frame, from copies made on the title's list ([`Slot`]).
 #[derive(Clone, Copy)]
 struct Trial {
     flags: u32,
     only_generated: bool,
     vsync: bool,
     async_workloads: bool,
+    defer: bool,
 }
 
 fn trial() -> Trial {
     static TRIAL: OnceLock<Trial> = OnceLock::new();
     *TRIAL.get_or_init(|| {
         let on = |name| std::env::var_os(name).is_some_and(|v| v == "1");
+        let fixed_rate = std::env::var_os("VICTORY_DISPLAY_HZ").is_some_and(|v| !v.is_empty());
         let trial = Trial {
             flags: std::env::var("VICTORY_FRAMEGEN_FLAGS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0),
             only_generated: on("VICTORY_FRAMEGEN_ONLY_GENERATED"),
-            vsync: on("VICTORY_FRAMEGEN_VSYNC"),
+            vsync: on("VICTORY_FRAMEGEN_VSYNC")
+                || (fixed_rate && std::env::var_os("VICTORY_FRAMEGEN_VSYNC").is_none_or(|v| v != "0")),
             async_workloads: on("VICTORY_FRAMEGEN_ASYNC"),
+            defer: on("VICTORY_FRAMEGEN_DEFER"),
         };
         tracing::info!(
             flags = trial.flags,
             only_generated = trial.only_generated,
             vsync = trial.vsync,
             async_workloads = trial.async_workloads,
+            defer = trial.defer,
             "frame generation: trial switches"
         );
         trial
     })
+}
+
+/// Preparations wait for their present ([`Slot`]): the upscaler's list
+/// need not wait for the previous present.
+pub(crate) fn deferred() -> bool {
+    requested() && trial().defer
 }
 
 /// Configure the provider directory before the first swap chain or SDK call.
@@ -412,8 +428,10 @@ impl PreparedFrame {
 /// A host list owns the SDK resources it recorded through GPU completion.
 /// Resetting an unsent list frees its frame slot without touching the SDK.
 pub(crate) struct Preparation {
-    _context: Arc<Context>,
+    _context: Option<Arc<Context>>,
     recording: Option<Recording>,
+    /// The deferred slot's copies the list writes ([`Slot`]).
+    _kept: Vec<ID3D12Resource>,
 }
 
 impl Preparation {
@@ -438,6 +456,120 @@ impl Drop for Recording {
     }
 }
 
+/// `VICTORY_FRAMEGEN_DEFER=1`. A title held at its frame cap records frame
+/// N+1's upscale while it waits to present frame N, so a preparation made
+/// on the upscaler's list can belong to the frame after the next present.
+/// AMD's analytical provider keeps one set of prepared buffers (it flips
+/// them at each prepare) and resets a generation whose frame is not the
+/// last one configured, so its configure and prepare have to come right
+/// before their own present. The depth and motion vectors are copied on
+/// the title's list into one of two slots; the slot is bound to the token
+/// the title submits that list with, and the present with that token
+/// configures and prepares from the copies on the host's list.
+struct Slot {
+    /// Depth and motion copies, in COPY_DEST between uses.
+    textures: Option<[ID3D12Resource; 2]>,
+    pending: Option<Pending>,
+}
+
+/// One frame's copied inputs, waiting for their present.
+struct Pending {
+    /// Order of recording: the oldest unbound one takes a submission.
+    seq: u64,
+    title_list: usize,
+    token: Option<u64>,
+    submission: Arc<AtomicU8>,
+    depth_desc: [u32; 8],
+    motion_desc: [u32; 8],
+    max_render: [u32; 2],
+    render_size: [u32; 2],
+    upscale_flags: u32,
+    jitter: [f32; 2],
+    motion_scale: [f32; 2],
+    frame_ms: f32,
+    reset: bool,
+    camera: [f32; 4],
+}
+
+const SLOTS: usize = 2;
+
+/// Frees slots whose list was reset unsent.
+fn drop_discarded(slots: &mut [Slot]) {
+    for slot in slots {
+        if slot.pending.as_ref().is_some_and(|p| p.submission.load(Ordering::Acquire) == DISCARDED) {
+            slot.pending = None;
+        }
+    }
+}
+
+/// Binds the oldest unbound slot recorded on one of `lists` to `token`.
+fn bind_slot(slots: &mut [Slot], lists: &[usize], token: u64) {
+    let oldest = slots
+        .iter_mut()
+        .filter_map(|slot| slot.pending.as_mut())
+        .filter(|p| {
+            p.token.is_none()
+                && p.submission.load(Ordering::Acquire) != DISCARDED
+                && lists.contains(&p.title_list)
+        })
+        .min_by_key(|p| p.seq);
+    if let Some(pending) = oldest {
+        pending.token = Some(token);
+    }
+}
+
+/// The slot for the present with `token`, taken out, and any slot bound to
+/// an earlier token freed (its frame was not presented). The count of
+/// those freed comes back too.
+fn take_slot(slots: &mut [Slot], token: u64) -> (Option<(usize, Pending)>, u64) {
+    let mut stale = 0;
+    for slot in slots.iter_mut() {
+        if slot.pending.as_ref().is_some_and(|p| p.token.is_some_and(|t| t < token)) {
+            slot.pending = None;
+            stale += 1;
+        }
+    }
+    let index = slots
+        .iter()
+        .position(|slot| slot.pending.as_ref().is_some_and(|p| p.token == Some(token)));
+    (index.and_then(|i| slots[i].pending.take().map(|p| (i, p))), stale)
+}
+
+/// FidelityFX's read state of a preparation input, as the host list's.
+fn read_state(ffx: u32) -> D3D12_RESOURCE_STATES {
+    // FFX pixel and compute read (0xc) or compute read (0x4).
+    D3D12_RESOURCE_STATES(if ffx == 0xc { 0xc0 } else { 0x40 })
+}
+
+/// A default-heap texture of `source`'s description, in COPY_DEST.
+fn copy_texture(source: &ID3D12Resource) -> Option<ID3D12Resource> {
+    let device = crate::external::host_device()?;
+    // SAFETY: the description of a live resource, used for a new one.
+    unsafe {
+        let desc = source.GetDesc();
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut texture: Option<ID3D12Resource> = None;
+        device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut texture,
+            )
+            .ok()?;
+        texture
+    }
+}
+
+fn same_texture(a: &ID3D12Resource, b: &ID3D12Resource) -> bool {
+    // SAFETY: plain queries of live resources.
+    let (a, b) = unsafe { (a.GetDesc(), b.GetDesc()) };
+    (a.Width, a.Height, a.Format, a.MipLevels, a.DepthOrArraySize, a.Flags)
+        == (b.Width, b.Height, b.Format, b.MipLevels, b.DepthOrArraySize, b.Flags)
+}
+
 #[derive(Default)]
 struct State {
     swap_context: usize,
@@ -449,6 +581,13 @@ struct State {
     context: Option<Arc<Context>>,
     refused_layout: Option<([u32; 2], u32)>,
     prepared: Option<PreparedFrame>,
+    /// Deferred preparation ([`Slot`]): the slots, the next recording's
+    /// order, AMD's frame number of the last preparation, and the token
+    /// and enable of the preparation made for the coming present.
+    slots: Vec<Slot>,
+    seq: u64,
+    frame_id: u64,
+    ready: Option<(u64, bool)>,
     last_present: Option<u64>,
     real: u64,
     sample: Option<(Instant, u64, u32, u64)>,
@@ -475,6 +614,8 @@ struct Cadence {
     present_wrong_token: u64,
     present_before_submission: u64,
     present_reset: u64,
+    /// Deferred slots freed unpresented (a later token was presented).
+    stale: u64,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
@@ -576,9 +717,9 @@ pub struct Inputs<'a> {
     pub camera: [f32; 4],
 }
 
-fn make_context(api: &Api, state: &State, input: &Inputs<'_>) -> Option<Arc<Context>> {
+fn make_context(api: &Api, state: &State, max_render: [u32; 2], upscale_flags: u32) -> Option<Arc<Context>> {
     let device = crate::external::host_device()?;
-    if state.format == 0 || state.display.contains(&0) || input.max_render.contains(&0) {
+    if state.format == 0 || state.display.contains(&0) || max_render.contains(&0) {
         return None;
     }
     let mut version = Box::new(Version {
@@ -605,9 +746,9 @@ fn make_context(api: &Api, state: &State, input: &Inputs<'_>) -> Option<Arc<Cont
             next: &raw mut backend.header,
         },
         // Keep the depth/MV flags. The swap chain's target is SDR.
-        flags: input.upscale_flags & 0b1_1110,
+        flags: upscale_flags & 0b1_1110,
         display: state.display,
-        max_render: input.max_render,
+        max_render,
         format: state.format,
     });
     let mut handle = null_mut();
@@ -640,7 +781,7 @@ fn make_context(api: &Api, state: &State, input: &Inputs<'_>) -> Option<Arc<Cont
         unsafe { (api.destroy)(&mut handle, null()) };
         return None;
     }
-    tracing::info!(display = ?state.display, render = ?input.max_render, "frame generation: AMD 3.1.6 context created");
+    tracing::info!(display = ?state.display, render = ?max_render, "frame generation: AMD 3.1.6 context created");
     Some(Arc::new(Context {
         handle: UnsafeCell::new(handle),
         can_generate: AtomicBool::new(false),
@@ -684,6 +825,9 @@ pub(crate) fn prepare(
             state.cadence.no_swap_chain += 1;
         }
         return None;
+    }
+    if trial().defer {
+        return copy_for_present(list, title_list, &input, &mut state);
     }
     if state.prepared.as_ref().is_some_and(|p| p.submission.load(Ordering::Acquire) == DISCARDED) {
         state.prepared = None;
@@ -731,7 +875,7 @@ pub(crate) fn prepare(
         state.refused_layout = None;
     }
     if state.context.is_none() && state.refused_layout != Some(layout) {
-        state.context = make_context(api, &state, &input);
+        state.context = make_context(api, &state, input.max_render, input.upscale_flags);
         if state.context.is_none() {
             state.refused_layout = Some(layout);
         }
@@ -788,7 +932,7 @@ pub(crate) fn prepare(
             tracing::warn!(result, "frame generation: AMD prepare refused the frame")
         });
         // The SDK may already have recorded work before a failed return.
-        return Some(Preparation { _context: context, recording: None });
+        return Some(Preparation { _context: Some(context), recording: None, _kept: Vec::new() });
     }
     let submission = Arc::new(AtomicU8::new(RECORDED));
     state.prepared = Some(PreparedFrame {
@@ -804,13 +948,215 @@ pub(crate) fn prepare(
     }
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| tracing::info!(frame, render = ?input.render_size, "frame generation: first AMD prepare recorded"));
-    Some(Preparation { _context: context, recording: Some(Recording(submission)) })
+    Some(Preparation { _context: Some(context), recording: Some(Recording(submission)), _kept: Vec::new() })
+}
+
+/// Deferred preparation ([`Slot`]): copies the frame's depth and motion
+/// vectors into a free slot on the upscaler's list.
+fn copy_for_present(
+    list: &ID3D12GraphicsCommandList,
+    title_list: crate::object::This,
+    input: &Inputs<'_>,
+    state: &mut State,
+) -> Option<Preparation> {
+    drop_discarded(&mut state.slots);
+    while state.slots.len() < SLOTS {
+        state.slots.push(Slot { textures: None, pending: None });
+    }
+    let Some(index) = state.slots.iter().position(|slot| slot.pending.is_none()) else {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.slot_occupied += 1;
+        }
+        return None;
+    };
+    let slot = &mut state.slots[index];
+    if !slot.textures.as_ref().is_some_and(|[depth, motion]| {
+        same_texture(depth, input.depth) && same_texture(motion, input.motion)
+    }) {
+        slot.textures = Some([copy_texture(input.depth)?, copy_texture(input.motion)?]);
+    }
+    let [depth, motion] = slot.textures.clone()?;
+    let (depth_state, motion_state) = (read_state(input.depth_state), read_state(input.motion_state));
+    use crate::host::transition;
+    // SAFETY: the upscaler's list is open and holds both inputs in their read states.
+    unsafe {
+        list.ResourceBarrier(&[
+            transition(input.depth, depth_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(input.motion, motion_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        ]);
+        list.CopyResource(&depth, input.depth);
+        list.CopyResource(&motion, input.motion);
+        list.ResourceBarrier(&[
+            transition(input.depth, D3D12_RESOURCE_STATE_COPY_SOURCE, depth_state),
+            transition(input.motion, D3D12_RESOURCE_STATE_COPY_SOURCE, motion_state),
+        ]);
+    }
+    state.seq += 1;
+    let submission = Arc::new(AtomicU8::new(RECORDED));
+    state.slots[index].pending = Some(Pending {
+        seq: state.seq,
+        title_list: title_list as usize,
+        token: None,
+        submission: submission.clone(),
+        depth_desc: input.depth_desc,
+        motion_desc: input.motion_desc,
+        max_render: input.max_render,
+        render_size: input.render_size,
+        upscale_flags: input.upscale_flags,
+        jitter: input.jitter,
+        motion_scale: input.motion_scale,
+        frame_ms: input.frame_ms,
+        reset: input.reset,
+        camera: input.camera,
+    });
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| tracing::info!(render = ?input.render_size, "frame generation: first input copied for its present (VICTORY_FRAMEGEN_DEFER)"));
+    Some(Preparation { _context: None, recording: Some(Recording(submission)), _kept: vec![depth, motion] })
+}
+
+/// Deferred preparation ([`Slot`]): on the host's list of the present with
+/// `token`, configures AMD for that frame and prepares it from the slot's
+/// copies. Returns the copies, for the list to hold until it has run.
+pub(crate) fn present_prepare(list: &ID3D12GraphicsCommandList, token: Option<u64>) -> Option<[ID3D12Resource; 2]> {
+    if !deferred() {
+        return None;
+    }
+    let api = api()?;
+    // Drop retired contexts after the SDK guard, since Context::drop takes it.
+    let _retired;
+    let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    state.ready = None;
+    if state.swap_context == 0 {
+        return None;
+    }
+    drop_discarded(&mut state.slots);
+    let (taken, _stale) = token.map_or((None, 0), |token| take_slot(&mut state.slots, token));
+    #[cfg(feature = "diagnostics")]
+    {
+        state.cadence.stale += _stale;
+    }
+    let Some((index, pending)) = taken else {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.present_no_prepare += 1;
+        }
+        return None;
+    };
+    if pending.submission.load(Ordering::Acquire) != SUBMITTED {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.present_before_submission += 1;
+        }
+        return None;
+    }
+    let [depth, motion] = state.slots[index].textures.clone()?;
+    if pending.render_size[0] > state.display[0] || pending.render_size[1] > state.display[1] {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.invalid_extent += 1;
+        }
+        return None;
+    }
+    let frame = state.frame_id + 1;
+    let layout = (pending.max_render, pending.upscale_flags & 0b1_1110);
+    if state.context.as_ref().is_some_and(|context| {
+        (context.create.max_render, context.create.flags) != layout
+            || context.create.display != state.display
+            || context.create.format != state.format
+    }) {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.layout_changed += 1;
+        }
+        if !disable_and_drain(api, &state, state.frame_id) {
+            return None;
+        }
+        _retired = state.context.take();
+        state.refused_layout = None;
+    }
+    if state.context.is_none() && state.refused_layout != Some(layout) {
+        state.context = make_context(api, &state, pending.max_render, pending.upscale_flags);
+        if state.context.is_none() {
+            state.refused_layout = Some(layout);
+        }
+    }
+    let Some(context) = state.context.clone() else {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.context_unavailable += 1;
+        }
+        return None;
+    };
+    let enabled = !pending.reset;
+    if !configure(api, &state, frame, enabled) {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.configure_failed += 1;
+        }
+        return None;
+    }
+    const FFX_COMPUTE_READ: u32 = 0x4;
+    let shader_read = read_state(FFX_COMPUTE_READ);
+    let mut prepare = Prepare {
+        header: header(PREPARE_FRAMEGEN),
+        frame,
+        flags: 0,
+        command_list: list.as_raw(),
+        render_size: pending.render_size,
+        jitter: pending.jitter,
+        motion_scale: pending.motion_scale,
+        frame_ms: pending.frame_ms,
+        unused_reset: false,
+        camera: pending.camera,
+        depth: Resource { resource: depth.as_raw(), description: pending.depth_desc, state: FFX_COMPUTE_READ },
+        motion: Resource { resource: motion.as_raw(), description: pending.motion_desc, state: FFX_COMPUTE_READ },
+    };
+    use crate::host::transition;
+    // SAFETY: the present's open host list; the copies stay alive through
+    // it (returned to the caller, which keeps them on the list).
+    let result = unsafe {
+        list.ResourceBarrier(&[
+            transition(&depth, D3D12_RESOURCE_STATE_COPY_DEST, shader_read),
+            transition(&motion, D3D12_RESOURCE_STATE_COPY_DEST, shader_read),
+        ]);
+        let result = (api.dispatch)(context.handle.get(), &raw mut prepare.header);
+        list.ResourceBarrier(&[
+            transition(&depth, shader_read, D3D12_RESOURCE_STATE_COPY_DEST),
+            transition(&motion, shader_read, D3D12_RESOURCE_STATE_COPY_DEST),
+        ]);
+        result
+    };
+    if result != OK {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.prepare_failed += 1;
+        }
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| tracing::warn!(result, "frame generation: AMD prepare refused the frame"));
+        return Some([depth, motion]);
+    }
+    state.frame_id = frame;
+    state.ready = token.map(|token| (token, enabled));
+    #[cfg(feature = "diagnostics")]
+    {
+        state.cadence.prepared += 1;
+    }
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| tracing::info!(frame, render = ?pending.render_size, "frame generation: first AMD prepare at its present (VICTORY_FRAMEGEN_DEFER)"));
+    Some([depth, motion])
 }
 
 /// Bind the recorded upscaler input to the token supplied by the title on
 /// submission. Reusing the same list must not change an already bound token.
 pub(crate) fn bind_submission(lists: &[crate::object::This], token: u64) {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if trial().defer {
+        let lists: Vec<usize> = lists.iter().map(|&list| list as usize).collect();
+        bind_slot(&mut state.slots, &lists, token);
+        return;
+    }
     if let Some(prepared) = state.prepared.as_mut()
         && prepared.token.is_none()
         && prepared.submission.load(Ordering::Acquire) != DISCARDED
@@ -970,26 +1316,19 @@ pub(crate) fn present(
 ) -> HRESULT {
     let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let (enabled, disable) = match state.prepared.take() {
-        Some(prepared) if prepared.matches_present(frame, token) => {
-            #[cfg(feature = "diagnostics")]
-            if !prepared.enabled {
-                state.cadence.present_reset += 1;
-            }
-            (prepared.enabled && allow_generation, prepared.enabled && !allow_generation)
+    // Deferred: `present_prepare` configured this frame on the present's
+    // list (or nothing was prepared for it). AMD's frame number is ours.
+    let (enabled, disable, frame) = if trial().defer {
+        let ready = state.ready.take().filter(|&(ready, _)| Some(ready) == token);
+        #[cfg(feature = "diagnostics")]
+        if ready.is_some_and(|(_, enabled)| !enabled) {
+            state.cadence.present_reset += 1;
         }
-        _unmatched => {
-            #[cfg(feature = "diagnostics")]
-            match _unmatched {
-                Some(prepared) if prepared.frame != frame => state.cadence.present_wrong_frame += 1,
-                Some(prepared) if prepared.token == token && !prepared.submitted() => {
-                    state.cadence.present_before_submission += 1;
-                }
-                Some(_) => state.cadence.present_wrong_token += 1,
-                None => state.cadence.present_no_prepare += 1,
-            }
-            (false, true)
-        }
+        let prepared = ready.is_some_and(|(_, enabled)| enabled);
+        (prepared && allow_generation, !(prepared && allow_generation), state.frame_id)
+    } else {
+        let (enabled, disable) = matched_present(&mut state, frame, token, allow_generation);
+        (enabled, disable, frame)
     };
     if disable && state.context.is_some()
         && let Some(api) = api()
@@ -1015,6 +1354,32 @@ pub(crate) fn present(
         record_present(&mut state, presented, enabled);
     }
     status
+}
+
+/// The upscaler input recorded for this present (frame number and token
+/// match): (generate, configure generation off).
+fn matched_present(state: &mut State, frame: u64, token: Option<u64>, allow_generation: bool) -> (bool, bool) {
+    match state.prepared.take() {
+        Some(prepared) if prepared.matches_present(frame, token) => {
+            #[cfg(feature = "diagnostics")]
+            if !prepared.enabled {
+                state.cadence.present_reset += 1;
+            }
+            (prepared.enabled && allow_generation, prepared.enabled && !allow_generation)
+        }
+        _unmatched => {
+            #[cfg(feature = "diagnostics")]
+            match _unmatched {
+                Some(prepared) if prepared.frame != frame => state.cadence.present_wrong_frame += 1,
+                Some(prepared) if prepared.token == token && !prepared.submitted() => {
+                    state.cadence.present_before_submission += 1;
+                }
+                Some(_) => state.cadence.present_wrong_token += 1,
+                None => state.cadence.present_no_prepare += 1,
+            }
+            (false, true)
+        }
+    }
 }
 
 fn record_present(state: &mut State, presented: Option<u32>, enabled: bool) {
@@ -1077,6 +1442,7 @@ fn record_present(state: &mut State, presented: Option<u32>, enabled: bool) {
                     present_wrong_token = cadence.present_wrong_token,
                     present_before_submission = cadence.present_before_submission,
                     present_reset = cadence.present_reset,
+                    stale = cadence.stale,
                     "frame generation: cadence"
                 );
             }
@@ -1113,6 +1479,10 @@ pub(crate) fn resize(
     // the proxy might still reference alive.
     let resized = resize_buffers();
     state.prepared = None;
+    for slot in &mut state.slots {
+        slot.pending = None;
+    }
+    state.ready = None;
     state.sample = None;
     #[cfg(feature = "diagnostics")]
     {
@@ -1273,6 +1643,80 @@ mod tests {
         assert!(!frame.matches_present(8, Some(10)));
         assert!(!frame.matches_present(7, Some(11)));
         assert!(!frame.matches_present(7, None));
+    }
+
+    fn pending(seq: u64, title_list: usize, submission: &Arc<AtomicU8>) -> Option<Pending> {
+        Some(Pending {
+            seq,
+            title_list,
+            token: None,
+            submission: submission.clone(),
+            depth_desc: [0; 8],
+            motion_desc: [0; 8],
+            max_render: [1280, 720],
+            render_size: [1280, 720],
+            upscale_flags: 0,
+            jitter: [0.0; 2],
+            motion_scale: [1.0; 2],
+            frame_ms: 40.0,
+            reset: false,
+            camera: [0.0; 4],
+        })
+    }
+
+    #[test]
+    fn a_frame_recorded_before_the_previous_present_waits_for_its_own() {
+        // A title held at its frame cap records frame 11's upscale (list 2)
+        // before it presents frame 10 (list 1, token 10).
+        let submitted = Arc::new(AtomicU8::new(SUBMITTED));
+        let mut slots = vec![
+            Slot { textures: None, pending: pending(1, 1, &submitted) },
+            Slot { textures: None, pending: pending(2, 2, &submitted) },
+        ];
+        bind_slot(&mut slots, &[1], 10);
+        let (taken, stale) = take_slot(&mut slots, 10);
+        assert_eq!((taken.map(|(i, p)| (i, p.title_list)), stale), (Some((0, 1)), 0));
+        // Frame 11 keeps its copies until its own submission and present.
+        bind_slot(&mut slots, &[2], 11);
+        assert_eq!(slots[1].pending.as_ref().and_then(|p| p.token), Some(11));
+        let (taken, _) = take_slot(&mut slots, 11);
+        assert_eq!(taken.map(|(i, _)| i), Some(1));
+    }
+
+    #[test]
+    fn one_list_used_for_two_frames_binds_the_oldest_first() {
+        let submitted = Arc::new(AtomicU8::new(SUBMITTED));
+        let mut slots = vec![
+            Slot { textures: None, pending: pending(5, 7, &submitted) },
+            Slot { textures: None, pending: pending(4, 7, &submitted) },
+        ];
+        bind_slot(&mut slots, &[7], 20);
+        assert_eq!(slots[1].pending.as_ref().and_then(|p| p.token), Some(20));
+        assert_eq!(slots[0].pending.as_ref().and_then(|p| p.token), None);
+    }
+
+    #[test]
+    fn a_frame_never_presented_frees_its_slot_at_a_later_present() {
+        let submitted = Arc::new(AtomicU8::new(SUBMITTED));
+        let mut slots = vec![
+            Slot { textures: None, pending: pending(1, 1, &submitted) },
+            Slot { textures: None, pending: pending(2, 2, &submitted) },
+        ];
+        bind_slot(&mut slots, &[1], 30);
+        bind_slot(&mut slots, &[2], 31);
+        let (taken, stale) = take_slot(&mut slots, 31);
+        assert_eq!((taken.map(|(i, _)| i), stale), (Some(1), 1));
+        assert!(slots.iter().all(|slot| slot.pending.is_none()));
+    }
+
+    #[test]
+    fn a_list_reset_unsent_frees_its_slot() {
+        let discarded = Arc::new(AtomicU8::new(DISCARDED));
+        let mut slots = vec![Slot { textures: None, pending: pending(1, 1, &discarded) }];
+        bind_slot(&mut slots, &[1], 40);
+        assert_eq!(slots[0].pending.as_ref().and_then(|p| p.token), None);
+        drop_discarded(&mut slots);
+        assert!(slots[0].pending.is_none());
     }
 
     #[test]

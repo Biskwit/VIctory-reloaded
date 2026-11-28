@@ -90,9 +90,10 @@ pub fn finish_submitted() {
 /// signatures, pipeline) is replaced before the list's next draw or
 /// dispatch.
 pub fn record<R>(list: This, f: impl FnOnce(&Recording<'_>) -> R) -> Option<R> {
-    if crate::framegen::requested() {
+    if crate::framegen::requested() && !crate::framegen::deferred() {
         // Finish the prior presentation before opening an upscaler list.
-        // AMD's frame generator reuses its preparation buffers across presents.
+        // AMD's frame generator reuses its preparation buffers across presents
+        // (deferred, it prepares at the present: `framegen::present_prepare`).
         crate::queue::wait_before_framegen();
     }
     let recording = crate::list::thin::for_external(list)?;

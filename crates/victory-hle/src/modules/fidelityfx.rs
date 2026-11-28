@@ -334,6 +334,8 @@ pub fn serving() -> bool {
 
 /// Releases presentation and upscaling resources before the process ends.
 pub fn shut_down() {
+    #[cfg(windows)]
+    victory_gpu::restore_display("shutdown");
     victory_gpu::framegen::shut_down();
     dlss::shut_down();
 }

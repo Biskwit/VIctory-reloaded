@@ -12443,6 +12443,15 @@ impl Host {
                 ));
                 list.ResourceBarrier(&post);
             }
+            // Deferred frame generation: AMD's configure and prepare for
+            // this frame, on this list, right before its present.
+            if p.framegen
+                && let Some(copies) = crate::framegen::present_prepare(list, token)
+            {
+                for texture in &copies {
+                    copy.keep(texture);
+                }
+            }
             copy.close();
             // Published, the sender also presents behind it (not with frame
             // generation, which presents through its own swap chain).
@@ -12636,8 +12645,38 @@ fn display_rate(hwnd: HWND) {
                 result = result.0,
                 "display rate for the run (VICTORY_DISPLAY_HZ; 0 is done)"
             );
+            if result.0 == 0 && from != hz {
+                *SWITCHED_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()) = Some(info.szDevice.to_vec());
+                // A panic puts the desktop's mode back before the previous hook runs.
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |panic| {
+                    restore_display("panic");
+                    previous(panic);
+                }));
+            }
         }
     });
+}
+
+/// The monitor `display_rate` switched (its device name), until restored.
+static SWITCHED_DISPLAY: Mutex<Option<Vec<u16>>> = Mutex::new(None);
+
+/// Puts back the desktop's own display mode if `VICTORY_DISPLAY_HZ` switched
+/// it (once; later calls do nothing). Windows also drops the switched mode
+/// some seconds after the process is gone, which is too late for whatever
+/// starts next. Called at the title's end, when its window is destroyed, at
+/// shutdown and on a panic.
+pub fn restore_display(why: &str) {
+    use windows::Win32::Graphics::Gdi::{CDS_TYPE, ChangeDisplaySettingsExW};
+    let Some(device) = SWITCHED_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    // SAFETY: the NUL-terminated device name GetMonitorInfoW gave; no mode
+    // (the registry's) and no flags put back the desktop's own.
+    let result = unsafe {
+        ChangeDisplaySettingsExW(windows::core::PCWSTR(device.as_ptr()), None, None, CDS_TYPE(0), None)
+    };
+    tracing::info!(why, result = result.0, "display mode put back (VICTORY_DISPLAY_HZ; 0 is done)");
 }
 
 /// A visible top-level window of this process: the one the title made, if

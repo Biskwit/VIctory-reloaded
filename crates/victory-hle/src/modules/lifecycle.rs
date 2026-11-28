@@ -550,6 +550,7 @@ extern "system" fn window_proc(
     if message == wm::WM_NCDESTROY {
         WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).remove(&(hwnd as usize));
         if title_window {
+            victory_gpu::restore_display("the title's window was destroyed");
             super::gameinput::mouse::detach(hwnd);
             // a window the title makes again is its window then
             TITLE_WINDOW.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -616,6 +617,10 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     if ENDING.swap(true, Ordering::SeqCst) {
         return;
     }
+    // The desktop's display mode first: the suspend and the pipeline save
+    // can take seconds, and a kill would leave the switched mode behind.
+    #[cfg(windows)]
+    victory_gpu::restore_display(why);
     let constrain = constrained().clone();
     let suspend = routines().clone();
     tracing::info!(
