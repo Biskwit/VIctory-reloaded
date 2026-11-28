@@ -2769,6 +2769,8 @@ struct CardTake {
     looked: Vec<crate::picked::Range>,
     sent_as: u64,
     dirty: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+    /// For each of `dirty`, its masks ([`crate::masked`]).
+    masked: Vec<Vec<crate::masked::Masked>>,
     whole: Vec<std::sync::Arc<crate::shadow::Shadow>>,
     own: Option<send::Own>,
 }
@@ -4015,11 +4017,13 @@ fn late_line(frames: f64) {
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
-                "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN): {:.1} MB in {:.0} runs, {:.0} words in scatters; {:.2} ms \
-                 taking them out of the CPU sides",
+                "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN): {:.1} MB in {:.0} runs, {:.0} words in scatters, {:.0} \
+                 masked pages with {:.0} words; {:.2} ms taking them out of the CPU sides",
                 t[0] / (1 << 20) as f64,
                 t[1],
                 t[2],
+                t[4],
+                t[5],
                 t[3] / 1000.0,
             );
         }
@@ -4049,11 +4053,12 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, masked, words] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
-            bytes / (1 << 20) as f64
+             {runs:.0} changed runs, {:.2} MB; {masked:.0} masks of 4 KiB with {words:.0} words (VICTORY_UNDER_MASKS={})",
+            bytes / (1 << 20) as f64,
+            u8::from(crate::masked::on())
         );
     }
 }
@@ -4704,7 +4709,7 @@ impl Host {
             None => 0,
         };
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
-        let mut dirty = crate::shadow::card_dirty(sent_as);
+        let (mut dirty, mut masked) = crate::shadow::card_dirty(sent_as);
         gathering.end();
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
@@ -4722,18 +4727,20 @@ impl Host {
                 whole.push(shadow.clone());
                 if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
                     dirty.push((shadow.clone(), Vec::new()));
+                    masked.push(Vec::new());
                 }
             }
         }
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
-        let own = if send::own() { send::take(self, &dirty) } else { None };
+        let own = if send::own() { send::take(self, &dirty, &masked) } else { None };
         taking.end();
         Some(CardTake {
             declared,
             looked,
             sent_as,
             dirty,
+            masked,
             whole,
             own,
         })
@@ -4749,6 +4756,7 @@ impl Host {
             looked,
             sent_as,
             dirty,
+            masked,
             whole,
             own,
         } = take;
@@ -4780,7 +4788,7 @@ impl Host {
                     if let Some(own) = &own {
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)));
                     }
-                    for (shadow, ranges) in &dirty {
+                    for ((shadow, ranges), pages) in dirty.iter().zip(&masked) {
                         let Some((staging, before, _)) = shadow.card_sides() else {
                             continue;
                         };
@@ -4789,9 +4797,10 @@ impl Host {
                                 list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             }
                         }
-                        let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
+                        let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>()
+                            + pages.iter().map(|p| 4 * u64::from(p.count())).sum::<u64>();
                         crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
-                        crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        crate::shadow::CARD_STATS[1].fetch_add((ranges.len() + pages.len()) as u64, Ordering::Relaxed);
                         #[cfg(feature = "diagnostics")]
                         traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
                         if own.is_none() && before.is_some() && !ranges.is_empty() {
@@ -4812,7 +4821,7 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for (shadow, ranges) in &dirty {
+                    for ((shadow, ranges), pages) in dirty.iter().zip(&masked) {
                         let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
                         };
@@ -4831,7 +4840,9 @@ impl Host {
                             // (In order: the next of the same piece, of the
                             // tens of thousands there are, says nothing.)
                             let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
-                            for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
+                            // (A masked page's pieces as those of a range.)
+                            let pages = pages.iter().map(|p| (p.at, p.at + 4 * p.words as usize));
+                            for run in ranges.iter().copied().chain(pages).map(|(a, b)| shadow.card_run(a, b)) {
                                 match runs.last_mut() {
                                     Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => last.to = last.to.max(run.to),
                                     _ => runs.push(run),

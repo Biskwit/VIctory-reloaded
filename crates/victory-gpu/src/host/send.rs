@@ -74,6 +74,32 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// Masked pages ([`crate::masked`]): each [`MASKED`] bytes, its copy's offset
+/// and words, then a bit for each word (32 words a dword), then the words.
+/// A thread for each word; a word whose bit is set is stored, no other.
+const MASKED_STORE: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)"
+cbuffer Part : register(b0) { uint at; uint pages; };
+ByteAddressBuffer masked : register(t0);
+RWByteAddressBuffer card : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
+    uint page = group.x / 16u;
+    uint word = (group.x % 16u) * 64u + thread.x;
+    if (page >= pages) return;
+    uint base = at + page * 4240u;
+    uint2 head = masked.Load2(base);
+    if (word >= head.y) return;
+    uint bits = masked.Load(base + 16u + (word / 32u) * 4u);
+    if (((bits >> (word % 32u)) & 1u) == 0u) return;
+    card.Store(head.x + word * 4u, masked.Load(base + 144u + word * 4u));
+}
+"#;
+
+/// The bytes of a masked page in a submission's memory (`MASKED_STORE`).
+const MASKED: u64 = 16 + 128 + 4096;
+
 struct Pass {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -81,28 +107,35 @@ struct Pass {
 
 fn pass(host: &Host) -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
-    PASS.get_or_init(|| {
-        let code = compile(SCATTER, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
-        // SAFETY: the code lives through the calls; the root signature is
-        // inside it.
-        unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).ok()?;
-            let pso: ID3D12PipelineState = host
-                .device
-                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                    pRootSignature: std::mem::transmute_copy(&root),
-                    CS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: code.as_ptr().cast(),
-                        BytecodeLength: code.len(),
-                    },
-                    ..Default::default()
-                })
-                .ok()?;
-            name(&pso, || "victory: changed words sent to the card".into());
-            Some(Pass { root, pso })
-        }
-    })
-    .as_ref()
+    PASS.get_or_init(|| made(host, SCATTER, "victory: changed words sent to the card")).as_ref()
+}
+
+/// The masked pages' pass.
+fn masked_pass(host: &Host) -> Option<&'static Pass> {
+    static PASS: OnceLock<Option<Pass>> = OnceLock::new();
+    PASS.get_or_init(|| made(host, MASKED_STORE, "victory: the title's words of masked pages sent to the card")).as_ref()
+}
+
+fn made(host: &Host, source: &str, called: &'static str) -> Option<Pass> {
+    let code = compile(source, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
+    // SAFETY: the code lives through the calls; the root signature is
+    // inside it.
+    unsafe {
+        let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).ok()?;
+        let pso: ID3D12PipelineState = host
+            .device
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            })
+            .ok()?;
+        name(&pso, || called.into());
+        Some(Pass { root, pso })
+    }
 }
 
 /// Memory a submission's sends come from, mapped.
@@ -170,14 +203,17 @@ pub(super) fn give_back(memory: Memory) {
 }
 
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,
-/// microseconds of taking them out of the CPU sides.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// microseconds of taking them out of the CPU sides; masked pages and their
+/// words stored.
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// One copy's sends: ranges copied (offset in the copy, in the memory,
-/// bytes), and its pairs (where in the memory, how many).
+/// bytes), its pairs (where in the memory, how many), and its masked pages
+/// (where in the memory, how many).
 struct Copy {
     runs: Vec<(usize, u64, usize)>,
     pairs: (u64, u32),
+    masked: (u64, u32),
 }
 
 /// Where a submission's bytes are taken to.
@@ -189,10 +225,18 @@ pub(super) struct Own {
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
-/// Takes what `dirty` sends up out of the CPU sides.
-pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
+/// Takes what `dirty` sends up out of the CPU sides, and the words of the
+/// masked pages of each (`masked`, a list for each of `dirty`).
+pub(super) fn take(
+    host: &Host,
+    dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
+    masked: &[Vec<crate::masked::Masked>],
+) -> Option<Own> {
     let began = std::time::Instant::now();
     pass(host)?;
+    if masked.iter().any(|m| !m.is_empty()) {
+        masked_pass(host)?;
+    }
     // Runs of whole words of the copy: only those are pairs. (A byte beside
     // them in a word may be the card's.)
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
@@ -205,8 +249,12 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             at += ((b - a) as u64).next_multiple_of(16);
         }
         let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-        copies.push(Copy { runs, pairs: (at, words as u32) });
+        copies.push(Copy { runs, pairs: (at, words as u32), masked: (0, 0) });
         at += (words as u64 * 8).next_multiple_of(16);
+    }
+    for (copy, pages) in copies.iter_mut().zip(masked) {
+        copy.masked = (at, pages.len() as u32);
+        at += pages.len() as u64 * MASKED;
     }
     if at == 0 {
         return None;
@@ -225,6 +273,23 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
                 work.push((from, ranges, to));
                 to += words * 8;
             }
+        }
+    }
+    // The masked pages: their heads and masks here, their words with the
+    // other bytes.
+    for (((shadow, _), copy), pages) in dirty.iter().zip(&copies).zip(masked) {
+        let from = shadow.card_data() as usize;
+        for (i, page) in pages.iter().enumerate() {
+            let to = memory.data + (copy.masked.0 + i as u64 * MASKED) as usize;
+            // SAFETY: inside the memory, which has `MASKED` bytes for each
+            // page.
+            unsafe {
+                (to as *mut [u32; 4]).write_unaligned([page.at as u32, page.words, 0, 0]);
+                ((to + 16) as *mut [u32; crate::masked::WORDS / 32]).write_unaligned(page.mask);
+            }
+            // (The page's words lie in the copy's CPU side, which the thread
+            // that asked alone writes there.)
+            moves.push((from + page.at, to + 144, 4 * page.words as usize));
         }
     }
     let one = |i: usize| {
@@ -248,6 +313,8 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
+    STATS[4].fetch_add(copies.iter().map(|c| u64::from(c.masked.1)).sum(), Ordering::Relaxed);
+    STATS[5].fetch_add(masked.iter().flatten().map(|p| u64::from(p.count())).sum(), Ordering::Relaxed);
     crate::shadow::copy_all(moves);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies })
@@ -277,7 +344,7 @@ impl Own {
                 unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, &self.memory.buffer, from, n as u64) };
             }
             let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
-            if copy.pairs.1 > 0 {
+            if copy.pairs.1 > 0 || copy.masked.1 > 0 {
                 if let Some(was) = state {
                     first.push(transition(&shadow.buffer, was, write));
                 }
@@ -286,7 +353,7 @@ impl Own {
             let hashed = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             if let Some(was) = state
                 && hashed
-                && (!copy.runs.is_empty() || copy.pairs.1 > 0)
+                && (!copy.runs.is_empty() || copy.pairs.1 > 0 || copy.masked.1 > 0)
             {
                 last.push(transition(&shadow.buffer, was, read));
             }
@@ -312,6 +379,29 @@ impl Own {
                         let constants = [at as u32 + done * 8, n];
                         list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
                         list.Dispatch(n.div_ceil(64), 1, 1);
+                        done += n;
+                    }
+                }
+            }
+            // The masked pages, after the pairs: other words of the same
+            // copies, so no barrier between.
+            if let Some(pass) = masked_pass(host)
+                && self.copies.iter().any(|c| c.masked.1 > 0)
+            {
+                list.SetComputeRootSignature(&pass.root);
+                list.SetPipelineState(&pass.pso);
+                list.SetComputeRootShaderResourceView(1, self.memory.buffer.GetGPUVirtualAddress());
+                for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.masked.1 > 0) {
+                    list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
+                    // Sixteen groups a page.
+                    const MOST: u32 = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION / 16;
+                    let (at, pages) = copy.masked;
+                    let mut done = 0;
+                    while done < pages {
+                        let n = (pages - done).min(MOST);
+                        let constants = [(at + u64::from(done) * MASKED) as u32, n];
+                        list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                        list.Dispatch(16 * n, 1, 1);
                         done += n;
                     }
                 }

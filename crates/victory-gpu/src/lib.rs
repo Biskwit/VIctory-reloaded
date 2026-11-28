@@ -49,6 +49,8 @@ mod inplace;
 mod land;
 pub mod list;
 #[cfg(windows)]
+mod masked;
+#[cfg(windows)]
 mod live;
 pub mod object;
 #[cfg(windows)]

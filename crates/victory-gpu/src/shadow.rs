@@ -127,6 +127,10 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<SentRuns>,
+    /// Pages of the title's words under flights' writes, by mask
+    /// ([`crate::masked`]): not taken yet, and sent. Locked inside `dirty`'s
+    /// lock, after `sent`.
+    masks: Mutex<crate::masked::Masks>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
     /// The copy itself, once it is one of [`CARDED`]: what goes into
@@ -672,10 +676,14 @@ impl SentRuns {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
-    let mut out = Vec::new();
+///
+/// The masks of the copies' pages under flights' writes ([`crate::masked`])
+/// are taken with them, numbered as they are, one list for each copy of the
+/// ranges (a copy with masks alone is there with no range).
+pub(crate) fn card_dirty(sent_as: u64) -> (Vec<(Arc<Shadow>, Vec<(usize, usize)>)>, Vec<Vec<crate::masked::Masked>>) {
+    let (mut out, mut masked) = (Vec::new(), Vec::new());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    let take = |shadow: &Shadow| -> Vec<(usize, usize)> {
+    let take = |shadow: &Shadow| -> (Vec<(usize, usize)>, Vec<crate::masked::Masked>) {
         shadow
             .card
             .as_ref()
@@ -688,38 +696,40 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
                     sent.forget(fetched);
                     sent.note_joined(sent_as, ranges.clone());
                 }
-                ranges
+                let pages = c.masks.lock().unwrap_or_else(|e| e.into_inner()).take(sent_as, relay(), fetched);
+                (ranges, pages)
             })
             .unwrap_or_default()
+    };
+    let mut put = |shadow: Arc<Shadow>| {
+        let (ranges, pages) = take(&shadow);
+        if !ranges.is_empty() || !pages.is_empty() {
+            out.push((shadow, ranges));
+            masked.push(pages);
+        }
     };
     // (Those set from here on go to the next call.)
     let touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
     if card_near() {
         for shadow in touched.iter().filter_map(std::sync::Weak::upgrade) {
-            let ranges = take(&shadow);
-            if !ranges.is_empty() {
-                out.push((shadow, ranges));
-            }
+            put(shadow);
         }
         // The copies that went, let go of now and then.
         static CALLS: AtomicU64 = AtomicU64::new(0);
         if CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(64) {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.2.strong_count() > 0);
         }
-        return out;
+        return (out, masked);
     }
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     carded.retain(|(_, _, weak)| {
         let Some(shadow) = weak.upgrade() else {
             return false;
         };
-        let ranges = take(&shadow);
-        if !ranges.is_empty() {
-            out.push((shadow, ranges));
-        }
+        put(shadow);
         true
     });
-    out
+    (out, masked)
 }
 
 /// Diagnostics (`crate::host::upcheck`, nothing in the air): copies whose
@@ -2112,8 +2122,9 @@ fn back_piece(
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
-/// compared, changed runs put in, and their bytes.
-static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// compared, changed runs put in, and their bytes; pages put in by mask, and
+/// their words.
+static MERGED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Why [`Shadow::merge_under_writes`] last left the caller to wait.
 static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2135,8 +2146,8 @@ pub(crate) fn stale_why() -> &'static str {
 }
 
 /// [`MERGED`], taken.
-pub(crate) fn merged_stats() -> [u64; 3] {
-    [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
+pub(crate) fn merged_stats() -> [u64; 5] {
+    [0, 1, 2, 3, 4].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
 /// The runs of bytes where `now` differs from `was` (of one length), as
@@ -2877,13 +2888,13 @@ mod touched_tests {
         };
         one.card_changed(16, 32);
         one.card_changed(32, 64);
-        assert_eq!(ours(card_dirty(1)), [(one.id, vec![(16, 64)])]);
-        assert_eq!(ours(card_dirty(2)), []);
+        assert_eq!(ours(card_dirty(1).0), [(one.id, vec![(16, 64)])]);
+        assert_eq!(ours(card_dirty(2).0), []);
         two.card_changed(0, 8);
         one.card_changed(100, 200);
         let mut both = vec![(one.id, vec![(100, 200)]), (two.id, vec![(0, 8)])];
         both.sort();
-        assert_eq!(ours(card_dirty(3)), both);
+        assert_eq!(ours(card_dirty(3).0), both);
     }
 }
 
@@ -3780,9 +3791,10 @@ impl Shadow {
                 return true;
             }
             // A page's part in the range, compared and put in: the runs it
-            // changed; none for a page that is not there (left as it is, and
-            // looked at again next time) or that had too many.
-            type Done = Option<Vec<(usize, usize)>>;
+            // changed, or its mask ([`crate::masked`]); none for a page that
+            // is not there (left as it is, and looked at again next time) or
+            // that had too many.
+            type Done = Option<(Vec<(usize, usize)>, Vec<crate::masked::Masked>)>;
             let left = std::sync::atomic::AtomicI64::new(*runs_left as i64);
             let over = std::sync::atomic::AtomicBool::new(false);
             let done: Vec<Mutex<Done>> = stale.iter().map(|_| Mutex::new(None)).collect();
@@ -3810,17 +3822,22 @@ impl Shadow {
             }
             *runs_left = left.into_inner().max(0) as usize;
             let mut taken = Vec::new();
+            let mut masked = Vec::new();
             for (i, runs) in done.into_iter().enumerate() {
-                let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
+                let Some((runs, masks)) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
                     continue;
                 };
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
                 MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                 MERGED[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
+                MERGED[3].fetch_add(masks.len() as u64, Ordering::Relaxed);
+                MERGED[4].fetch_add(masks.iter().map(|m| u64::from(m.count())).sum(), Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
                 if crate::land::under_who::on() {
-                    crate::land::under_who::merged((start, end - start), lo, runs.len());
+                    let words: u32 = masks.iter().map(|m| m.count()).sum();
+                    crate::land::under_who::merged((start, end - start), lo, runs.len() + words as usize);
                 }
+                masked.extend(masks);
                 self.card_changed_runs(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
@@ -3829,6 +3846,7 @@ impl Shadow {
                     taken.push(stale[i]);
                 }
             }
+            self.card_masked(masked);
             drop(before);
             drop(merging);
             {
@@ -3849,8 +3867,11 @@ impl Shadow {
 
     /// Of [`Shadow::merge_under_writes`]: title memory `[lo, lo + n)`, in one
     /// page, compared with the reference, which begins at `held`, and put in.
-    /// The runs that changed, none if it cannot be read, and an error if
-    /// there were more to copy one by one than `left`.
+    /// The runs that changed, or of a copy in the card's memory with
+    /// [`crate::masked::on`] the masks of its words that did, one for each
+    /// 4 KiB of it with some (and no run);
+    /// none if it cannot be read, and an error if there were more to copy one
+    /// by one than `left`.
     ///
     /// # Safety
     /// The reference holds the copy's length, and nothing else writes these
@@ -3861,7 +3882,7 @@ impl Shadow {
         n: usize,
         held: *mut u8,
         left: &std::sync::atomic::AtomicI64,
-    ) -> Result<Option<Vec<(usize, usize)>>, ()> {
+    ) -> Result<Option<(Vec<(usize, usize)>, Vec<crate::masked::Masked>)>, ()> {
         thread_local! {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
@@ -3875,6 +3896,23 @@ impl Shadow {
             let at = lo - self.start as usize;
             // SAFETY: the caller's.
             let held = unsafe { std::slice::from_raw_parts_mut(held.add(at), n) };
+            if self.card.is_some() && crate::host::words_under() && crate::host::relay() && crate::masked::on() && at.is_multiple_of(4) && n.is_multiple_of(4) {
+                // The words that differ, by mask, 4 KiB at a time: the CPU
+                // side takes the title's (where they are the same it holds
+                // them already).
+                let was = crate::host::upcheck::on().then(|| held.to_vec());
+                let mut masks = Vec::new();
+                for (k, (title, held)) in title.chunks(crate::masked::WORDS * 4).zip(held.chunks_mut(crate::masked::WORDS * 4)).enumerate() {
+                    if let Some(mask) = crate::masked::Masked::of(at + k * crate::masked::WORDS * 4, title, held) {
+                        held.copy_from_slice(title);
+                        masks.push(mask);
+                    }
+                }
+                if let Some(was) = was.filter(|_| !masks.is_empty()) {
+                    crate::host::upcheck::note(self.id, at, &was, held);
+                }
+                return Ok(Some((Vec::new(), masks)));
+            }
             if self.card.is_some() {
                 // Whole words go up as pairs, all of them in one
                 // dispatch: only what is a copy of its own counts.
@@ -3891,7 +3929,7 @@ impl Shadow {
                 if let Some(was) = was {
                     crate::host::upcheck::note(self.id, at, &was, held);
                 }
-                return Ok(Some(runs));
+                return Ok(Some((runs, Vec::new())));
             }
             let runs = changed_runs(title, held);
             for &(r, m) in &runs {
@@ -3901,7 +3939,7 @@ impl Shadow {
                 unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                 held[r..r + m].copy_from_slice(&title[r..r + m]);
             }
-            Ok(Some(runs))
+            Ok(Some((runs, Vec::new())))
         })
     }
 
@@ -4344,6 +4382,26 @@ impl Shadow {
     }
 
     /// [`Shadow::card_changed`] of each of `runs`.
+    /// Pages of the title's words under flights' writes, by mask, to go to
+    /// the card's side with its changed runs ([`crate::masked`]).
+    fn card_masked(&self, pages: Vec<crate::masked::Masked>) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        if pages.is_empty() {
+            return;
+        }
+        let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        card.masks.lock().unwrap_or_else(|e| e.into_inner()).put(pages);
+        // (Under the lock: what takes the list sees them or finds it set.)
+        if !card.touched.swap(true, Ordering::AcqRel)
+            && let Some(me) = card.me.get()
+        {
+            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        }
+        drop(dirty);
+    }
+
     fn card_changed_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
         let Some(card) = &self.card else {
             return;
@@ -4625,6 +4683,7 @@ impl Shadow {
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
             let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < at + n && b > at).collect();
             sent.near(fetched_after, at, at + n, &mut skip);
+            card.masks.lock().unwrap_or_else(|e| e.into_inner()).near(fetched_after, at, at + n, &mut skip);
             skip
         };
         title.clear();
@@ -4660,6 +4719,7 @@ impl Shadow {
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                masks: Mutex::default(),
                 touched: Default::default(),
                 me: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
@@ -4721,6 +4781,8 @@ impl Shadow {
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
             let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
             sent.near(fetched_after, from, to, &mut skip);
+            // (And the words of masks, which are the title's.)
+            card.masks.lock().unwrap_or_else(|e| e.into_inner()).near(fetched_after, from, to, &mut skip);
             skip
         };
         let mut put = 0;
@@ -4817,6 +4879,7 @@ mod land_tests {
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
+            masks: Mutex::default(),
                 touched: Default::default(),
             me: Default::default(),
             size: len as u64,
@@ -5233,6 +5296,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    masks: Mutex::default(),
                 touched: Default::default(),
                     me: Default::default(),
                     size,
@@ -5462,6 +5526,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
+        masks: Mutex::default(),
         touched: Default::default(),
         me: Default::default(),
         size: len,
@@ -5552,6 +5617,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                masks: Mutex::default(),
                 touched: Default::default(),
                 me: Default::default(),
                 size: len,

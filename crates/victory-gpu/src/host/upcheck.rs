@@ -834,6 +834,55 @@ mod tests {
         assert_eq!((undone, found), (true, 16));
     }
 
+    /// A page the title writes while a flight's shader writes other words of
+    /// it on the card: its words go up by mask ([`crate::masked`]), behind
+    /// the flight. The shader's words stay on the card and land in title
+    /// memory; the title's go up and stay, whether the landing's fetch ran
+    /// before the masked store or after it.
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    fn a_masked_page_keeps_the_flights_words_and_the_titles() {
+        let Some(host) = host() else {
+            return;
+        };
+        assert!(crate::masked::on(), "VICTORY_UNDER_MASKS=0 is set");
+        let (title, start, shadow) = title(0x5555, false);
+        let slow = Slow::new(host);
+        let (mut masked, mut lists) = (0, Vec::new());
+        const ROUNDS: usize = 6;
+        for round in 0..ROUNDS {
+            // A block of 64 KiB, merged as one part of 16 masks' room.
+            let page = (round + 3) << 16;
+            let shader: Vec<u8> = (0..256).map(|i| (i + round + 1) as u8 | 1).collect();
+            let a = host.new_list().unwrap();
+            shadow.refresh(&a, start as u64, LEN as u64);
+            shadow.gpu_writes(&a, start as u64, LEN as u64);
+            slow.record(&a, 100);
+            write(host, &a, &shadow, page, &shader);
+            a.close();
+            host.execute_own(&a);
+            // The title writes other words of the page meanwhile, and a
+            // submission reads them.
+            title[page + 400..page + 480].fill(0x3c + round as u8);
+            title[page + 9000..page + 9100].fill(0x5a + round as u8);
+            let b = host.new_list().unwrap();
+            shadow.refresh(&b, (start + page) as u64, 1 << 16);
+            b.close();
+            host.execute_own(&b);
+            masked += crate::shadow::merged_stats()[3];
+            settle_now(WHY_SYNC);
+            let holds = card(host, &shadow);
+            assert_eq!(holds[page..page + 256], shader[..], "round {round}: the shader's words stay on the card");
+            assert!(holds[page + 400..page + 480].iter().all(|&b| b == 0x3c + round as u8), "round {round}: the title's went up");
+            assert_eq!(title[page..page + 256], shader[..], "round {round}: the shader's words landed");
+            assert!(title[page + 400..page + 480].iter().all(|&b| b == 0x3c + round as u8), "round {round}: the title's stayed");
+            assert!(holds[page + 9000..page + 9100].iter().all(|&b| b == 0x5a + round as u8), "round {round}: in another 4 KiB too");
+            assert!(title[page + 9000..page + 9100].iter().all(|&b| b == 0x5a + round as u8), "round {round}: there too");
+            lists.extend([a, b]);
+        }
+        assert_eq!(masked, 2 * ROUNDS as u64, "two masks each round: the 4 KiB written of the block's sixteen");
+    }
+
     /// A shader that writes through views it picks: its buffer is found when
     /// it comes to it in turn, and what it writes from then on is landed.
     #[test]
