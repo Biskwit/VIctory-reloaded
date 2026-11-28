@@ -2891,6 +2891,8 @@ struct Handoff {
     slots: Option<card_steps::Slots>,
     /// Its lists' preludes, recorded by the sender ([`prelude_off_line`]).
     preludes: Vec<PreludeWork>,
+    /// The swap chain the sender presents behind it ([`present_off_line`]).
+    present: Option<IDXGISwapChain3>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; a handoff is touched by the
@@ -2936,6 +2938,63 @@ fn wait_sent() {
     let waiting = std::time::Instant::now();
     let _waiting = crate::timeline::span("waiting for published submissions to be sent");
     while sends.1 != sends.2 {
+        sends = SENDS_MOVED.wait(sends).unwrap_or_else(|e| e.into_inner());
+    }
+    SEND_STATS[3].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Whether the present's copy into the back buffer is published, and
+/// [`sender`] makes the swap chain's Present behind it (on by default with
+/// [`split_send`] and presents sent ahead, [`late_free_present`];
+/// `VICTORY_PRESENT_OFF_LINE=0`: the present's thread sends the copy and
+/// presents, as before).
+///
+/// Why: a submission that thread sends itself goes behind every one
+/// published, so it waited for the sender ([`wait_sent`]): at the present,
+/// 0.9 times and 1.42 ms a frame in the Series S cell (noop-mc3-tl), the
+/// only such wait there; 1.0 to 1.35 ms with the preludes recorded by the
+/// sender (noop-prel-ab1, noop-prel-ab2).
+///
+/// Who presents: the sender, behind the copy's lists and the signal of its
+/// fence value, so the Present is behind the copy on the queue as before.
+/// - The swap chain is called by one thread at a time. The sender calls
+///   only Present. Every other call (`GetCurrentBackBufferIndex`,
+///   `GetBuffer`, `ResizeBuffers`; the overlay and the panel make none, and
+///   a window resized by the title keeps its buffers) is made under the
+///   presenter's lock by a thread that first waited until every present
+///   published was made ([`wait_presented`]).
+/// - The back buffer a copy is recorded into is the current one, which
+///   moves at a Present: that same wait.
+/// - At most one present is published and not made: the next one waits for
+///   it. That and the Present itself, which blocks the sender at DXGI's
+///   frame latency as it blocked the present's thread, hold that thread
+///   back: it runs ahead at most one present past where the Present held it
+///   before. The flights in the air are held to [`late_most`] as before.
+/// - The window: the title's, made and pumped by the title's thread that
+///   called `CreateWindowExW` (victory-hle's `lifecycle`), or ours, made and
+///   pumped by "victory-window", which waits for nothing. The swap chain is
+///   windowed (DXGI's Alt+Enter off; full screen is the title's window
+///   restyled by its own thread), so a Present makes no mode change. The
+///   title's threads waited for the present's thread at presents and for
+///   the sender at fences of published flights before this as well.
+fn present_off_line() -> bool {
+    crate::toggled!("VICTORY_PRESENT_OFF_LINE") && split_send()
+}
+
+/// Presents [`sender`] made ([`present_off_line`]).
+static PRESENTS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Waits until [`sender`] has made `n` presents ([`present_off_line`]).
+fn wait_presented(n: u64) {
+    if PRESENTS_MADE.load(Ordering::Acquire) >= n {
+        return;
+    }
+    let waiting = std::time::Instant::now();
+    let _waiting = crate::timeline::span("waiting for the last present to be made");
+    // The sender counts a present before it counts its submission sent,
+    // which it does under this lock.
+    let mut sends = SENDS.lock().unwrap_or_else(|e| e.into_inner());
+    while PRESENTS_MADE.load(Ordering::Acquire) < n {
         sends = SENDS_MOVED.wait(sends).unwrap_or_else(|e| e.into_inner());
     }
     SEND_STATS[3].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -5837,8 +5896,15 @@ impl Host {
     /// submission whose number comes back has finished ([`FINISHED`]); 0 if
     /// it ran and was waited for after all.
     fn execute_own(&self, list: &HostList) -> u64 {
+        self.own_flight(list, false, None)
+    }
+
+    /// [`Host::execute_own`]; `published`: as a submission of the title's
+    /// with [`split_send`], the sender sends it, and presents `present`
+    /// behind it ([`present_off_line`]).
+    fn own_flight(&self, list: &HostList, published: bool, present: Option<&IDXGISwapChain3>) -> u64 {
         late_threads();
-        let Some((submitted, sent)) = self.submit(&[list], &[], true, false) else {
+        let Some((submitted, sent)) = self.submit(&[list], &[], true, published) else {
             return 0;
         };
         let number = sent.number;
@@ -5865,6 +5931,11 @@ impl Host {
                 texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+        }
+        // Published: in the air from here on; the sender sends it.
+        if let Some(mut handoff) = sent.handoff {
+            handoff.present = present.cloned();
+            publish(handoff);
         }
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         LINE_MOVED.notify_one();
@@ -5969,6 +6040,14 @@ impl Host {
         SENT_FENCE.store(h.fence, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         split.part(5);
+        // The present behind its copy.
+        if let Some(chain) = h.present.take() {
+            stage.next("sending: the host's Present");
+            // SAFETY: our swap chain; no other thread calls it until this
+            // present is counted made ([`present_off_line`]).
+            let _ = unsafe { chain.Present(0, DXGI_PRESENT(0)) };
+            PRESENTS_MADE.fetch_add(1, Ordering::Release);
+        }
         SEND_STATS[0].fetch_add(1, Ordering::Relaxed);
         SEND_STATS[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
@@ -6452,6 +6531,7 @@ impl Host {
                 heaps: heaps_synced,
                 slots: own.as_mut().and_then(card_steps::Taken::slots),
                 preludes,
+                present: None,
             };
             let sent = Sent {
                 number: this_submission,
@@ -9757,6 +9837,9 @@ struct Presenter {
     /// present in the air, and the submission it last flew as (it is used
     /// again once that one has finished).
     ahead: Vec<(HostList, u64)>,
+    /// Presents published, which the sender makes in order
+    /// ([`present_off_line`]).
+    published: u64,
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
@@ -10226,6 +10309,9 @@ impl Host {
         }
         let state_u32 = state;
         let p = presenter.as_mut()?;
+        // The swap chain is this thread's from here: the presents published
+        // were made, and the back buffer moved past them.
+        wait_presented(p.published);
         if planes.is_some() && p.composer.is_none() {
             match crate::compose::Composer::new(self, format) {
                 Ok(c) => p.composer = Some(c),
@@ -10445,9 +10531,16 @@ impl Host {
                 list.ResourceBarrier(&post);
             }
             copy.close();
+            // Published, the sender also presents behind it.
+            let handed = slot.is_some() && present_off_line();
             let flown = match slot {
                 Some(i) => {
-                    let flown = self.execute_own(copy);
+                    let flown = if handed {
+                        self.own_flight(copy, true, Some(&p.swap_chain))
+                    } else {
+                        self.execute_own(copy)
+                    };
+                    p.published += u64::from(handed);
                     p.ahead[i].1 = flown;
                     flown
                 }
@@ -10474,7 +10567,9 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if !handed {
+                let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -10532,6 +10627,7 @@ impl Host {
                 format,
                 copy,
                 ahead: Vec::new(),
+                published: 0,
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
