@@ -192,6 +192,14 @@ nothing from the game goes in the tree.*
       launches 36.9 -> 36.4 and 38.1 -> 37.6 ms a frame; a check compared
       about 1.7 million skipped refreshes with title memory and none
       differed;
+    - a submission's steps are walked once for what to ask the write watch,
+      what to refresh and what lies under flights' writes, and the lists'
+      steps take that walk's verdicts instead of looking at the stamps again
+      (`VICTORY_ONE_WALK=0`, `VICTORY_STALE_WALKED=0`: as before). In-run
+      over 2 launches each: -0.55 and -0.60 ms a frame for the one walk,
+      -0.40 and -0.35 more for the copies under flights' writes. Its gate
+      ran at 35.8 ms (27.9 fps) over 4 launches and 34.0-35.1 ms a minute
+      over 12 minutes;
     - the write watch's journal keeps its pages in 4 MiB pieces instead of
       one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
       of 111; the submitting thread about 1 ms less a frame;
