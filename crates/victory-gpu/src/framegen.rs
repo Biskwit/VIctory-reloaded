@@ -222,6 +222,42 @@ pub fn requested() -> bool {
         && *ON.get_or_init(|| std::env::var_os("VICTORY_FRAMEGEN").is_some_and(|v| v == "1"))
 }
 
+/// Trial switches, read once:
+/// - `VICTORY_FRAMEGEN_FLAGS=<n>`: AMD's debug flags (1: a green bar on the
+///   left edge of each generated frame; 16: pacing lines);
+/// - `VICTORY_FRAMEGEN_ONLY_GENERATED=1`: present only the generated frames;
+/// - `VICTORY_FRAMEGEN_VSYNC=1`: AMD presents both frames on the vblank,
+///   without tearing (otherwise with tearing allowed);
+/// - `VICTORY_FRAMEGEN_ASYNC=1`: generation on AMD's async compute queue.
+#[derive(Clone, Copy)]
+struct Trial {
+    flags: u32,
+    only_generated: bool,
+    vsync: bool,
+    async_workloads: bool,
+}
+
+fn trial() -> Trial {
+    static TRIAL: OnceLock<Trial> = OnceLock::new();
+    *TRIAL.get_or_init(|| {
+        let on = |name| std::env::var_os(name).is_some_and(|v| v == "1");
+        let trial = Trial {
+            flags: std::env::var("VICTORY_FRAMEGEN_FLAGS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+            only_generated: on("VICTORY_FRAMEGEN_ONLY_GENERATED"),
+            vsync: on("VICTORY_FRAMEGEN_VSYNC"),
+            async_workloads: on("VICTORY_FRAMEGEN_ASYNC"),
+        };
+        tracing::info!(
+            flags = trial.flags,
+            only_generated = trial.only_generated,
+            vsync = trial.vsync,
+            async_workloads = trial.async_workloads,
+            "frame generation: trial switches"
+        );
+        trial
+    })
+}
+
 /// Configure the provider directory before the first swap chain or SDK call.
 pub fn set_dir(dir: &Path) {
     let _ = DIR.set(dir.to_path_buf());
@@ -827,10 +863,10 @@ fn configuration(state: &State, context: *mut c_void, frame: u64, enabled: bool)
         generate_callback: enabled.then_some(generate as Generate),
         generate_context: if enabled { context } else { null_mut() },
         enabled,
-        async_workloads: false,
+        async_workloads: trial().async_workloads,
         hudless: NO_RESOURCE,
-        flags: 0,
-        only_generated: false,
+        flags: trial().flags,
+        only_generated: trial().only_generated,
         rect: [0, 0, state.display[0] as i32, state.display[1] as i32],
         frame,
     }
@@ -967,7 +1003,7 @@ pub(crate) fn present(
     // state lock does not have to be held while the proxy paces presentation.
     drop(state);
     // SAFETY: the caller holds the presenter and has submitted the back buffer.
-    let status = unsafe { swap_chain.Present(0, DXGI_PRESENT(0)) };
+    let status = unsafe { swap_chain.Present(u32::from(trial().vsync), DXGI_PRESENT(0)) };
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(context) = &state.context {
         context.can_generate.store(false, Ordering::Release);
