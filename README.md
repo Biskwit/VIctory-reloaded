@@ -200,6 +200,13 @@ nothing from the game goes in the tree.*
       -0.40 and -0.35 more for the copies under flights' writes. Its gate
       ran at 35.8 ms (27.9 fps) over 4 launches and 34.0-35.1 ms a minute
       over 12 minutes;
+    - the preludes of a submission's lists (the texture transitions and
+      twin copies a list needs before it runs) are recorded by the sending
+      thread; what they hold is still decided by the submitting thread, in
+      submission order (`VICTORY_PRELUDE_OFF_LINE=0`: as before). In-run
+      over 2 launches: 35.7 -> 35.2 and 35.4 -> 34.85 ms a frame, the
+      title's wait at presents 9.1 -> 8.25 and 9.3 -> 7.65. Its gate ran at
+      35.0-36.5 ms a frame and 34.3-35.5 ms a minute over 12 minutes;
     - the write watch's journal keeps its pages in 4 MiB pieces instead of
       one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
       of 111; the submitting thread about 1 ms less a frame;
