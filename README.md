@@ -172,6 +172,9 @@ scripts\play.ps1 -Exe <path of your copy's executable> -Console series-s
 
 `Play-VIctory.cmd -Exe <path>` does the same from a double-click or a Command Prompt.
 
+For titles that use BCPack, set `VICTORY_BCPACK_TABLES` to the path of a local copy of the
+[format tables](docs/asset-policy.md#bcpack) you are authorised to use.
+
 | Option | What it does |
 |---|---|
 | (none) | Full screen, Series X profile, settings picked for your graphics card |

@@ -256,6 +256,10 @@ i9-12900K with an RTX 4090 unless it says otherwise. The
   - where our threads run: one placing for ours (`VICTORY_PLACE_APART`,
     `VICTORY_PLACE_LANE`) and Vice-Tay's `VICTORY_LANE_CORE` and
     `VICTORY_CACHE_CORES`;
+  - a dispatch's compute pipeline not made yet: ours, first in the queue and
+    waited for (`VICTORY_COMPUTE_FIRST`, `VICTORY_COMPUTE_WAIT`), but the
+    head blend-shape map's, a pass over the screen with Vice-Tay's
+    `VICTORY_HEAD_MAP_WAIT`, keeps its queueing at creation and bounded wait;
   - with frame generation (`VICTORY_FRAMEGEN=1`) submissions and presents
     are sent by the line's thread (`VICTORY_SUBMIT_SPLIT` and
     `VICTORY_PRESENT_OFF_LINE` step aside).
