@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="508" viewBox="0 0 920 508" role="img" aria-labelledby="t d">
+<title id="t">What each change took off the frame</title>
+<desc id="d">Series S, prologue cell: the same run switching the change on and off, when it went in</desc>
+<style>text{font-family:system-ui,-apple-system,'Segoe UI',sans-serif}.tick{font-variant-numeric:tabular-nums}</style>
+<rect x="0.5" y="0.5" width="919" height="507" rx="12" fill="#1a1a19" stroke="rgba(255,255,255,0.10)"/>
+<text x="32" y="44" fill="#f0efec" font-size="20" font-weight="600">What each change took off the frame</text>
+<text x="32" y="68" fill="#c3c2b7" font-size="14">Series S, prologue cell: the same run switching the change on and off, when it went in</text>
+<line x1="360" x2="360" y1="94" y2="452" stroke="#383835" stroke-width="1"/>
+<text class="tick" x="360" y="472" text-anchor="middle" fill="#898781" font-size="13">0</text>
+<line x1="494.2857142857143" x2="494.2857142857143" y1="94" y2="452" stroke="#2c2c2a" stroke-width="1"/>
+<text class="tick" x="494.2857142857143" y="472" text-anchor="middle" fill="#898781" font-size="13">1</text>
+<line x1="628.5714285714286" x2="628.5714285714286" y1="94" y2="452" stroke="#2c2c2a" stroke-width="1"/>
+<text class="tick" x="628.5714285714286" y="472" text-anchor="middle" fill="#898781" font-size="13">2</text>
+<line x1="762.8571428571429" x2="762.8571428571429" y1="94" y2="452" stroke="#2c2c2a" stroke-width="1"/>
+<text class="tick" x="762.8571428571429" y="472" text-anchor="middle" fill="#898781" font-size="13">3</text>
+<text x="830" y="492" text-anchor="end" fill="#898781" font-size="12">ms a frame taken off</text>
+<text x="346" y="121" text-anchor="end" fill="#f0efec" font-size="13.5">FSR 4&apos;s scratch kept on the card</text>
+<path d="M360 108H772.2857142857143Q776.2857142857143 108 776.2857142857143 112V120Q776.2857142857143 124 772.2857142857143 124H360Z" fill="#3987e5"/>
+<text class="tick" x="784.2857142857143" y="121" fill="#c3c2b7" font-size="13">3.1</text>
+<text x="346" y="153" text-anchor="end" fill="#f0efec" font-size="13.5">Submissions prepared while the last is sent</text>
+<path d="M360 140H705.1428571428571Q709.1428571428571 140 709.1428571428571 144V152Q709.1428571428571 156 705.1428571428571 156H360Z" fill="#3987e5"/>
+<text class="tick" x="717.1428571428571" y="153" fill="#c3c2b7" font-size="13">2.6</text>
+<text x="346" y="185" text-anchor="end" fill="#f0efec" font-size="13.5">Our threads off the title&apos;s processors</text>
+<path d="M360 172H664.8571428571429Q668.8571428571429 172 668.8571428571429 176V184Q668.8571428571429 188 664.8571428571429 188H360Z" fill="#3987e5"/>
+<text class="tick" x="676.8571428571429" y="185" fill="#c3c2b7" font-size="13">2.3</text>
+<text x="346" y="217" text-anchor="end" fill="#f0efec" font-size="13.5">Card steps written by the sending thread</text>
+<path d="M360 204H584.2857142857142Q588.2857142857142 204 588.2857142857142 208V216Q588.2857142857142 220 584.2857142857142 220H360Z" fill="#3987e5"/>
+<text class="tick" x="596.2857142857142" y="217" fill="#c3c2b7" font-size="13">1.7</text>
+<text x="346" y="249" text-anchor="end" fill="#f0efec" font-size="13.5">Words under shaders’ writes sent by mask</text>
+<path d="M360 236H577.5714285714286Q581.5714285714286 236 581.5714285714286 240V248Q581.5714285714286 252 577.5714285714286 252H360Z" fill="#3987e5"/>
+<text class="tick" x="589.5714285714286" y="249" fill="#c3c2b7" font-size="13">1.6</text>
+<text x="346" y="281" text-anchor="end" fill="#f0efec" font-size="13.5">Only nearby card copies looked at</text>
+<path d="M360 268H470.1428571428571Q474.1428571428571 268 474.1428571428571 272V280Q474.1428571428571 284 470.1428571428571 284H360Z" fill="#3987e5"/>
+<text class="tick" x="482.1428571428571" y="281" fill="#c3c2b7" font-size="13">0.85</text>
+<text x="346" y="313" text-anchor="end" fill="#f0efec" font-size="13.5">The sending thread presents</text>
+<path d="M360 300H463.42857142857144Q467.42857142857144 300 467.42857142857144 304V312Q467.42857142857144 316 463.42857142857144 316H360Z" fill="#3987e5"/>
+<text class="tick" x="475.42857142857144" y="313" fill="#c3c2b7" font-size="13">0.80</text>
+<text x="346" y="345" text-anchor="end" fill="#f0efec" font-size="13.5">A submission&apos;s steps walked once</text>
+<path d="M360 332H433.2142857142857Q437.2142857142857 332 437.2142857142857 336V344Q437.2142857142857 348 433.2142857142857 348H360Z" fill="#3987e5"/>
+<text class="tick" x="445.2142857142857" y="345" fill="#c3c2b7" font-size="13">0.57</text>
+<text x="346" y="377" text-anchor="end" fill="#f0efec" font-size="13.5">Preludes recorded by the sending thread</text>
+<path d="M360 364H426.5Q430.5 364 430.5 368V376Q430.5 380 426.5 380H360Z" fill="#3987e5"/>
+<text class="tick" x="438.5" y="377" fill="#c3c2b7" font-size="13">0.53</text>
+<text x="346" y="409" text-anchor="end" fill="#f0efec" font-size="13.5">Unchanged refreshes skipped by stamp</text>
+<path d="M360 396H423.1428571428571Q427.1428571428571 396 427.1428571428571 400V408Q427.1428571428571 412 423.1428571428571 412H360Z" fill="#3987e5"/>
+<text class="tick" x="435.1428571428571" y="409" fill="#c3c2b7" font-size="13">0.50</text>
+<text x="346" y="441" text-anchor="end" fill="#f0efec" font-size="13.5">Copies under flights from the one walk</text>
+<path d="M360 428H406.35714285714283Q410.35714285714283 428 410.35714285714283 432V440Q410.35714285714283 444 406.35714285714283 444H360Z" fill="#3987e5"/>
+<text class="tick" x="418.35714285714283" y="441" fill="#c3c2b7" font-size="13">0.38</text>
+</svg>

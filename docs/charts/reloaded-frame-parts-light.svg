@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="384" viewBox="0 0 920 384" role="img" aria-labelledby="t d">
+<title id="t">Where a frame goes</title>
+<desc id="d">Series S, prologue cell: each part of the frame where we started and now (the parts overlap in time)</desc>
+<style>text{font-family:system-ui,-apple-system,'Segoe UI',sans-serif}.tick{font-variant-numeric:tabular-nums}</style>
+<rect x="0.5" y="0.5" width="919" height="383" rx="12" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
+<text x="32" y="44" fill="#0b0b0b" font-size="20" font-weight="600">Where a frame goes</text>
+<text x="32" y="68" fill="#52514e" font-size="14">Series S, prologue cell: each part of the frame where we started and now (the parts overlap in time)</text>
+<circle cx="40" cy="98" r="5" fill="#86b6ef" stroke="#fcfcfb" stroke-width="2"/>
+<text x="52" y="103" fill="#52514e" font-size="13">Vice-Tay (where we started)</text>
+<circle cx="262" cy="98" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="274" y="103" fill="#52514e" font-size="13">Round 3 (masks, sender)</text>
+<line x1="200" x2="200" y1="124" y2="324" stroke="#c3c2b7" stroke-width="1"/>
+<text class="tick" x="200" y="344" text-anchor="middle" fill="#898781" font-size="13">0</text>
+<line x1="312" x2="312" y1="124" y2="324" stroke="#e1e0d9" stroke-width="1"/>
+<text class="tick" x="312" y="344" text-anchor="middle" fill="#898781" font-size="13">10</text>
+<line x1="424" x2="424" y1="124" y2="324" stroke="#e1e0d9" stroke-width="1"/>
+<text class="tick" x="424" y="344" text-anchor="middle" fill="#898781" font-size="13">20</text>
+<line x1="536" x2="536" y1="124" y2="324" stroke="#e1e0d9" stroke-width="1"/>
+<text class="tick" x="536" y="344" text-anchor="middle" fill="#898781" font-size="13">30</text>
+<line x1="648" x2="648" y1="124" y2="324" stroke="#e1e0d9" stroke-width="1"/>
+<text class="tick" x="648" y="344" text-anchor="middle" fill="#898781" font-size="13">40</text>
+<line x1="760" x2="760" y1="124" y2="324" stroke="#e1e0d9" stroke-width="1"/>
+<text class="tick" x="760" y="344" text-anchor="middle" fill="#898781" font-size="13">50</text>
+<line x1="872" x2="872" y1="124" y2="324" stroke="#e1e0d9" stroke-width="1"/>
+<text class="tick" x="872" y="344" text-anchor="middle" fill="#898781" font-size="13">60</text>
+<text x="872" y="364" text-anchor="end" fill="#898781" font-size="12">ms a frame</text>
+<text x="184" y="161" text-anchor="end" fill="#0b0b0b" font-size="14">Frame</text>
+<line x1="588.6400000000001" x2="844" y1="156" y2="156" stroke="#c3c2b7" stroke-width="2" stroke-linecap="round"/>
+<circle cx="844" cy="156" r="6" fill="#86b6ef" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="588.6400000000001" cy="156" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text class="tick" x="856" y="161" fill="#52514e" font-size="13">57.5</text>
+<text class="tick" x="576.6400000000001" y="161" text-anchor="end" fill="#0b0b0b" font-size="13" font-weight="600">34.7</text>
+<text x="184" y="209" text-anchor="end" fill="#0b0b0b" font-size="14">Preparing (CPU)</text>
+<line x1="481.12" x2="709.5999999999999" y1="204" y2="204" stroke="#c3c2b7" stroke-width="2" stroke-linecap="round"/>
+<circle cx="709.5999999999999" cy="204" r="6" fill="#86b6ef" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="481.12" cy="204" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text class="tick" x="721.5999999999999" y="209" fill="#52514e" font-size="13">45.5</text>
+<text class="tick" x="469.12" y="209" text-anchor="end" fill="#0b0b0b" font-size="13" font-weight="600">25.1</text>
+<text x="184" y="257" text-anchor="end" fill="#0b0b0b" font-size="14">Card busy (GPU)</text>
+<line x1="426.24" x2="690.56" y1="252" y2="252" stroke="#c3c2b7" stroke-width="2" stroke-linecap="round"/>
+<circle cx="690.56" cy="252" r="6" fill="#86b6ef" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="426.24" cy="252" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text class="tick" x="702.56" y="257" fill="#52514e" font-size="13">43.8</text>
+<text class="tick" x="414.24" y="257" text-anchor="end" fill="#0b0b0b" font-size="13" font-weight="600">20.2</text>
+<text x="184" y="305" text-anchor="end" fill="#0b0b0b" font-size="14">Copying back (CPU)</text>
+<line x1="394.88" x2="469.92" y1="300" y2="300" stroke="#c3c2b7" stroke-width="2" stroke-linecap="round"/>
+<circle cx="469.92" cy="300" r="6" fill="#86b6ef" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="394.88" cy="300" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text class="tick" x="481.92" y="305" fill="#52514e" font-size="13">24.1</text>
+<text class="tick" x="382.88" y="305" text-anchor="end" fill="#0b0b0b" font-size="13" font-weight="600">17.4</text>
+</svg>

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="380" viewBox="0 0 920 380" role="img" aria-labelledby="t d">
+<title id="t">A 12-minute session, minute by minute</title>
+<desc id="d">Series S, prologue cell, round 3: median fps of each minute in the cell (the first went to loading)</desc>
+<style>text{font-family:system-ui,-apple-system,'Segoe UI',sans-serif}.tick{font-variant-numeric:tabular-nums}</style>
+<rect x="0.5" y="0.5" width="919" height="379" rx="12" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
+<text x="32" y="44" fill="#0b0b0b" font-size="20" font-weight="600">A 12-minute session, minute by minute</text>
+<text x="32" y="68" fill="#52514e" font-size="14">Series S, prologue cell, round 3: median fps of each minute in the cell (the first went to loading)</text>
+<line x1="72" x2="872" y1="320" y2="320" stroke="#c3c2b7" stroke-width="1"/>
+<text class="tick" x="60" y="325" text-anchor="end" fill="#898781" font-size="13">0</text>
+<line x1="72" x2="872" y1="257.14285714285717" y2="257.14285714285717" stroke="#e1e0d9" stroke-width="1"/>
+<text class="tick" x="60" y="262.14285714285717" text-anchor="end" fill="#898781" font-size="13">10</text>
+<line x1="72" x2="872" y1="194.28571428571428" y2="194.28571428571428" stroke="#e1e0d9" stroke-width="1"/>
+<text class="tick" x="60" y="199.28571428571428" text-anchor="end" fill="#898781" font-size="13">20</text>
+<line x1="72" x2="872" y1="131.42857142857144" y2="131.42857142857144" stroke="#e1e0d9" stroke-width="1"/>
+<text class="tick" x="60" y="136.42857142857144" text-anchor="end" fill="#898781" font-size="13">30</text>
+<line x1="72" x2="872" y1="131.42857142857144" y2="131.42857142857144" stroke="#52514e" stroke-width="1.5"/>
+<text x="872" y="123.42857142857144" text-anchor="end" fill="#52514e" font-size="13">30 fps</text>
+<polygon points="72,320 72.0,138.3 160.9,135.7 249.8,131.2 338.7,131.8 427.6,135.7 516.4,136.7 605.3,136.7 694.2,134.0 783.1,131.2 872.0,131.2 872,320" fill="#2a78d6" fill-opacity="0.10"/>
+<polyline points="72.0,138.3 160.9,135.7 249.8,131.2 338.7,131.8 427.6,135.7 516.4,136.7 605.3,136.7 694.2,134.0 783.1,131.2 872.0,131.2" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<text class="tick" x="72" y="340" text-anchor="middle" fill="#898781" font-size="13">2</text>
+<text class="tick" x="160.88888888888889" y="340" text-anchor="middle" fill="#898781" font-size="13">3</text>
+<text class="tick" x="249.77777777777777" y="340" text-anchor="middle" fill="#898781" font-size="13">4</text>
+<text class="tick" x="338.66666666666663" y="340" text-anchor="middle" fill="#898781" font-size="13">5</text>
+<text class="tick" x="427.55555555555554" y="340" text-anchor="middle" fill="#898781" font-size="13">6</text>
+<text class="tick" x="516.4444444444445" y="340" text-anchor="middle" fill="#898781" font-size="13">7</text>
+<text class="tick" x="605.3333333333333" y="340" text-anchor="middle" fill="#898781" font-size="13">8</text>
+<text class="tick" x="694.2222222222223" y="340" text-anchor="middle" fill="#898781" font-size="13">9</text>
+<text class="tick" x="783.1111111111111" y="340" text-anchor="middle" fill="#898781" font-size="13">10</text>
+<text class="tick" x="872" y="340" text-anchor="middle" fill="#898781" font-size="13">11</text>
+<text x="872" y="360" text-anchor="end" fill="#898781" font-size="12">minute of the session</text>
+<circle cx="872" cy="131.23981123981122" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="862" y="155.23981123981122" text-anchor="end" fill="#0b0b0b" font-size="14" font-weight="600">30.0 fps</text>
+</svg>

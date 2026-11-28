@@ -38,6 +38,16 @@ const ALLOWED_DOCUMENTATION: &[&str] = &[
     "docs/charts/session-frame-rate.svg",
     "docs/index.html",
     "scripts/generate-benchmark-charts.mjs",
+    // The README's charts, made by scripts/reloaded-charts.mjs from our own measurements.
+    "docs/charts/reloaded-fps-light.svg",
+    "docs/charts/reloaded-fps-dark.svg",
+    "docs/charts/reloaded-frame-parts-light.svg",
+    "docs/charts/reloaded-frame-parts-dark.svg",
+    "docs/charts/reloaded-levers-light.svg",
+    "docs/charts/reloaded-levers-dark.svg",
+    "docs/charts/reloaded-session-light.svg",
+    "docs/charts/reloaded-session-dark.svg",
+    "scripts/reloaded-charts.mjs",
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.

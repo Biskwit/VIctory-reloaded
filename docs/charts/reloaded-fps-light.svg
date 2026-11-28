@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="420" viewBox="0 0 920 420" role="img" aria-labelledby="t d">
+<title id="t">Series S frame rate, round by round</title>
+<desc id="d">Prologue cell, i9-12900K + RTX 4090, warm launches, median of the settled frames</desc>
+<style>text{font-family:system-ui,-apple-system,'Segoe UI',sans-serif}.tick{font-variant-numeric:tabular-nums}</style>
+<rect x="0.5" y="0.5" width="919" height="419" rx="12" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
+<text x="32" y="44" fill="#0b0b0b" font-size="20" font-weight="600">Series S frame rate, round by round</text>
+<text x="32" y="68" fill="#52514e" font-size="14">Prologue cell, i9-12900K + RTX 4090, warm launches, median of the settled frames</text>
+<line x1="72" x2="880" y1="340" y2="340" stroke="#c3c2b7" stroke-width="1"/>
+<text class="tick" x="60" y="345" text-anchor="end" fill="#898781" font-size="13">0</text>
+<line x1="72" x2="880" y1="271.42857142857144" y2="271.42857142857144" stroke="#e1e0d9" stroke-width="1"/>
+<text class="tick" x="60" y="276.42857142857144" text-anchor="end" fill="#898781" font-size="13">10</text>
+<line x1="72" x2="880" y1="202.85714285714286" y2="202.85714285714286" stroke="#e1e0d9" stroke-width="1"/>
+<text class="tick" x="60" y="207.85714285714286" text-anchor="end" fill="#898781" font-size="13">20</text>
+<line x1="72" x2="880" y1="134.2857142857143" y2="134.2857142857143" stroke="#e1e0d9" stroke-width="1"/>
+<text class="tick" x="60" y="139.2857142857143" text-anchor="end" fill="#898781" font-size="13">30</text>
+<line x1="72" x2="880" y1="134.2857142857143" y2="134.2857142857143" stroke="#52514e" stroke-width="1.5"/>
+<text x="880" y="126.2857142857143" text-anchor="end" fill="#52514e" font-size="13">30 fps</text>
+<path d="M161 340V224.6857142857143Q161 220.6857142857143 165 220.6857142857143H181Q185 220.6857142857143 185 224.6857142857143V340Z" fill="#2a78d6"/>
+<text x="173" y="210.6857142857143" text-anchor="middle" fill="#0b0b0b" font-size="15" font-weight="600">17.4 fps</text>
+<text x="173" y="364" text-anchor="middle" fill="#0b0b0b" font-size="14">Vice-Tay</text>
+<text x="173" y="382" text-anchor="middle" fill="#898781" font-size="12">where we started</text>
+<path d="M363 340V207.54285714285714Q363 203.54285714285714 367 203.54285714285714H383Q387 203.54285714285714 387 207.54285714285714V340Z" fill="#2a78d6"/>
+<text x="375" y="193.54285714285714" text-anchor="middle" fill="#0b0b0b" font-size="15" font-weight="600">19.9 fps</text>
+<text x="375" y="364" text-anchor="middle" fill="#0b0b0b" font-size="14">Round 1</text>
+<text x="375" y="382" text-anchor="middle" fill="#898781" font-size="12">card copies, threads</text>
+<path d="M565 340V158.85714285714286Q565 154.85714285714286 569 154.85714285714286H585Q589 154.85714285714286 589 158.85714285714286V340Z" fill="#2a78d6"/>
+<text x="577" y="144.85714285714286" text-anchor="middle" fill="#0b0b0b" font-size="15" font-weight="600">27.0 fps</text>
+<text x="577" y="364" text-anchor="middle" fill="#0b0b0b" font-size="14">Round 2</text>
+<text x="577" y="382" text-anchor="middle" fill="#898781" font-size="12">ReBAR, split, guards</text>
+<path d="M767 340V146.5142857142857Q767 142.5142857142857 771 142.5142857142857H787Q791 142.5142857142857 791 146.5142857142857V340Z" fill="#2a78d6"/>
+<text x="779" y="132.5142857142857" text-anchor="middle" fill="#0b0b0b" font-size="15" font-weight="600">28.8 fps</text>
+<text x="779" y="364" text-anchor="middle" fill="#0b0b0b" font-size="14">Round 3</text>
+<text x="779" y="382" text-anchor="middle" fill="#898781" font-size="12">masks, sender</text>
+</svg>
