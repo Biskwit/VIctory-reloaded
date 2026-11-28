@@ -5446,6 +5446,7 @@ mod tests {
     /// the runtime has begun to change; after that it is again.
     #[test]
     fn what_is_left_alone_is_no_known_hole() {
+        let _one = one_asking_test();
         let p = placeholder(3);
         let known = |block: usize| published(p + block * BLOCK, p + (block + 1) * BLOCK);
         let ask = || writes(p, p + 3 * BLOCK, true).expect("as a view");
@@ -6053,12 +6054,14 @@ mod tests {
     }
 
     /// The section of [`two_views`] is closed and its views unmapped; the
-    /// guard is told they are gone first.
+    /// guard is told they are gone first (as the runtime tells it: known as
+    /// views, a later test's memory at the address would not be asked).
     fn drop_views(section: usize, views: &[usize], bytes: usize) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         for &view in views {
             title_memory_remapped(view, bytes);
+            title_memory_unmapping(view, bytes);
             // SAFETY: a view of the section mapped by `two_views`.
             unsafe {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
@@ -6682,7 +6685,7 @@ mod tests {
 
 #[cfg(test)]
 mod mapping_tests {
-    use super::{title_memory_reading, title_memory_remapping};
+    use super::{one_asking_test, title_memory_reading, title_memory_remapping};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
@@ -6691,6 +6694,8 @@ mod mapping_tests {
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
+        // (A change of mapping beside a test that asks ends its asking.)
+        let _one = one_asking_test();
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading();

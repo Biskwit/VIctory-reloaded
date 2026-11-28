@@ -13576,7 +13576,7 @@ mod refresh_tests {
     /// `VICTORY_TEST_ROUNDS`, if what is landed is noted before it is in.)
     #[test]
     fn landings_title_writes_and_light_refreshes_at_once() {
-        let _one = crate::watch::one_asking_test();
+        // (Its askings hold [`crate::watch::one_asking_test`]'s lock, `ONE`.)
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         assert!(crate::safecopy::on());
         const LEN: usize = 24 * PAGE;
@@ -13889,7 +13889,7 @@ mod refresh_tests {
     /// is so no more once something wrote it.
     #[test]
     fn unchanged_ranges_are_known() {
-        let _one = crate::watch::one_asking_test();
+        // (Its askings hold [`crate::watch::one_asking_test`]'s lock, `ONE`.)
         for view in [false, true] {
             let region = title(8 * PAGE, view);
             // (A page read for the first time counts as written.)
@@ -13982,7 +13982,7 @@ mod refresh_tests {
     #[test]
     #[ignore]
     fn frame_of_refreshes() {
-        let _one = crate::watch::one_asking_test();
+        // (Its askings hold [`crate::watch::one_asking_test`]'s lock, `ONE`.)
         let mut random = Random(0x9876_5432_1234_5671);
         const EACH: usize = 224 << 10;
         const BIG: usize = 174 << 20;

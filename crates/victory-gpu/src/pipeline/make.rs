@@ -1009,10 +1009,13 @@ mod tests {
                     finished.send((used_budget, pending.made.get().is_some())).unwrap();
                 });
                 began.recv().unwrap();
-                let deadline = if wait { Duration::from_millis(25) } else { Duration::from_secs(1) };
+                // Without its own wait it is a dispatch's compute pipeline,
+                // which our compute wait holds ([`wait_compute`]).
+                let held = wait || !compute_wait().0.is_zero();
+                let deadline = if held { Duration::from_millis(25) } else { Duration::from_secs(1) };
                 let first = result.recv_timeout(deadline);
                 head.make_with(|| None);
-                if wait {
+                if held {
                     assert_eq!(first, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
                     assert_eq!(result.recv_timeout(Duration::from_secs(1)), Ok((false, true)));
                 } else {
