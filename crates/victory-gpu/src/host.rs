@@ -12535,6 +12535,7 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        display_rate(hwnd);
         self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
         unsafe {
@@ -12594,6 +12595,49 @@ impl Host {
             })
         }
     }
+}
+
+/// Trial: `VICTORY_DISPLAY_HZ=<n>` puts the window's monitor at n Hz, in its
+/// current size, for the run: a temporary full-screen mode (CDS_FULLSCREEN),
+/// which Windows drops for the desktop's own when the process ends. Once.
+fn display_rate(hwnd: HWND) {
+    use windows::Win32::Graphics::Gdi::{
+        CDS_FULLSCREEN, ChangeDisplaySettingsExW, DEVMODEW, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
+        ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+        MONITORINFOEXW, MonitorFromWindow,
+    };
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(hz) = std::env::var("VICTORY_DISPLAY_HZ").ok().and_then(|v| v.trim().parse::<u32>().ok()) else {
+            return;
+        };
+        // SAFETY: plain queries and a mode change on the window's own monitor.
+        unsafe {
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFOEXW::default();
+            info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+            if !GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()).as_bool() {
+                return;
+            }
+            let device = windows::core::PCWSTR(info.szDevice.as_ptr());
+            let mut mode = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+            if !EnumDisplaySettingsW(device, ENUM_CURRENT_SETTINGS, &mut mode).as_bool() {
+                return;
+            }
+            let from = mode.dmDisplayFrequency;
+            mode.dmDisplayFrequency = hz;
+            mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+            let result = ChangeDisplaySettingsExW(device, Some(&mode), None, CDS_FULLSCREEN, None);
+            tracing::info!(
+                width = mode.dmPelsWidth,
+                height = mode.dmPelsHeight,
+                from,
+                to = hz,
+                result = result.0,
+                "display rate for the run (VICTORY_DISPLAY_HZ; 0 is done)"
+            );
+        }
+    });
 }
 
 /// A visible top-level window of this process: the one the title made, if
