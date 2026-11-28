@@ -61,8 +61,7 @@ pub struct Container<'a> {
     pub digest: [u8; 16],
     pub version: (u16, u16),
     pub parts: Vec<Part<'a>>,
-    /// The bytes as given, before the cut to the container's size: what the
-    /// log's shader hashes are of.
+    /// Input before trimming to the DXBC size, as used by shader log hashes.
     pub(crate) input: &'a [u8],
 }
 

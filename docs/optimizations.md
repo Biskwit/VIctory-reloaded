@@ -216,7 +216,8 @@ i9-12900K with an RTX 4090 unless it says otherwise. The
       holds about 8 ms of the title's own work;
     - the write watch's journal keeps its pages in 4 MiB pieces instead of
       one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
-      of 111; the submitting thread about 1 ms less a frame;
+      of 111; the submitting thread about 1 ms less a frame (given up in the
+      merge of Vice-Tay fe7c6e52, below, for its journal in parts);
     - a submission is prepared while the one before it is sent: the line's
       thread prepares and publishes it, a second thread (victory-send)
       records the card-copy lists, waits for the heaps' records and sends
@@ -224,6 +225,36 @@ i9-12900K with an RTX 4090 unless it says otherwise. The
       launches: 53.1 -> 50.5 ms a frame, the title's wait at presents 19.9 ->
       16.0 ms; its gate ran at 43.3-46.0 ms a frame (23 fps over a 15-minute
       session).
+- **Merged with Vice-Tay fe7c6e52** (its 368 commits since fab5286c, in
+  one merge). Where both sides did the same thing, one implementation is
+  kept, with our switch:
+  - the card steps' plan made once: Vice-Tay's (b9ef9252 and its follow-ups,
+    the plan handed down the submission's calls, and not kept while the
+    fill heuristic asks the write watch), under `VICTORY_PLAN_ONCE`;
+  - host lists closed off the line's thread: ours (closed when given back,
+    `VICTORY_OFF_LINE`), and Vice-Tay's left-open list (104c3d36) for a list
+    taken open, which its title's next reset closes;
+  - write-watched `XMemAllocDefault` blocks: ours (1 MiB and more, on), with
+    Vice-Tay's opt-in `VICTORY_WATCH_XMEM_ALLOC` read as an alias (`=0` off);
+  - static-sampler pipelines and the library: ours, with Vice-Tay's
+    `VICTORY_LIBRARY_STATIC_SAMPLERS=1` read as `VICTORY_LIBRARY_LOAD=1`;
+  - the resolve's depth plane: ours (`VICTORY_AMBIENT_DEPTH`), with
+    Vice-Tay's companion lookup (292adb5a) for the view at the stencil's
+    place;
+  - the journal of written pages: Vice-Tay's, in parts (renderer port 7
+    needs them); our refresh stamps note through it, and are off while
+    `VICTORY_PORT_JOURNAL` may be on;
+  - the guards' lock: Vice-Tay's read-write lock (renderer port 6); our
+    faults without the lock (`VICTORY_FAULT_FAST`) are off while
+    `VICTORY_PORT_GUARD` may be on;
+  - the submission's asking: Vice-Tay's (one hold of everything) unless
+    `VICTORY_ASK_OWN` (on): each part holds only its pages;
+  - where our threads run: one placing for ours (`VICTORY_PLACE_APART`,
+    `VICTORY_PLACE_LANE`) and Vice-Tay's `VICTORY_LANE_CORE` and
+    `VICTORY_CACHE_CORES`;
+  - with frame generation (`VICTORY_FRAMEGEN=1`) submissions and presents
+    are sent by the line's thread (`VICTORY_SUBMIT_SPLIT` and
+    `VICTORY_PRESENT_OFF_LINE` step aside).
 - **Not brought over (yet)** from our earlier tree (fxceless's fork with about
   140 commits of ours): its FidelityFX SDK path for the Series S upscale
   (Vice-Tay translates FSR 4's own code) and its other rendering fixes, which

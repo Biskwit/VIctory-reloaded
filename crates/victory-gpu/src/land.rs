@@ -162,6 +162,17 @@ pub(crate) mod stat {
     /// Pieces left on the card, and their bytes (`VICTORY_LAND_NOT`).
     pub(crate) const NOT: usize = 26;
     pub(crate) const NOT_BYTES: usize = 27;
+    #[cfg(feature = "diagnostics")]
+    pub(crate) const TEXTURE_READBACK_US: usize = 28;
+    #[cfg(feature = "diagnostics")]
+    pub(crate) const BUFFER_READBACK_US: usize = 29;
+    #[cfg(feature = "diagnostics")]
+    pub(crate) const TEXTURE_READBACKS: usize = 30;
+    #[cfg(feature = "diagnostics")]
+    pub(crate) const BUFFER_READBACKS: usize = 31;
+    #[cfg(feature = "diagnostics")]
+    pub(crate) const COUNT: usize = 32;
+    #[cfg(not(feature = "diagnostics"))]
     pub(crate) const COUNT: usize = 28;
 }
 
@@ -201,10 +212,18 @@ pub(crate) fn log(frames: f64) {
     }
     #[cfg(feature = "diagnostics")]
     probe::log();
+    let ms = |i: usize| s[i] / 1000.0;
+    #[cfg(feature = "diagnostics")]
+    if s[stat::TEXTURE_READBACKS] > 0.0 || s[stat::BUFFER_READBACKS] > 0.0 {
+        tracing::info!(
+            "read-backs per frame: textures {:.2} ms ({:.1} queued), buffers {:.2} ms ({:.1} queued)",
+            ms(stat::TEXTURE_READBACK_US), s[stat::TEXTURE_READBACKS],
+            ms(stat::BUFFER_READBACK_US), s[stat::BUFFER_READBACKS],
+        );
+    }
     if s[stat::PIECES] == 0.0 && s[stat::REST] == 0.0 {
         return;
     }
-    let ms = |i: usize| s[i] / 1000.0;
     let mb = |v: f64| v / (1 << 20) as f64;
     tracing::info!(
         "landing per frame (VICTORY_LAND={}, {} threads): which pieces to fetch {:.2} ms, then the fetches (the relay's line); \
@@ -307,6 +326,8 @@ impl Pool {
     }
 
     fn help(&self) {
+        // (The thread that calls `each` waits for this one's share.)
+        let mut priority = crate::cores::Priority::new();
         let mut state = self.state();
         loop {
             let Some((work, i)) = take(&mut state) else {
@@ -315,6 +336,7 @@ impl Pool {
             };
             state.running += 1;
             drop(state);
+            priority.keep();
             let working = crate::timeline::span("a landing's job");
             // SAFETY: counted in `running`, so `each` has not returned.
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));

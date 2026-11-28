@@ -171,6 +171,11 @@ impl Masks {
         pages
     }
 
+    /// Whether it holds no mask, taken or not.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.dirty.is_empty() && self.sent.is_empty()
+    }
+
     /// Adds to `out` the offsets in `[from, to)` that a fetch which ran
     /// behind the sends up to `fetched_after` may hold the card's old words
     /// at: those of masks not taken, and of masks taken by later sends.

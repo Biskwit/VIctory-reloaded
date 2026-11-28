@@ -15,8 +15,20 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// On Windows with diagnostics, copystat counts allocations and uses this
+// same backend when the feature is enabled.
+#[cfg(all(feature = "mimalloc", not(all(windows, feature = "diagnostics"))))]
+#[global_allocator]
+static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod lightprobe;
+#[cfg(windows)]
+mod texlate;
+#[cfg(windows)]
+mod texstore;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -35,8 +47,12 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+pub mod framegen;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
@@ -46,7 +62,17 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
+mod port;
+#[cfg(windows)]
+mod port_cbv;
+#[cfg(windows)]
+pub mod port_descriptors;
+#[cfg(windows)]
+mod port_journal;
+#[cfg(windows)]
 mod land;
+#[cfg(all(test, windows))]
+mod loadprobe;
 pub mod list;
 #[cfg(windows)]
 mod masked;
@@ -80,6 +106,18 @@ mod safecopy;
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
+
+/// What `victory shaders` made of one shader that translates.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Precompiled {
+    /// Its entry was in the cache already.
+    Cached,
+    /// Translated now and written to the cache.
+    Translated,
+    /// Translated, but not on disk: why (a run would translate it again).
+    NotCached(String),
+}
+
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
@@ -107,6 +145,16 @@ mod texback;
 #[cfg(windows)]
 pub use host::on_failure;
 
+/// The process is ending in an orderly way (the title exits, or its window
+/// was closed): the pictures the capture thread still has in its line
+/// (`VICTORY_CAPTURE`) are written before this returns, or three seconds
+/// have passed, which is logged. Does nothing without diagnostics.
+#[cfg(windows)]
+pub fn finish_captures() {
+    #[cfg(feature = "diagnostics")]
+    capture::finish();
+}
+
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -119,13 +167,18 @@ pub fn switched(switch: &str) -> Option<bool> {
 pub fn frame_phase() -> u32 {
     copystat::phase()
 }
+
+/// Frames the title has begun (its frame waits that ended), for logs.
+pub fn frames_begun() -> u64 {
+    frame::current()
+}
 #[cfg(windows)]
 pub use cores::title_affinity;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
-    writing as kernel_will_write,
+    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_placeholder, title_memory_reading,
+    title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
+    title_memory_written, writing as kernel_will_write,
 };

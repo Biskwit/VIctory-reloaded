@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 
 use super::This;
 use crate::fence::FenceRef;
+use crate::host::JoinStop;
 
 /// One thing in the line: what it stands at, if it does, and what it does.
 pub(super) trait Work: Send {
@@ -83,14 +84,39 @@ pub(super) trait Work: Send {
     {
         Err(next)
     }
+    fn join_stopped(&self, _reason: JoinStop) {}
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
+    /// Renderer port #7 (`crate::port_journal`, from renderer patch #4): a mark taken when an entry is
+    /// put in the line (by the thread that puts it, before the line's lock):
+    /// the round of the heaps' records begun after that. 0: none.
+    fn mark_now() -> u64 {
+        0
+    }
+    /// A mark taken when a wait goes or is taken along (on our thread): a
+    /// round that begins after.
+    fn mark_later() -> u64 {
+        0
+    }
+    /// Whether what its queue has behind this wait may have been written
+    /// only just before the wait was met (by the CPU, which writes, then
+    /// meets the wait): it was met in memory. A wait met by a bottom-of-pipe
+    /// write of a flight or of the submission it is taken along with is the
+    /// card's order, not the CPU's.
+    fn raises(&self) -> bool {
+        true
+    }
+    /// Told just before [`Work::go`] of a submission: the highest mark of
+    /// what it is made of and of the waits its queue went past.
+    fn marked(&mut self, _mark: u64) {}
 }
 
 struct Entry<W> {
     number: u64,
     queue: usize,
     what: W,
+    /// [`Work::mark_now`] when it was put in the line.
+    mark: u64,
 }
 
 struct State<W> {
@@ -108,6 +134,23 @@ struct State<W> {
     /// Presents and submissions in the line or being done.
     presents: usize,
     runs: usize,
+    /// Per queue, the highest [`Work::mark_later`] of the waits it went past:
+    /// what is behind a wait may have been written only before the wait was
+    /// met, not before it was put in the line.
+    floors: Vec<(usize, u64)>,
+}
+
+impl<W> State<W> {
+    fn floor(&self, queue: usize) -> u64 {
+        self.floors.iter().find(|f| f.0 == queue).map_or(0, |f| f.1)
+    }
+
+    fn raise(&mut self, queue: usize, mark: u64) {
+        match self.floors.iter_mut().find(|f| f.0 == queue) {
+            Some(f) => f.1 = f.1.max(mark),
+            None => self.floors.push((queue, mark)),
+        }
+    }
 }
 
 /// See the module's text.
@@ -130,6 +173,7 @@ impl<W: Work> Lane<W> {
                 served: 0,
                 presents: 0,
                 runs: 0,
+                floors: Vec::new(),
             }),
             work: Condvar::new(),
             moved: Condvar::new(),
@@ -140,19 +184,21 @@ impl<W: Work> Lane<W> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn put(state: &mut State<W>, queue: usize, what: W) {
+    fn put(state: &mut State<W>, queue: usize, what: W, mark: u64) {
         state.presents += usize::from(what.shows());
         state.runs += usize::from(what.runs());
         let number = state.next;
         state.next += 1;
-        state.items.push_back(Entry { number, queue, what });
+        state.items.push_back(Entry { number, queue, what, mark });
     }
 
     /// Adds to the end of the line, and has it looked at.
     pub(super) fn push(&self, queue: usize, what: impl IntoIterator<Item = W>) {
+        let what: Vec<W> = what.into_iter().collect();
+        let mark = if what.iter().any(W::runs) { W::mark_now() } else { 0 };
         let mut state = self.lock();
         for what in what {
-            Self::put(&mut state, queue, what);
+            Self::put(&mut state, queue, what, mark);
         }
         state.asked += 1;
         drop(state);
@@ -165,7 +211,7 @@ impl<W: Work> Lane<W> {
     pub(super) fn push_behind(&self, queue: usize, always: bool, what: W, now: impl FnOnce()) {
         let mut state = self.lock();
         if always || state.running == Some(queue) || state.items.iter().any(|e| e.queue == queue) {
-            Self::put(&mut state, queue, what);
+            Self::put(&mut state, queue, what, 0);
         } else {
             now();
         }
@@ -256,12 +302,12 @@ impl<W: Work> Lane<W> {
 
     /// The parts of `entry`, which stands for them, in place `at`.
     fn unfold(state: &mut State<W>, at: usize, entry: Entry<W>) {
-        let (number, queue, runs) = (entry.number, entry.queue, usize::from(entry.what.runs()));
+        let (number, queue, runs, mark) = (entry.number, entry.queue, usize::from(entry.what.runs()), entry.mark);
         let parts = entry.what.unfold();
         state.runs -= runs;
         state.runs += parts.iter().filter(|p| p.runs()).count();
         for (i, what) in parts.into_iter().enumerate() {
-            state.items.insert(at + i, Entry { number, queue, what });
+            state.items.insert(at + i, Entry { number, queue, what, mark });
         }
     }
 
@@ -318,6 +364,14 @@ impl<W: Work> Lane<W> {
             entry
         };
         let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()));
+        // The highest mark of what it is made of (renderer port #7).
+        let mut mark = entry.mark;
+        if entry.what.ask().is_some() && !entry.what.folded() && entry.what.raises() {
+            // A wait that goes: what its queue has behind it was written
+            // before it was met, which is now at the latest.
+            let later = W::mark_later();
+            self.lock().raise(entry.queue, later);
+        }
         if entry.what.folded() {
             // Its parts take its place: behind everything before it, before
             // everything after it (they share its number; the first of them
@@ -339,6 +393,7 @@ impl<W: Work> Lane<W> {
                 at.and_then(|at| Some((at, state.items.remove(at)?)))
             };
             let Some((at, next)) = next else {
+                entry.what.join_stopped(JoinStop::QueueBoundary);
                 break;
             };
             // (Back where it was: parts of one submission share a number.)
@@ -350,16 +405,29 @@ impl<W: Work> Lane<W> {
                     continue;
                 }
                 state.items.insert(at, next);
+                entry.what.join_stopped(JoinStop::FoldedWait);
                 break;
             }
-            let Entry { number, queue, what } = next;
+            let Entry { number, queue, what, mark: theirs } = next;
+            let waits = what.ask().is_some() && what.raises();
             match entry.what.take_along(what) {
-                Ok(run) => runs += usize::from(run),
+                Ok(run) => {
+                    runs += usize::from(run);
+                    mark = mark.max(theirs);
+                    if waits {
+                        let later = W::mark_later();
+                        self.lock().raise(queue, later);
+                    }
+                }
                 Err(what) => {
-                    self.lock().items.insert(at, Entry { number, queue, what });
+                    self.lock().items.insert(at, Entry { number, queue, what, mark: theirs });
                     break;
                 }
             }
+        }
+        if runs > 0 {
+            let floor = self.lock().floor(entry.queue);
+            entry.what.marked(mark.max(floor));
         }
         entry.what.go(forced);
         {
@@ -381,15 +449,18 @@ enum Job {
     Wait(FenceRef, u64),
     /// A part of a submission waits for a memory value.
     Value(crate::list::ValueWait),
-    /// A submission, or a part of one: the lists' host sides and the order
-    /// they run in.
-    Run(usize, Vec<crate::list::Detached>, Vec<usize>),
+    /// A submission, or a part of one: the lists' host sides, the order
+    /// they run in, and the heap-sync stamp captured at enqueue.
+    Run(usize, Vec<crate::list::Detached>, Vec<usize>, u64),
     /// A submission whose lists are being translated ([`crate::list::thin`]):
-    /// the parts of it are known when they are.
-    Lists(usize, Recordings),
+    /// the parts of it are known when they are. Carries the enqueue heap-sync
+    /// stamp so unfolded runs inherit it.
+    Lists(usize, Recordings, u64),
     /// Parts taken along with a submission ([`crate::host::joins`]): where they
-    /// begin in the order, and the signals given behind them.
-    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(FenceRef, u64)>),
+    /// begin in the order, the signals given behind them, and the combined
+    /// heap-sync stamp (`merge_stamp`, where `0` dominates to force a fresh
+    /// round whenever any joined part is unstamped).
+    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(FenceRef, u64)>, u64),
     /// A signal of the queue's.
     Signal(FenceRef, u64),
     /// A frame is shown: the base texture (and optional overlay plane) and the states their lists leave them in.
@@ -418,7 +489,7 @@ impl Work for Job {
         match self {
             Job::Wait(fence, value) => Some(Ask::Wait(fence.clone(), *value)),
             Job::Value(wait) => Some(Ask::Value(*wait)),
-            Job::Lists(_, lists) => Some(Ask::Lists(lists.clone())),
+            Job::Lists(_, lists, _) => Some(Ask::Lists(lists.clone())),
             _ => None,
         }
     }
@@ -428,11 +499,11 @@ impl Work for Job {
     }
 
     fn unfold(self) -> Vec<Self> {
-        let Job::Lists(queue, recordings) = self else {
+        let Job::Lists(queue, recordings, stamp) = self else {
             return vec![self];
         };
         let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
-        let jobs = jobs_of(queue as This, &lists);
+        let jobs = jobs_of(queue as This, &lists, stamp);
         // It stood for one submission not begun.
         let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
         QUEUED.fetch_add(runs, Relaxed);
@@ -444,6 +515,46 @@ impl Work for Job {
     fn settle(ask: &Ask) {
         if let Ask::Lists(recordings) = ask {
             recordings.iter().for_each(|r| r.wait());
+        }
+    }
+
+    fn mark_now() -> u64 {
+        if crate::port_journal::on() { crate::descriptor::round_after_now() } else { 0 }
+    }
+
+    fn mark_later() -> u64 {
+        // (Asked for now when `port_journal` is on: the round runs while the
+        // lane does what is before the part behind the wait. Otherwise capture
+        // the current `SyncRounds` stamp so any queued submission behind a
+        // fence or memory-value wait still waits for a round begun after the
+        // wait was met.)
+        if crate::port_journal::on() {
+            crate::descriptor::round_after_now()
+        } else {
+            crate::descriptor::heap_sync_stamp()
+        }
+    }
+
+    fn raises(&self) -> bool {
+        // Without `port_journal`, treat every wait conservatively without
+        // re-reading title memory.
+        if !crate::port_journal::on() {
+            return true;
+        }
+        match self {
+            Job::Value(wait) => wait.met(),
+            _ => true,
+        }
+    }
+
+    fn marked(&mut self, mark: u64) {
+        if crate::port_journal::on() {
+            crate::port_journal::set_mark(mark);
+        } else if mark > 0 {
+            match self {
+                Job::Run(.., stamp) | Job::Joined(.., stamp) if *stamp > 0 => *stamp = (*stamp).max(mark),
+                _ => {}
+            }
         }
     }
 
@@ -463,16 +574,24 @@ impl Work for Job {
         matches!(self, Job::Run(..) | Job::Joined(..) | Job::Lists(..))
     }
 
+    fn join_stopped(&self, reason: JoinStop) {
+        note_join_stop(reason);
+    }
+
     fn take_along(&mut self, next: Job) -> Result<bool, Job> {
         let (most, most_lists) = crate::host::joins();
         if most < 2 {
+            note_join_stop(JoinStop::Disabled);
             return Err(next);
         }
         // Nothing but waits and signals that a submission may follow.
         let (count, lists, signals) = match self {
-            Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..]),
-            Job::Joined(_, lists, order, parts, signals) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
-            _ => return Err(next),
+            Job::Run(_, lists, order, _) => (1, (&*lists, &*order), &[][..]),
+            Job::Joined(_, lists, order, parts, signals, _) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
+            _ => {
+                note_join_stop(JoinStop::BoundaryJob);
+                return Err(next);
+            }
         };
         let hosts = || lists.1.iter().map(|&i| lists.0[i].host());
         match &next {
@@ -481,6 +600,7 @@ impl Work for Job {
                     || crate::host::late_met_known(wait) == Some(true)
                     || hosts().any(|list| crate::host::will_meet(list, wait));
                 if !met {
+                    note_join_stop(JoinStop::ValueWait);
                     return Err(next);
                 }
             }
@@ -488,32 +608,45 @@ impl Work for Job {
                 if crate::fence::completed(fence.as_this()) < *value
                     && !signals.iter().any(|(f, v)| f == fence && v >= value)
                 {
+                    note_join_stop(JoinStop::FenceWait);
                     return Err(next);
                 }
             }
             Job::Signal(..) => {}
-            Job::Run(_, more, order) => {
+            Job::Run(_, more, order, _) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                let stop = if count >= most {
+                    Some(JoinStop::PartLimit)
+                } else if lists.1.len() + runs.len() > most_lists {
+                    Some(JoinStop::ListLimit)
+                } else {
+                    crate::host::join_blocked(hosts(), &runs)
+                };
+                if let Some(reason) = stop {
+                    note_join_stop(reason);
                     return Err(next);
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => {
+                note_join_stop(JoinStop::BoundaryJob);
+                return Err(next);
+            }
         }
         // (A signal held in the line keeps its fence: no placeholder job
         // can stand in for this one while it is taken apart.)
-        if let Job::Run(queue, lists, order) = self {
-            *self = Job::Joined(*queue, std::mem::take(lists), std::mem::take(order), Vec::new(), Vec::new());
+        if let Job::Run(queue, lists, order, stamp) = self {
+            *self = Job::Joined(*queue, std::mem::take(lists), std::mem::take(order), Vec::new(), Vec::new(), *stamp);
         }
-        let Job::Joined(_, lists, order, parts, signals) = self else {
+        let Job::Joined(_, lists, order, parts, signals, stamp) = self else {
             return Err(next);
         };
         let run = matches!(next, Job::Run(..));
         match next {
-            Job::Run(_, more, then) => {
+            Job::Run(_, more, then, next_stamp) => {
                 parts.push(order.len());
                 order.extend(then.into_iter().map(|i| i + lists.len()));
                 lists.extend(more);
+                *stamp = merge_stamp(*stamp, next_stamp);
                 STATS[JOINED].fetch_add(1, Relaxed);
             }
             Job::Signal(fence, value) => signals.push((fence, value)),
@@ -541,24 +674,24 @@ impl Work for Job {
         match self {
             // (A folded one is unfolded, never done.)
             Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}
-            Job::Run(queue, lists, order) => {
+            Job::Run(queue, lists, order, stamp) => {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || format!("RUN submission of {} lists (its thread's)", order.len()));
                 match crate::host::host() {
-                    Some(host) => host.execute_late(lists, order),
+                    Some(host) => host.execute_parts_stamped(lists, order, &[], (stamp > 0).then_some(stamp)),
                     None => drop(lists),
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
-            Job::Joined(queue, lists, order, parts, signals) => {
+            Job::Joined(queue, lists, order, parts, signals, stamp) => {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || {
                     format!("RUN {} parts of submissions in one, {} lists (its thread's)", 1 + parts.len(), order.len())
                 });
                 match crate::host::host() {
-                    Some(host) => host.execute_parts(lists, order, &parts),
+                    Some(host) => host.execute_parts_stamped(lists, order, &parts, (stamp > 0).then_some(stamp)),
                     None => drop(lists),
                 }
                 // (A part that had no list is one all the same.)
@@ -588,6 +721,8 @@ impl Work for Job {
                 QUEUED.fetch_sub(1, Relaxed);
             }
         }
+        // (The mark was this submission's alone.)
+        crate::port_journal::set_mark(0);
         STATS[BUSY].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     }
 }
@@ -616,6 +751,23 @@ const BUSY: usize = 8;
 const FORCED: usize = 9;
 /// Parts prepared together with the one before them.
 const JOINED: usize = 10;
+
+#[cfg(feature = "diagnostics")]
+const JOIN_STOP_COUNT: usize = JoinStop::EarlierWrite as usize + 1;
+#[cfg(feature = "diagnostics")]
+static JOIN_STOPS: [AtomicU64; JOIN_STOP_COUNT] = [const { AtomicU64::new(0) }; JOIN_STOP_COUNT];
+
+fn note_join_stop(reason: JoinStop) {
+    #[cfg(feature = "diagnostics")]
+    {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_REASONS").is_some_and(|v| v == "1")) {
+            JOIN_STOPS[reason as usize].fetch_add(1, Relaxed);
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = reason;
+}
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -731,9 +883,26 @@ pub(super) fn drain() {
     STATS[DRAINS].fetch_add(1, Relaxed);
 }
 
+/// On the upscaler's thread, wait for any prior Present to consume its
+/// frame-generation buffers. A blocked title queue can still make progress.
+pub(super) fn wait_before_framegen() {
+    if OURS.get() {
+        return;
+    }
+    let state = LANE.lock();
+    let (_state, wait) = LANE
+        .moved
+        .wait_timeout_while(state, Duration::from_millis(250), |state| state.presents != 0)
+        .unwrap_or_else(|e| e.into_inner());
+    if wait.timed_out() {
+        tracing::debug!(target: "victory_gpu::framegen", "frame generation: previous present still pending at upscale");
+    }
+}
+
 /// A submission of `lists` to queue `this`.
 pub(super) fn submit(this: This, lists: &[This]) {
     let queue = this as usize;
+    let stamp = crate::descriptor::heap_sync_stamp();
     if crate::list::thin::on() {
         let recordings = crate::list::thin::submitted(lists);
         if recordings.is_empty() {
@@ -742,11 +911,11 @@ pub(super) fn submit(this: This, lists: &[This]) {
         let before = QUEUED.fetch_add(1, Relaxed);
         STATS[DEPTH].fetch_add(before, Relaxed);
         STATS[DEEPEST].fetch_max(before + 1, Relaxed);
-        LANE.push(queue, [Job::Lists(queue, recordings)]);
+        LANE.push(queue, [Job::Lists(queue, recordings, stamp)]);
         room(before + 1);
         return;
     }
-    let jobs = jobs_of(this, lists);
+    let jobs = jobs_of(this, lists, stamp);
     let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
     let before = QUEUED.fetch_add(runs, Relaxed);
     STATS[RUNS].fetch_add(runs, Relaxed);
@@ -766,8 +935,15 @@ fn room(queued: u64) {
     }
 }
 
+/// Combines enqueue heap-sync stamps when joining two submissions: `0` means
+/// unstamped (must request a fresh round at preparation) and dominates any
+/// stamped part.
+fn merge_stamp(a: u64, b: u64) -> u64 {
+    if a == 0 || b == 0 { 0 } else { a.max(b) }
+}
+
 /// What a submission of `lists` is in the line.
-fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
+fn jobs_of(this: This, lists: &[This], stamp: u64) -> Vec<Job> {
     let queue = this as usize;
     // In one piece up to the first list that waits for a memory value, as
     // `super::submit_cut` runs them; the rest part by part.
@@ -789,12 +965,19 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
     let mut jobs: Vec<Job> = Vec::new();
     if first > 0 {
         let (taken, order) = crate::list::detach(&lists[..first]);
-        jobs.push(Job::Run(queue, taken, order));
+        jobs.push(Job::Run(queue, taken, order, stamp));
     }
     if first < lists.len() {
+        // Parts behind a memory-value wait may depend on descriptor records
+        // written after `submit` (before that wait is met), so they and every
+        // subsequent part stay unstamped (`0` -> fresh round at preparation).
+        let mut after_wait = false;
         for (waits, taken, order) in crate::list::detach_parts(&lists[first..]) {
+            if !waits.is_empty() {
+                after_wait = true;
+            }
             jobs.extend(waits.into_iter().map(Job::Value));
-            jobs.push(Job::Run(queue, taken, order));
+            jobs.push(Job::Run(queue, taken, order, if after_wait { 0 } else { stamp }));
         }
     }
     jobs
@@ -855,6 +1038,28 @@ pub(super) fn line(frames: f64) {
         s[FORCED] / frames,
         s[JOINED] / frames
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let stops: [u64; JOIN_STOP_COUNT] = std::array::from_fn(|i| JOIN_STOPS[i].swap(0, Relaxed));
+        if stops.iter().any(|&count| count != 0) {
+            let per_frame = |reason: JoinStop| stops[reason as usize] as f64 / frames;
+            tracing::info!(
+                "submission join stops per frame (VICTORY_JOIN_REASONS): {:.1} no queued candidate, \
+                 {:.1} folded wait, {:.1} joining disabled, {:.1} other job, {:.1} value wait, \
+                 {:.1} fence wait, {:.1} part limit, {:.1} list limit, {:.1} CPU copy, {:.1} earlier write",
+                per_frame(JoinStop::QueueBoundary),
+                per_frame(JoinStop::FoldedWait),
+                per_frame(JoinStop::Disabled),
+                per_frame(JoinStop::BoundaryJob),
+                per_frame(JoinStop::ValueWait),
+                per_frame(JoinStop::FenceWait),
+                per_frame(JoinStop::PartLimit),
+                per_frame(JoinStop::ListLimit),
+                per_frame(JoinStop::CpuCopy),
+                per_frame(JoinStop::EarlierWrite),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -938,10 +1143,72 @@ mod tests {
                 }
             }
         }
+        fn mark_now() -> u64 {
+            NOW.get()
+        }
+        fn mark_later() -> u64 {
+            LATER.get()
+        }
+        fn marked(&mut self, mark: u64) {
+            let name = match self {
+                T::Run(name, _) | T::Slow(name, ..) => name.to_string(),
+                T::Group(names, ..) => names.join("+"),
+                _ => "?".into(),
+            };
+            MARKS.with(|m| m.borrow_mut().push((name, mark)));
+        }
     }
 
     thread_local! {
         static FORCED_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// What [`Work::mark_now`] and [`Work::mark_later`] give in a test.
+        static NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static LATER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// The marks submissions were done with, by name.
+        static MARKS: std::cell::RefCell<Vec<(String, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Renderer port #7: a submission is done with the mark taken when it
+    /// was put in the line, or, behind a wait of its queue, at least the one
+    /// taken when that wait went (what is behind a wait may be written only
+    /// before it is met); one taken along with others, the highest of all.
+    #[test]
+    fn a_submission_needs_what_was_written_before_it_and_its_queues_waits() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let f = fence();
+        let run = |name| T::Run(name, log.clone());
+        NOW.set(5);
+        lane.push(1, [run("a")]);
+        NOW.set(6);
+        lane.push(1, [T::Wait(f, 1), run("b")]);
+        look(&lane);
+        assert_eq!(MARKS.take(), [("a".to_string(), 5)], "b stands at its wait");
+        // The wait is met later; what b reads may have been written just
+        // before that.
+        LATER.set(9);
+        crate::fence::set(f as This, 1);
+        look(&lane);
+        assert_eq!(MARKS.take(), [("b".to_string(), 9)]);
+        // Another queue went past no wait; this one did, for good.
+        NOW.set(7);
+        lane.push(2, [run("c")]);
+        NOW.set(3);
+        lane.push(1, [run("d")]);
+        look(&lane);
+        assert_eq!(MARKS.take(), [("c".to_string(), 7), ("d".to_string(), 9)]);
+        // Taken along: a met wait between two parts raises them both.
+        let part = |name| T::Group(vec![name], log.clone(), Vec::new());
+        NOW.set(10);
+        LATER.set(12);
+        lane.push(3, [part("x"), T::Wait(f, 1), part("y")]);
+        look(&lane);
+        assert_eq!(MARKS.take(), [("x+y".to_string(), 12)]);
+        // A present is no submission: it is told no mark.
+        lane.push(3, [T::Present("present", log.clone())]);
+        look(&lane);
+        assert!(MARKS.take().is_empty());
+        assert_eq!(*log.lock().unwrap(), ["a", "b", "c", "d", "x+y", "present"]);
     }
 
     fn fence() -> usize {
@@ -1082,5 +1349,14 @@ mod tests {
         while log.lock().unwrap().len() < 6 {
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn merge_stamp_preserves_unstamped_parts() {
+        assert_eq!(merge_stamp(3, 5), 5);
+        assert_eq!(merge_stamp(7, 2), 7);
+        assert_eq!(merge_stamp(0, 5), 0);
+        assert_eq!(merge_stamp(5, 0), 0);
+        assert_eq!(merge_stamp(0, 0), 0);
     }
 }

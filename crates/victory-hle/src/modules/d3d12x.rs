@@ -4,6 +4,7 @@
 
 use std::ffi::c_void;
 
+pub use victory_gpu::Precompiled;
 use victory_gpu::device;
 use victory_gpu::object::{HRESULT, Iid, Object};
 
@@ -31,6 +32,7 @@ extern "system" fn create_device(
 fn host_gpu_failed(what: &str) -> ! {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
     victory_loader::log_crash(&format!("VIctory: host GPU failure: {what}"));
+    victory_gpu::pipeline::known::flush_on_gpu_failure();
     const DXGI_ERROR_DEVICE_REMOVED: u32 = 0x887A_0005;
     // SAFETY: ends our own process.
     unsafe { TerminateProcess(GetCurrentProcess(), DXGI_ERROR_DEVICE_REMOVED) };
@@ -38,8 +40,9 @@ fn host_gpu_failed(what: &str) -> ! {
 }
 
 /// Translates `container` into the cache ([`use_shader_cache`]) ahead of
-/// any run: whether it was there already, or why it does not translate.
-pub fn precompile(container: &[u8]) -> Result<bool, String> {
+/// any run: whether it was there already or could not be kept, or why it
+/// does not translate.
+pub fn precompile(container: &[u8]) -> Result<Precompiled, String> {
     #[cfg(windows)]
     {
         victory_gpu::shader_cache::precompile(container)
@@ -51,17 +54,25 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     }
 }
 
-/// The fork's offline warm-up (`victory translate --warm`), by
-/// [`precompile`]: whether it was translated now.
-pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
+/// Cache identity for shader pretranslation on this host.
+pub fn precompile_cache_key() -> Option<[u8; 32]> {
+    #[cfg(windows)]
+    { victory_gpu::shader_cache::precompile_cache_key() }
+    #[cfg(not(windows))]
+    { None }
+}
+
+/// Of the cached translations met since the start: those an earlier build
+/// of the translator made, those translated again, and those that came out
+/// different (`victory_gpu::shader_cache`).
+pub fn stale_shaders() -> (u64, u64, u64) {
     #[cfg(windows)]
     {
-        victory_gpu::shader_cache::precompile(container).map(|was_there| !was_there)
+        victory_gpu::shader_cache::stale_counts()
     }
     #[cfg(not(windows))]
     {
-        let _ = container;
-        Err("no shader cache on this host".into())
+        (0, 0, 0)
     }
 }
 

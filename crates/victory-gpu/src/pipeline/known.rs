@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -30,6 +30,8 @@ use windows::core::PCSTR;
 
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
+
+mod writer;
 
 const SHADERS: &str = "known-shaders.bin";
 const PIPELINES: &str = "known-pipelines.bin";
@@ -52,9 +54,14 @@ struct Book {
     added: usize,
 }
 
-static BOOK: OnceLock<Option<Mutex<Book>>> = OnceLock::new();
+struct Recorder {
+    book: Mutex<Book>,
+    writer: writer::Writer,
+}
 
-fn book() -> Option<&'static Mutex<Book>> {
+static BOOK: OnceLock<Option<Recorder>> = OnceLock::new();
+
+fn book() -> Option<&'static Recorder> {
     BOOK.get_or_init(|| {
         let dir = super::library::folder().filter(|_| on())?;
         std::fs::create_dir_all(&dir).ok()?;
@@ -77,26 +84,22 @@ fn book() -> Option<&'static Mutex<Book>> {
             }
         }
         tracing::info!(pipelines = keys.len(), shaders = shaders.len(), "title pipelines known from earlier runs");
-        let spawned = std::thread::Builder::new().name("victory-known".into()).spawn(|| {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                flush();
-            }
-        });
-        spawned.ok()?;
-        Some(Mutex::new(Book { dir, keys, shaders, new: Default::default(), added: 0 }))
+        Some(Recorder {
+            writer: writer::Writer::start(flush).ok()?,
+            book: Mutex::new(Book { dir, keys, shaders, new: Default::default(), added: 0 }),
+        })
     })
     .as_ref()
 }
 
 /// The title created a pipeline.
 pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) {
-    let Some(book) = book() else { return };
+    let Some(recorder) = book() else { return };
     let mut id = [0u8; 16];
     for (at, b) in id.iter_mut().enumerate() {
         *b = key.get(2 * at..2 * at + 2).and_then(|x| u8::from_str_radix(x, 16).ok()).unwrap_or(0);
     }
-    let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
+    let mut book = recorder.book.lock().unwrap_or_else(|e| e.into_inner());
     if shaders.is_empty() || !book.keys.insert(id) {
         return;
     }
@@ -124,28 +127,74 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
     book.added += 1;
 }
 
-/// Writes what was noted.
-fn flush() {
-    let Some(Some(book)) = BOOK.get() else { return };
-    let (dir, new, added) = {
+/// Appends pipelines noted since the last successful write, if the book is active.
+pub fn flush() {
+    let Some(Some(recorder)) = BOOK.get() else { return };
+    flush_book(&recorder.book);
+}
+
+/// Gives the existing writer a short chance to save after the fatal GPU report.
+pub fn flush_on_gpu_failure() {
+    if let Some(Some(recorder)) = BOOK.get() {
+        recorder.writer.request_flush(std::time::Duration::from_millis(250));
+    }
+}
+
+fn flush_book(book: &Mutex<Book>) {
+    // The timer and shutdown may both flush. Keep their writes in order while
+    // allowing the title to note more pipelines during disk I/O.
+    static WRITER: Mutex<()> = Mutex::new(());
+    let _writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, mut new, added) = {
         let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
         if book.added == 0 {
             return;
         }
         (book.dir.clone(), std::mem::take(&mut book.new), std::mem::take(&mut book.added))
     };
-    for (file, bytes) in [SHADERS, PIPELINES].iter().zip(&new) {
+    for (file, bytes) in [SHADERS, PIPELINES].into_iter().zip(&mut new) {
+        if bytes.is_empty() {
+            continue;
+        }
         let written = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(dir.join(file))
-            .and_then(|mut f| f.write_all(bytes));
+            .and_then(|f| append_bytes(f, bytes));
         if let Err(e) = written {
-            tracing::warn!(error = %e, file, "title pipelines not written down");
+            let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
+            for (mut older, newer) in new.into_iter().zip(&mut book.new) {
+                if !older.is_empty() {
+                    older.append(newer);
+                    *newer = older;
+                }
+            }
+            book.added += added;
+            drop(book);
+            tracing::warn!(error = %e, file, "keeping unwritten title pipelines for retry");
             return;
         }
     }
     tracing::info!(pipelines = added, "title pipelines written down");
+}
+
+/// A failed append may already have written a prefix of a record.
+fn append_bytes(mut out: impl Write, bytes: &mut Vec<u8>) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let mut written = 0;
+    let result = loop {
+        if written == bytes.len() {
+            break Ok(());
+        }
+        match out.write(&bytes[written..]) {
+            Ok(0) => break Err(Error::from(ErrorKind::WriteZero)),
+            Ok(n) => written += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => break Err(e),
+        }
+    };
+    bytes.drain(..written);
+    result
 }
 
 /// Calls `f` with each container's stage, hash, place and length; where the
@@ -169,16 +218,16 @@ fn walk_shaders(dir: &Path, mut f: impl FnMut(u8, [u8; 32], u64, u32)) -> u64 {
     at
 }
 
-/// Calls `f` with each pipeline's number and entry; where the last whole one
-/// ends.
-fn walk_pipelines(dir: &Path, mut f: impl FnMut(usize, &[u8])) -> u64 {
+/// Calls `f` with the offset of each length prefix and the entry that follows.
+/// Returns where the last whole entry ends.
+fn walk_pipelines(dir: &Path, mut f: impl FnMut(u64, &[u8])) -> u64 {
     let bytes = std::fs::read(dir.join(PIPELINES)).unwrap_or_default();
-    let (mut at, mut n) = (0, 0);
+    let mut at = 0;
     while let Some(head) = bytes.get(at..at + 4) {
         let size = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
         let Some(entry) = bytes.get(at + 4..at + 4 + size) else { break };
-        f(n, entry);
-        (at, n) = (at + 4 + size, n + 1);
+        f(at as u64, entry);
+        at += 4 + size;
     }
     at as u64
 }
@@ -190,13 +239,49 @@ pub fn count(dir: &Path) -> usize {
     n
 }
 
+fn recipe_key(entry: &[u8]) -> String {
+    entry.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The key of each pipeline known in `dir`, as the early list has it.
 pub fn keys(dir: &Path) -> Vec<String> {
     let mut all = Vec::new();
-    walk_pipelines(dir, |_, e| {
-        all.push(e.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect());
-    });
+    walk_pipelines(dir, |_, entry| all.push(recipe_key(entry)));
     all
+}
+
+/// A recorded pipeline and whether the configured shader skip list excludes it.
+pub struct WarmEntry {
+    pub key: String,
+    pub skipped: bool,
+    pub offset: u64,
+}
+
+/// Entries in their recorded order, so worker indices still name the same pipelines.
+pub fn warm_entries(dir: &Path) -> Vec<WarmEntry> {
+    let skips = super::skip_hashes();
+    let mut entries = Vec::new();
+    walk_pipelines(dir, |offset, entry| {
+        entries.push(WarmEntry { key: recipe_key(entry), skipped: matches_skip_list(entry, skips), offset });
+    });
+    entries
+}
+
+fn matches_skip_list(entry: &[u8], skips: &[String]) -> bool {
+    if skips.is_empty() {
+        return false;
+    }
+    let Some((&count, rest)) = entry.get(16..).and_then(|bytes| bytes.split_first()) else {
+        return false;
+    };
+    let Some(shaders) = rest.get(..usize::from(count) * 33) else {
+        return false;
+    };
+    shaders.chunks_exact(33).any(|shader| {
+        let hash = blake3::Hash::from_bytes(shader[1..].try_into().expect("recorded shader hash"));
+        let hex = hash.to_hex();
+        skips.iter().any(|skip| skip == &hex[..16])
+    })
 }
 
 /// What a driver's cached pipelines depend on besides the title's: the
@@ -216,23 +301,51 @@ pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
 }
 
-/// Makes the host pipelines of those of `which` (numbers in the file) and
-/// lets each go again: the driver's cache on disk keeps them. `each` is told
-/// the number before, and what came of it after: milliseconds and whether
-/// there is one.
-pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
+/// A recipe selected by the warm command, in the book it scanned.
+pub struct WarmRecipe<'a> {
+    pub index: usize,
+    pub offset: u64,
+    pub key: &'a str,
+}
+
+/// Load only this worker's recipes, in request order. Check the keys before
+/// any work is reported so a changed book is a setup error, not a bad shader.
+fn requested_pipelines(dir: &Path, which: &[WarmRecipe<'_>]) -> io::Result<Vec<Vec<u8>>> {
+    let mut book = std::fs::File::open(dir.join(PIPELINES))?;
+    let len = book.metadata()?.len();
+    which.iter().map(|recipe| {
+        let Some(body) = recipe.offset.checked_add(4).filter(|&at| at <= len) else {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "pipeline recipe offset past end of book"));
+        };
+        book.seek(SeekFrom::Start(recipe.offset))?;
+        let mut head = [0; 4];
+        book.read_exact(&mut head)?;
+        let size = u32::from_le_bytes(head);
+        if u64::from(size) > len - body {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete pipeline recipe"));
+        }
+        let mut entry = vec![0; size as usize];
+        book.read_exact(&mut entry)?;
+        if recipe_key(&entry) != recipe.key {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "pipeline book changed before the worker read it"));
+        }
+        Ok(entry)
+    }).collect()
+}
+
+/// Makes the selected host pipelines and lets each go again: the driver's
+/// cache on disk keeps them. `each` receives each recipe's index before
+/// compiling, and afterward with elapsed milliseconds and success. Unreadable
+/// recipes return an error before reporting the start of compilation.
+pub fn make(
+    dir: &Path, which: &[WarmRecipe<'_>], mut each: impl FnMut(usize, Option<(f64, bool)>),
+) -> io::Result<()> {
+    let entries = requested_pipelines(dir, which)?;
     let mut places = HashMap::new();
     walk_shaders(dir, |stage, hash, at, len| {
         places.insert(hash, (stage, at, len));
     });
-    let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
-    let wanted: HashSet<usize> = which.iter().copied().collect();
-    let mut entries = HashMap::new();
-    walk_pipelines(dir, |n, bytes| {
-        if wanted.contains(&n) {
-            entries.insert(n, bytes.to_vec());
-        }
-    });
+    let mut file = std::fs::File::open(dir.join(SHADERS))?;
     let mut read = |hash: &[u8; 32]| {
         let &(_, at, len) = places.get(hash)?;
         let mut bytes = vec![0; len as usize];
@@ -240,15 +353,19 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
         file.read_exact(&mut bytes).ok()?;
         Some(bytes)
     };
-    for n in which {
-        let Some(entry) = entries.get(n) else { continue };
-        each(*n, None);
+    for (recipe, entry) in which.iter().zip(&entries) {
         let began = std::time::Instant::now();
-        let made = parse(entry, &mut read)
-            .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
-            .is_some();
-        each(*n, Some((began.elapsed().as_secs_f64() * 1e3, made)));
+        let (shaders, graphics) = parse(entry, &mut read).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("pipeline recipe {} ({}) or its shader data is incomplete or invalid", recipe.index, recipe.key),
+            )
+        })?;
+        each(recipe.index, None);
+        let made = HostPipeline::new(&shaders, graphics.as_deref()).is_some();
+        each(recipe.index, Some((began.elapsed().as_secs_f64() * 1e3, made)));
     }
+    Ok(())
 }
 
 #[allow(clippy::type_complexity)]
@@ -424,6 +541,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failed_open_retries_before_later_records() {
+        for blocked in [SHADERS, PIPELINES] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            let book = Mutex::new(Book {
+                dir: dir.into(),
+                keys: HashSet::new(),
+                shaders: HashSet::new(),
+                new: [vec![1], vec![11]],
+                added: 1,
+            });
+            std::fs::create_dir(dir.join(blocked)).unwrap();
+            flush_book(&book);
+            std::fs::remove_dir(dir.join(blocked)).unwrap();
+            {
+                let mut b = book.lock().unwrap();
+                assert_eq!(b.added, 1);
+                b.new[0].push(2);
+                b.new[1].push(12);
+                b.added += 1;
+            }
+            flush_book(&book);
+            flush_book(&book);
+            assert_eq!(std::fs::read(dir.join(SHADERS)).unwrap(), [1, 2]);
+            assert_eq!(std::fs::read(dir.join(PIPELINES)).unwrap(), [11, 12]);
+            assert_eq!(book.lock().unwrap().added, 0);
+        }
+    }
+
+    #[test]
+    fn a_short_write_keeps_only_the_unwritten_suffix() {
+        let mut pending = vec![1, 2, 3, 4, 5];
+        let mut first = [0; 2];
+        // A fixed-size output accepts the prefix, then returns Ok(0).
+        let err = append_bytes(&mut first[..], &mut pending).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(first, [1, 2]);
+        assert_eq!(pending, [3, 4, 5]);
+        let mut rest = Vec::new();
+        append_bytes(&mut rest, &mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(rest, [3, 4, 5]);
+    }
+
+    #[test]
     fn a_state_comes_back_as_it_was() {
         let mut g = GraphicsState { sample_mask: 7, depth_bounds: true, ..Default::default() };
         g.rasterizer.DepthBias = -3;
@@ -454,6 +616,66 @@ mod tests {
         assert_eq!(back.describe(), g.describe());
         assert!(GraphicsState::get(&bytes[..bytes.len() - 1]).is_none());
         assert!(GraphicsState::get(&bytes[..9]).is_none());
+    }
+
+    #[test]
+    fn a_warm_skip_can_match_any_shader_in_a_recipe() {
+        let mut entry = vec![0xff; 16];
+        entry.extend([2, 0]);
+        entry.extend([0x11; 32]);
+        entry.push(1);
+        entry.extend([0x22; 32]);
+        entry.push(0);
+
+        let skips = vec!["22".repeat(8)];
+        assert!(matches_skip_list(&entry, &skips));
+        assert!(!matches_skip_list(&entry, &["33".repeat(8)]));
+        assert!(!matches_skip_list(&entry, &[]));
+        assert!(!matches_skip_list(&entry[..entry.len() - 2], &skips));
+    }
+
+    #[test]
+    fn a_warm_worker_reads_selected_recipes_in_request_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = Vec::new();
+        for (byte, size) in [(1, 18u32), (2, 240), (3, 51)] {
+            bytes.extend(size.to_le_bytes());
+            bytes.extend(vec![byte; size as usize]);
+        }
+        bytes.extend(100u32.to_le_bytes()); // interrupted append
+        std::fs::write(dir.path().join(PIPELINES), &bytes).unwrap();
+        let entries = warm_entries(dir.path());
+        assert_eq!(entries.len(), 3);
+        let request = |index: usize| WarmRecipe {
+            index, offset: entries[index].offset, key: &entries[index].key,
+        };
+        let which = [request(2), request(0), request(2)];
+        assert_eq!(requested_pipelines(dir.path(), &which).unwrap(), [vec![3; 51], vec![1; 18], vec![3; 51]]);
+
+        let mut stale = [request(0)];
+        stale[0].offset = entries[1].offset;
+        assert_eq!(requested_pipelines(dir.path(), &stale).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        stale[0].offset = (bytes.len() - 4) as u64;
+        assert_eq!(requested_pipelines(dir.path(), &stale).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn a_missing_shader_keeps_the_pipeline_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entry = vec![0x12; 16];
+        entry.extend([1, 5]); // One compute shader.
+        entry.extend([0xab; 32]);
+        entry.push(0); // No graphics state.
+        let mut book = (entry.len() as u32).to_le_bytes().to_vec();
+        book.extend(entry);
+        std::fs::write(dir.path().join(PIPELINES), book).unwrap();
+        std::fs::write(dir.path().join(SHADERS), b"").unwrap();
+
+        let key = "12".repeat(16);
+        let which = [WarmRecipe { index: 0, offset: 0, key: &key }];
+        let error = make(dir.path(), &which, |_, _| panic!("an unreadable recipe reported progress")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(&key));
     }
 
     #[test]

@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 
 /// The system's processor sets of group 0: each one's id, its efficiency
-/// class (higher is faster) and its logical processor's number.
-fn cpu_sets() -> Vec<(u32, u8, u8)> {
+/// class (higher is faster), its core (which two of them may share) and its
+/// logical processor's number.
+fn cpu_set_records() -> Vec<(u32, u8, u8, u8)> {
     use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut bytes = 0u32;
@@ -27,18 +28,159 @@ fn cpu_sets() -> Vec<(u32, u8, u8)> {
         // SAFETY: the record's type is CpuSet (the only one there is).
         let set = unsafe { &info.Anonymous.CpuSet };
         if set.Group == 0 {
-            sets.push((set.Id, set.EfficiencyClass, set.LogicalProcessorIndex));
+            sets.push((set.Id, set.EfficiencyClass, set.CoreIndex, set.LogicalProcessorIndex));
         }
         at += info.Size as usize;
     }
     sets
 }
 
+/// The sets by core: each one's id, its efficiency class and its core.
+#[cfg(test)]
+fn cpu_sets() -> Vec<(u32, u8, u8)> {
+    cpu_set_records().into_iter().map(|(id, class, core, _)| (id, class, core)).collect()
+}
+
+/// The bytes of the last-level cache each processor set of group 0 shares,
+/// by set id (none known: empty).
+fn l3_of_sets() -> Vec<(u32, u32)> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, GetSystemCpuSetInformation, RelationCache, SYSTEM_CPU_SET_INFORMATION,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // The largest cache of each logical processor of group 0, by its index.
+    let mut by_processor = [0u32; 64];
+    let mut bytes = 0u32;
+    // SAFETY: a size query, then the call into a buffer of that size.
+    unsafe { GetLogicalProcessorInformationEx(RelationCache, std::ptr::null_mut(), &mut bytes) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    // SAFETY: as above; the buffer holds `bytes` bytes, aligned for the records.
+    let ok = unsafe { GetLogicalProcessorInformationEx(RelationCache, buffer.as_mut_ptr().cast(), &mut bytes) };
+    let mut at = 0usize;
+    while ok != 0 && at + size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() <= bytes as usize {
+        // SAFETY: a record inside the buffer; each says its own size.
+        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()) };
+        if info.Size == 0 {
+            break;
+        }
+        if info.Relationship == RelationCache {
+            // SAFETY: a cache record (asked for), with at least its first group mask.
+            let cache = unsafe { &info.Anonymous.Cache };
+            let mask = unsafe { cache.Anonymous.GroupMask };
+            if mask.Group == 0 {
+                for (p, size) in by_processor.iter_mut().enumerate() {
+                    if mask.Mask >> p & 1 != 0 {
+                        *size = (*size).max(cache.CacheSize);
+                    }
+                }
+            }
+        }
+        at += info.Size as usize;
+    }
+    // Processor indices to set ids.
+    let mut bytes = 0u32;
+    // SAFETY: as for `cpu_sets`.
+    unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    // SAFETY: as above.
+    let ok = unsafe { GetSystemCpuSetInformation(buffer.as_mut_ptr().cast(), bytes, &mut bytes, GetCurrentProcess(), 0) };
+    let mut sizes = Vec::new();
+    let mut at = 0usize;
+    while ok != 0 && at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes as usize {
+        // SAFETY: a record inside the buffer; each says its own size.
+        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_CPU_SET_INFORMATION>()) };
+        if info.Size == 0 {
+            break;
+        }
+        // SAFETY: the record's type is CpuSet (the only one there is).
+        let set = unsafe { &info.Anonymous.CpuSet };
+        if set.Group == 0 && let Some(&size) = by_processor.get(set.LogicalProcessorIndex as usize) {
+            sizes.push((set.Id, size));
+        }
+        at += info.Size as usize;
+    }
+    sizes
+}
+
+/// Whether the cores of the largest last-level cache count as the fast
+/// ones where all cores are of one class (`VICTORY_CACHE_CORES=0`: not).
+/// On a processor with two core complexes of which one has the stacked cache
+/// (Ryzen 7900X3D, 7950X3D, 9900X3D, 9950X3D) every core reports the same
+/// efficiency class, so nothing was asked for: our threads ran on either
+/// complex. Their work (compares, hashes, copies of tens of megabytes a
+/// frame) is the kind the larger cache serves. Nothing changes on a processor
+/// whose caches are all alike, or with two kinds of cores.
+fn cache_cores() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_CACHE_CORES") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CACHE_CORES").is_none_or(|v| v != "0"))
+}
+
 /// The sets of the fastest class, if there are slower ones too.
-fn fast_of(sets: &[(u32, u8, u8)]) -> Vec<u32> {
+fn fast_by_class(sets: &[(u32, u8, u8)]) -> Vec<u32> {
     let best = sets.iter().map(|c| c.1).max().unwrap_or(0);
     let fast: Vec<u32> = sets.iter().filter(|c| c.1 == best).map(|c| c.0).collect();
     if fast.len() == sets.len() { Vec::new() } else { fast }
+}
+
+/// The sets on the largest last-level cache (`l3`: bytes by set id), if
+/// another one is smaller and the largest serves at least eight sets.
+fn fast_by_cache(sets: &[(u32, u8, u8)], l3: &[(u32, u32)]) -> Vec<u32> {
+    let size = |id: u32| l3.iter().find(|s| s.0 == id).map_or(0, |s| s.1);
+    let sizes: Vec<u32> = sets.iter().map(|s| size(s.0)).collect();
+    let (Some(&most), Some(&least)) = (sizes.iter().max(), sizes.iter().min()) else {
+        return Vec::new();
+    };
+    if least == 0 || least == most {
+        return Vec::new();
+    }
+    let fast: Vec<u32> = sets.iter().filter(|s| size(s.0) == most).map(|s| s.0).collect();
+    if fast.len() < 8 { Vec::new() } else { fast }
+}
+
+/// The fast sets: those of the fastest class if there are slower ones, else
+/// those of the largest cache ([`cache_cores`]). `now`: as things are at this
+/// moment (else whether there could be any, for threads to ask at all).
+fn fast_sets(sets: &[(u32, u8, u8)], now: bool) -> Vec<u32> {
+    let by_class = fast_by_class(sets);
+    if !by_class.is_empty() || (now && !cache_cores()) {
+        return by_class;
+    }
+    static L3: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+    fast_by_cache(sets, L3.get_or_init(l3_of_sets))
+}
+
+fn fast_of(sets: &[(u32, u8, u8)]) -> Vec<u32> {
+    fast_sets(sets, true)
+}
+
+/// The sets of one fast core of the last, and all the others, for
+/// [`lane_core`]; `None` with fewer than six fast cores.
+fn one_core(sets: &[(u32, u8, u8)]) -> Option<(Vec<u32>, Vec<u32>)> {
+    let best = sets.iter().map(|c| c.1).max()?;
+    let mut cores: Vec<u8> = sets.iter().filter(|c| c.1 == best).map(|c| c.2).collect();
+    cores.sort_unstable();
+    cores.dedup();
+    let core = *cores.last().filter(|_| cores.len() >= 6)?;
+    let of = |own: bool| sets.iter().filter(|c| (c.2 == core) == own).map(|c| c.0).collect();
+    Some((of(true), of(false)))
+}
+
+/// Whether the submitting thread has a fast core to itself, as far as this
+/// process goes (`VICTORY_LANE_CORE=1`): nothing else of it runs on the
+/// core's two threads. It was the one a frame waited for (94 % of it in a
+/// street), and shared its core's units with whatever ran beside it.
+fn lane_core() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_LANE_CORE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LANE_CORE").is_some_and(|v| v == "1"))
 }
 
 /// Of the sets of the logical processors the title asked none of its threads
@@ -223,20 +365,33 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
 }
 
-/// The sets, and the fast ones among them.
-fn sets() -> &'static (Vec<(u32, u8, u8)>, Vec<u32>) {
-    static SETS: OnceLock<(Vec<(u32, u8, u8)>, Vec<u32>)> = OnceLock::new();
+/// The sets read once: by logical processor (id, class, logical
+/// processor), for what the title leaves ([`left_of`]), and by core (id,
+/// class, core), for the fast ones ([`fast_of`]) and one of them
+/// ([`one_core`]).
+fn sets() -> &'static (Vec<(u32, u8, u8)>, Vec<(u32, u8, u8)>) {
+    static SETS: OnceLock<(Vec<(u32, u8, u8)>, Vec<(u32, u8, u8)>)> = OnceLock::new();
     SETS.get_or_init(|| {
-        let sets = cpu_sets();
-        let fast = fast_of(&sets);
-        (sets, fast)
+        let records = cpu_set_records();
+        let by = |f: fn(&(u32, u8, u8, u8)) -> u8| records.iter().map(|r| (r.0, r.1, f(r))).collect();
+        (by(|r| r.3), by(|r| r.2))
     })
 }
 
 /// Where a thread that asked as `what` at stage `from` is to run, and what
 /// that is called; `None`: wherever the system likes.
 fn chosen(what: &str, from: u32) -> Option<(Vec<u32>, &'static str)> {
-    let (sets, fast) = sets();
+    let (sets, by_core) = sets();
+    // (`VICTORY_CACHE_CORES` may change while the title runs.)
+    let mut fast = fast_of(by_core);
+    // `VICTORY_LANE_CORE=1`: the submitting thread alone on a fast core,
+    // the others' fast cores without it.
+    if let Some((own, _)) = one_core(by_core).filter(|_| lane_core()) {
+        if what == "victory-submit" {
+            return Some((own, "a fast core of its own (VICTORY_LANE_CORE)"));
+        }
+        fast.retain(|id| !own.contains(id));
+    }
     let asked = TITLE_ASKED.load(Relaxed);
     let kept = match what {
         "victory-list" if apart() => Some((false, "the slow cores the title leaves (VICTORY_PLACE_APART)")),
@@ -257,7 +412,7 @@ fn chosen(what: &str, from: u32) -> Option<(Vec<u32>, &'static str)> {
             tracing::info!(what, title = format_args!("{asked:#x}"), "the title leaves no {cores} cores: the thread stays where it was ({kind})");
         });
     }
-    (stage() >= from && !fast.is_empty()).then(|| (fast.clone(), "the fast cores (VICTORY_FAST_CORES=0: not)"))
+    (stage() >= from && !fast.is_empty()).then_some((fast, "the fast cores (VICTORY_FAST_CORES=0: not)"))
 }
 
 /// Our threads that asked: a handle each, the stage and the name they asked
@@ -274,6 +429,9 @@ fn ask(what: &str, from: u32) {
     if handle.is_null() {
         return;
     }
+    if lane_core() {
+        process_default();
+    }
     let mut ours = OURS.lock().unwrap_or_else(|e| e.into_inner());
     ours.push((handle as usize, from, what.to_string()));
     // (Under the lock: a placing again does not come between. Nothing to
@@ -281,6 +439,42 @@ fn ask(what: &str, from: u32) {
     if let Some((sets, kind)) = chosen(what, from) {
         select(handle as usize, what, &sets, kind, true);
     }
+}
+
+/// Every thread of the process is kept off the submitting thread's own core
+/// ([`lane_core`]), or may run anywhere.
+fn process_default() {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessDefaultCpuSets};
+    if stage() == 0 {
+        return;
+    }
+    let one = one_core(&sets().1).filter(|_| lane_core());
+    let others: &[u32] = one.as_ref().map_or(&[], |o| &o.1);
+    let at = if others.is_empty() { std::ptr::null() } else { others.as_ptr() };
+    // SAFETY: our own process and the system's own set ids (none: all).
+    unsafe { SetProcessDefaultCpuSets(GetCurrentProcess(), at, others.len() as u32) };
+}
+
+/// What the threads of the process, and those of ours that asked, are told
+/// now ([`lane_core`] and [`cache_cores`], which may have changed while the
+/// title runs).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn settle() {
+    if stage() == 0 {
+        return;
+    }
+    process_default();
+    place_again();
+    let by_core = &sets().1;
+    let one = one_core(by_core).filter(|_| lane_core());
+    tracing::info!(on = one.is_some(), core = ?one.as_ref().map(|o| &o.0), "the submitting thread has a core of its own (VICTORY_LANE_CORE)");
+    let fast = fast_of(by_core);
+    tracing::info!(
+        fast = fast.len(),
+        of = by_core.len(),
+        by_cache = fast_by_class(by_core).is_empty() && !fast.is_empty(),
+        "our threads' processors (VICTORY_CACHE_CORES)"
+    );
 }
 
 /// Asks for `sets` (none: the system's choice) for the thread `handle`.
@@ -316,17 +510,124 @@ fn place_again() {
     );
 }
 
+/// Whether the threads the submitting thread waits for run at its priority
+/// (`VICTORY_HELPER_PRIORITY=1`; off by default; `VICTORY_AB` can flip it
+/// while the title runs): above normal, ahead of the title's threads and of
+/// the threads that translate lists. They are the threads that spread its work
+/// (`shadow::wide`, the pools of `land`), the one that makes the heaps'
+/// records and the one that passes over the heap's views beside the lists.
+/// With `VICTORY_WIDE_SPIN` set, the `shadow::wide` workers busy-wait at that
+/// priority between jobs.
+///
+/// The submitting thread is above normal (`queue::behind`); its helpers are
+/// not, so on a busy processor it can stand waiting for helpers that are not
+/// running. Measured on a six-core processor (i5-12400F, 12 threads, RTX 3060,
+/// `-Machine 4070`, Series S at half scale) with `VICTORY_AB`, standing still
+/// in one scene with the same draws in every phase (off / on): 11.6 / 11.7
+/// fps, refreshes 19.1 / 16.9 ms a frame, waiting for the heaps' records 0.5
+/// / 0.0 ms, the title's threads waiting at presents 33.9 / 28.9 ms. The
+/// waits shrink, the frame rate did not move, and the helpers then run ahead
+/// of the title's own normal-priority threads (simulation, audio, streaming),
+/// which on a smaller or busier processor may cost more than it gives: off
+/// until another processor measures it.
+fn helpers_raised() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HELPER_PRIORITY") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HELPER_PRIORITY"))
+}
+
+/// A helper's priority ([`helpers_raised`]). [`Self::keep`] is called before
+/// each piece of work; it asks the system only when the switch has changed.
+pub(crate) struct Priority {
+    requested: Option<bool>,
+}
+
+impl Priority {
+    pub(crate) fn new() -> Self {
+        let mut priority = Self { requested: None };
+        priority.keep();
+        priority
+    }
+
+    pub(crate) fn keep(&mut self) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+        };
+        let on = helpers_raised();
+        if self.requested == Some(on) {
+            return;
+        }
+        let priority = if on { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+        // SAFETY: our own thread.
+        if unsafe { SetThreadPriority(GetCurrentThread(), priority) } == 0 {
+            let error = std::io::Error::last_os_error();
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::warn!(%error, priority, "could not set the submitting helper's priority");
+            });
+        }
+        self.requested = Some(on);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn the_fast_cores_are_those_of_the_best_class_if_there_is_a_worse_one() {
-        assert_eq!(fast_of(&[(256, 1, 0), (257, 1, 1), (258, 0, 2)]), [256, 257]);
-        assert!(fast_of(&[(256, 0, 0), (257, 0, 1)]).is_empty());
-        assert!(fast_of(&[]).is_empty());
+        assert_eq!(fast_by_class(&[(256, 1, 0), (257, 1, 0), (258, 0, 2)]), [256, 257]);
+        assert!(fast_by_class(&[(256, 0, 0), (257, 0, 1)]).is_empty());
+        assert!(one_core(&[(256, 1, 0), (257, 1, 0), (258, 0, 2)]).is_none());
+        let eight: Vec<(u32, u8, u8)> = (0..16).map(|n| (n, 1, n as u8 / 2 * 2)).chain((16..24).map(|n| (n, 0, n as u8))).collect();
+        let (own, others) = one_core(&eight).unwrap();
+        assert_eq!((own, others.len()), (vec![14, 15], 22));
+        assert!(fast_by_class(&[]).is_empty());
         assert!(!cpu_sets().is_empty());
         std::thread::spawn(|| keep_on_fast_cores("test")).join().unwrap();
+    }
+
+    const MB: u32 = 1 << 20;
+
+    /// `n` sets of one class, two to a core, from id 256.
+    fn alike(n: u32) -> Vec<(u32, u8, u8)> {
+        (0..n).map(|i| (256 + i, 0, (i / 2) as u8)).collect()
+    }
+
+    #[test]
+    fn the_largest_cache_is_fast_only_where_the_caches_differ() {
+        // Two complexes, one with the stacked cache (9950X3D: 16 sets each).
+        let sets = alike(32);
+        let l3: Vec<(u32, u32)> = (0..32).map(|i| (256 + i, if i < 16 { 96 * MB } else { 32 * MB })).collect();
+        assert_eq!(fast_by_cache(&sets, &l3), (256..272).collect::<Vec<_>>());
+        // The stacked cache on the second complex: that one.
+        let flipped: Vec<(u32, u32)> = (0..32).map(|i| (256 + i, if i < 16 { 32 * MB } else { 96 * MB })).collect();
+        assert_eq!(fast_by_cache(&sets, &flipped), (272..288).collect::<Vec<_>>());
+        // Two complexes alike (9950X): nothing.
+        let even: Vec<(u32, u32)> = (0..32).map(|i| (256 + i, 32 * MB)).collect();
+        assert!(fast_by_cache(&sets, &even).is_empty());
+        // One complex (7800X3D, 9800X3D): nothing.
+        let one: Vec<(u32, u32)> = (0..16).map(|i| (256 + i, 96 * MB)).collect();
+        assert!(fast_by_cache(&alike(16), &one).is_empty());
+        // Caches not known: nothing.
+        assert!(fast_by_cache(&sets, &[]).is_empty());
+        assert!(fast_by_cache(&sets, &l3[..16]).is_empty());
+        // A larger cache of under eight sets: nothing.
+        let few: Vec<(u32, u32)> = (0..32).map(|i| (256 + i, if i < 4 { 64 * MB } else { 32 * MB })).collect();
+        assert!(fast_by_cache(&sets, &few).is_empty());
+    }
+
+    #[test]
+    fn two_kinds_of_cores_still_go_by_their_class() {
+        // Eight fast cores (two sets each) and eight slow ones, the caches
+        // told to differ too: the class decides, whatever the caches say.
+        let sets: Vec<(u32, u8, u8)> =
+            (0..16).map(|n| (n, 1, n as u8 / 2 * 2)).chain((16..24).map(|n| (n, 0, n as u8))).collect();
+        assert_eq!(fast_sets(&sets, true), (0..16).collect::<Vec<_>>());
+        assert_eq!(fast_sets(&sets, false), (0..16).collect::<Vec<_>>());
     }
 
     /// The title on the first two fast processors of three: of the rest,

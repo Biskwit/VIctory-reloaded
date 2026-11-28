@@ -37,8 +37,17 @@ pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
-/// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
+/// Dwords of the [`SLOT_STRIDES`] buffer's strides: heap indices are
+/// clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// Where the [`SLOT_STRIDES`] buffer's second table begins (bytes): two
+/// dwords per view heap slot, the title address of the buffer view (or
+/// ray-tracing structure) there, low 32 bits first; 0 for anything else.
+/// Read by a program that takes the address out of a descriptor it picks
+/// at a computed index and walks the memory behind it.
+pub const VIEW_ADDRESSES: u32 = SLOT_STRIDES_COUNT * 4;
+/// Bytes of the whole [`SLOT_STRIDES`] buffer.
+pub const SLOT_STRIDES_BYTES: u32 = VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -102,6 +111,8 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// ForceEarlyDepthStencil, the DXIL equivalent of HLSL's earlydepthstencil.
+    pub const EARLY_DEPTH_STENCIL: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -153,6 +164,12 @@ pub(crate) struct Geometry {
 /// RDNA3 took a page fault and removed the device.
 static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`view_heap_limit`].
+    pub(crate) static VIEW_LIMIT_HERE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
@@ -160,6 +177,10 @@ pub fn set_view_heap_limit(null_slot: u32) {
 
 /// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
+    #[cfg(test)]
+    if let Some(n) = VIEW_LIMIT_HERE.get() {
+        return n;
+    }
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -187,6 +208,27 @@ thread_local! {
 pub fn set_raw_views(first: u32) {
     debug_assert!(first == 0 || first.is_power_of_two());
     RAW_VIEWS.store(first, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`constants_raw`].
+    pub(crate) static CONSTANTS_RAW_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Renderer port 5 (`VICTORY_PORT_CBV=1`; off by default): constant buffers are read as raw
+/// bytes, a table's through the raw twin of its slot ([`raw_views`]), a root one as a root SRV,
+/// so the host can give the card the title's bytes where they are (16-byte aligned, which a
+/// constant buffer view cannot take) instead of a copy made at every submission. The host's
+/// views must follow: the twin of every constant buffer's slot a raw view of its bytes. Part of
+/// the translation: the shader cache keys on the switch.
+pub fn constants_raw() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CONSTANTS_RAW_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// See [`RAW_VIEWS`]: where shaders translated now read the buffers they pick (0: in place).
@@ -484,9 +526,37 @@ impl Shader {
         props: (u32, u32),
         bounded: bool,
     ) -> V {
+        self.nonuniform_handles += u32::from(nonuniform);
+        self.marked_heap_handle_at(block, index, sampler, nonuniform, props, bounded)
+    }
+
+    /// The handle a buffer's size is asked through (`descriptor_data`):
+    /// marked non-uniform for AMD's RDNA4 compiler (`amdxc64.dll+0x861b9f`),
+    /// which reads a null pointer compiling `getDimensions` through the
+    /// uniform heap handle the buffer's loads use, and not counted in
+    /// `nonuniform_handles`, its index being the same in every lane.
+    pub fn size_handle_at(
+        &mut self,
+        block: usize,
+        index: V,
+        props: (u32, u32),
+        bounded: bool,
+    ) -> V {
+        self.marked_heap_handle_at(block, index, false, true, props, bounded)
+    }
+
+    fn marked_heap_handle_at(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+        bounded: bool,
+    ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         // (the raw twins of buffer views lie past it: such an index comes bounded)
-        let limit = if bounded { 0 } else { VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
+        let limit = if bounded { 0 } else { view_heap_limit() };
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
@@ -513,7 +583,6 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
-        self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -883,6 +952,7 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        self.m.single_latches();
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());

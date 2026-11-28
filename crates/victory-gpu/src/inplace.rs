@@ -167,6 +167,14 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// Something placed elsewhere (`crate::port`) in the same form: counted as
+/// [`place_for`] counts, so that [`gone`] takes it off again.
+pub(crate) fn counted(window: bool, bytes: u64) {
+    let at = if window { 0 } else { 2 };
+    STATS[at].fetch_add(1, Ordering::Relaxed);
+    STATS[at + 1].fetch_add(bytes, Ordering::Relaxed);
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
@@ -181,6 +189,8 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    // Renderer port 1's regions there: no longer what the title shows.
+    crate::port::forget(at, len);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -348,6 +358,9 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     let mut v = views_mut();
     if v.views.is_empty() {
         return;
@@ -373,6 +386,24 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             }
         }
     }
+}
+
+/// Whether any page of `[start, end)` has another title view, including
+/// pages shared too widely to enumerate for write watching.
+pub(crate) fn has_alias(start: usize, end: usize) -> bool {
+    let v = views();
+    if start >= end || v.pages_twice == 0 {
+        return false;
+    }
+    let first = v.views.range(..=start).next_back()
+        .filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
+    v.views.range(first.unwrap_or(start)..end).any(|(&base, &(bytes, section, offset))| {
+        let page = start.max(base) & !(K64 - 1);
+        (page..end.min(base + bytes)).step_by(K64).any(|page| {
+            v.pages.get(&(section, offset + (page - base) as u64))
+                .is_some_and(|shown| shown.len() > 1)
+        })
+    })
 }
 
 /// The 64 KiB pages of `[start, end)` that the title shows at other
@@ -525,6 +556,40 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
 }
 
+/// The whole stretch of views around `[at, at + len)` that follow one
+/// another in memory and in one section alike, if the range is one run of a
+/// section ([`Cover::Run`]): its first address, its bytes, the section and
+/// the offset of its first byte in it.
+pub(crate) fn stretch(at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
+    let v = views();
+    stretch_in(&v.views, at, len)
+}
+
+fn stretch_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
+    let Cover::Run(section, offset) = cover_in(views, at, len) else {
+        return None;
+    };
+    // Every view of the stretch has the same address less section offset.
+    let delta = at as i128 - offset as i128;
+    let follows = |a: usize, s: usize, o: u64| s == section && a as i128 - o as i128 == delta;
+    let (&first, &(n, _, _)) = views.range(..=at).next_back()?;
+    let mut start = first;
+    for (&a, &(n, s, o)) in views.range(..first).rev() {
+        if a + n != start || !follows(a, s, o) {
+            break;
+        }
+        start = a;
+    }
+    let mut stop = first + n;
+    for (&a, &(n, s, o)) in views.range(first + 1..) {
+        if a != stop || !follows(a, s, o) {
+            break;
+        }
+        stop = a + n;
+    }
+    Some((start, stop - start, section, (start as i128 - delta) as u64))
+}
+
 /// Another address of the title memory `[at, at + len)`, if it is a view of
 /// the title's pages, all of it one run of a section: in a view of ours of
 /// the whole section, which is never guarded (`crate::watch`) nor changed.
@@ -619,7 +684,7 @@ fn hr<T>(result: &windows::core::Result<T>) -> String {
 
 /// A queue, a list and a fence of the probe's own on `device`: nothing of
 /// the host's submissions is touched.
-struct Rig {
+pub(crate) struct Rig {
     device: ID3D12Device,
     queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
@@ -639,7 +704,7 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
+    pub(crate) fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
         // SAFETY: plain creation of objects of our own.
         unsafe {
             let queue: ID3D12CommandQueue =
@@ -684,7 +749,7 @@ impl Rig {
     }
 
     /// What the GPU reads of `size` bytes of `resource` from `offset`.
-    fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
+    pub(crate) fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
         let back = self.committed(D3D12_HEAP_TYPE_READBACK, size as u64, D3D12_RESOURCE_STATE_COPY_DEST)?;
         // SAFETY: two live buffers, the range inside both.
         self.run(|list| unsafe { list.CopyBufferRegion(&back, 0, resource, offset, size as u64) })?;
@@ -699,7 +764,7 @@ impl Rig {
     }
 
     /// The GPU writes `bytes` at `offset` of `resource` (a copy).
-    fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
+    pub(crate) fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
         let up = self.committed(D3D12_HEAP_TYPE_UPLOAD, bytes.len() as u64, D3D12_RESOURCE_STATE_GENERIC_READ)?;
         let mut data = std::ptr::null_mut();
         // SAFETY: the mapping holds the buffer's bytes until unmapped.
@@ -1266,7 +1331,7 @@ pub(crate) fn tick() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Views as the runtime tells them: a range inside one view, or over
@@ -1317,6 +1382,28 @@ mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    /// The stretch around a run: views on both sides that follow in memory
+    /// and in the section, up to a view from elsewhere or a gap.
+    #[test]
+    fn a_stretch_is_the_views_around_a_run_that_follow_in_the_section() {
+        let mut views = BTreeMap::new();
+        let at = 0x7_2000_0000usize;
+        // From elsewhere in the section, just below.
+        views.insert(at - K64, (K64, 9, 40 * K64 as u64));
+        for (k, n) in [(0usize, 2usize), (2, 3), (5, 1)] {
+            views.insert(at + k * K64, (n * K64, 9, ((10 + k) * K64) as u64));
+        }
+        // Next in memory, of another section; then a gap.
+        views.insert(at + 6 * K64, (K64, 8, 16 * K64 as u64));
+        views.insert(at + 8 * K64, (K64, 9, 18 * K64 as u64));
+        let whole = Some((at, 6 * K64, 9, 10 * K64 as u64));
+        assert_eq!(stretch_in(&views, at + 3 * K64 + 5, 10), whole);
+        assert_eq!(stretch_in(&views, at, 6 * K64), whole);
+        assert_eq!(stretch_in(&views, at + 5 * K64, 2 * K64), None, "into the other section");
+        assert_eq!(stretch_in(&views, at + 6 * K64, K64), Some((at + 6 * K64, K64, 8, 16 * K64 as u64)));
+        assert_eq!(stretch_in(&views, at + 7 * K64, K64), None, "the gap");
     }
 
     /// What the runtime forgets when memory is mapped anew.
@@ -1455,5 +1542,16 @@ mod tests {
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn views_gone_empty_range_leaves_existing_views_alone() {
+        let base = 0x7_9000_0000usize;
+        let section = 0x77_0001usize;
+        title_memory_view(base, K64, section, 0);
+        views_gone(base, 0);
+        assert_eq!(cover(base, K64), Cover::Run(section, 0));
+        views_gone(base, K64);
+        assert_eq!(cover(base, K64), Cover::None);
     }
 }

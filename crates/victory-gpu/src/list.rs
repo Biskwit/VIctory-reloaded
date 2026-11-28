@@ -149,7 +149,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -208,6 +208,13 @@ impl Detached {
     /// has completed, without waiting for the full `bury_lag` allocator delay.
     pub(crate) fn release_tables(&mut self) {
         self.state.tables_done();
+    }
+
+    /// Number of dynamic descriptor slots still held by this detached list
+    /// waiting for retirement.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pending_dynamic_slots(&self) -> u64 {
+        self.state.pending_dynamic_slots()
     }
 }
 
@@ -289,13 +296,15 @@ fn fresh_list() -> Option<crate::host::HostList> {
     Some(list)
 }
 
-/// A host list for a title's list that was submitted: closed, for the
-/// title's next call on it is a reset ([`idle_list`]).
+/// A host list for a title's list that was submitted, whose next call on
+/// it is a reset: closed after its reset when it ran (`recycle`), or left
+/// open, for that reset closes a recording it discards
+/// (`HostList::left_open`). Neither closes it on the line's thread.
 #[cfg(windows)]
 fn closed_list() -> Option<crate::host::HostList> {
     let (list, closed) = idle_list()?;
     if !closed {
-        list.close();
+        list.left_open();
     }
     Some(list)
 }
@@ -411,7 +420,7 @@ pub(crate) fn cut_list(this: This) -> bool {
 pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 
 /// Takes the host sides of the submitted `lists`, part by part ([`cut`]),
-/// and leaves each list a new, closed host list for its next reset, as
+/// and leaves each list a host list for its next reset ([`closed_list`]), as
 /// [`detach`] does. What comes back is in the order the queue runs it: a
 /// new entry starts at every part that has waits; host lists without
 /// waits join the entry before them. The list's upload memory and draw
@@ -442,8 +451,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        // The title's next call on its list is a reset, which wants it
-        // closed.
+        // The title's next call on its list is a reset ([`closed_list`]).
         let Some(fresh) = closed_list() else {
             continue;
         };
@@ -453,6 +461,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
+        host.close_if_open();
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
@@ -499,8 +508,9 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 }
 
 /// Takes the host sides of submitted lists (each once, however often the
-/// submission names it) and leaves each list a new, closed host list for
-/// its next reset: what was taken, and which of them run in what order.
+/// submission names it) and leaves each list a host list for its next
+/// reset ([`closed_list`]): what was taken, and which of them run in what
+/// order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
     let mut taken: Vec<(This, Detached)> = Vec::new();
@@ -513,8 +523,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        // The title's next call on its list is a reset, which wants it
-        // closed.
+        // The title's next call on its list is a reset ([`closed_list`]).
         let Some(fresh) = closed_list() else {
             continue;
         };
@@ -531,6 +540,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
                 std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
             (host, uploads, state)
         };
+        host.close_if_open();
         order.push(taken.len());
         taken.push((
             this,
@@ -848,7 +858,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 )
             };
             // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            unsafe { list.list.barriers(host) };
         }
     }
     0
@@ -861,8 +871,9 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // SAFETY: an open list and a live texture (the list's states hold
+        // it).
+        unsafe { list.list.barriers(&[barrier]) };
     }
 }
 
@@ -1789,14 +1800,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
             with_state(this, |_, state| state.copied());
             return;
         }
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        list.defer_raw_copy(dst as usize, src as usize, len);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
@@ -1922,7 +1926,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            unsafe { list.list.barriers(&[barrier]) };
         }
     }
     let _ = (this, flags, control, address, size);
@@ -2202,6 +2206,18 @@ mod state {
 
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TOTALS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Since the start, never reset (`crate::popwatch` takes the difference
+/// between two presented frames): draws of any kind, dispatches, indirect
+/// executions.
+static TOTALS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// See [`TOTALS`] (read by `crate::popwatch`, a diagnostics module).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn totals() -> [u64; 3] {
+    TOTALS.each_ref().map(|t| t.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
@@ -2231,6 +2247,7 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    TOTALS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
@@ -2281,6 +2298,7 @@ pub(crate) fn take_indirect() -> u64 {
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TOTALS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 #[cfg(not(windows))]
 extern "system" fn dispatch(_: This) {
@@ -2495,7 +2513,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { list.list.barriers(&[barrier]) };
     }
     #[cfg(not(windows))]
     let _ = (this, count);
@@ -2773,6 +2791,60 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// The host lists of a title's list reach execution closed: the one it
+    /// records into after the Reset that follows a submission, and the one
+    /// a second submission with no Reset in between takes. Through the
+    /// title's own calls, with the lists run by a real submission.
+    #[cfg(windows)]
+    #[test]
+    fn host_lists_reach_execution_closed_after_a_reset_and_when_submitted_twice() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping: no D3D12 device");
+            return;
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let open = |list: This| !host_list(list).expect("a host list").is_closed();
+        // The first recording: closed by the title, taken by a submission.
+        assert_eq!(close(list), S_OK);
+        let first = detach(&[list]);
+        assert!(first.0[0].host().is_closed());
+        // (A list given back closed, `crate::host::off_line`, may be the one
+        // given in its place.)
+        let pooled_closed = crate::host::off_line();
+        assert!(open(list) || pooled_closed, "the host list given in its place is left open");
+        // The title's next Reset, a command, its Close, and the submission.
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(open(list), "open for recording after the Reset");
+        state::stencil_ref(list, 1);
+        assert_eq!(close(list), S_OK);
+        let second = detach(&[list]);
+        assert!(second.0[0].host().is_closed(), "the recording after the Reset");
+        // Submitted again with no Reset in between: the list left open by
+        // the second submission is taken, and closed for it.
+        assert!(open(list) || pooled_closed);
+        let third = detach(&[list]);
+        assert!(third.0[0].host().is_closed(), "the list taken with no Reset before");
+        // Where lists go to the queue none of them is open, and they run.
+        for (taken, order) in [first, second, third] {
+            assert_eq!(order, [0]);
+            {
+                let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| taken[i].host()).collect();
+                assert_eq!(crate::host::closed_for_execution(&runs), 0);
+                host.execute(&runs);
+            }
+            // SAFETY: a plain query of the device.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+            recycle(taken, &order);
+        }
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
