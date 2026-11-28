@@ -10677,7 +10677,7 @@ fn title_window() -> Option<HWND> {
         unsafe {
             GetWindowThreadProcessId(hwnd, Some(&mut process));
             if process == windows::Win32::System::Threading::GetCurrentProcessId()
-                && IsWindowVisible(hwnd).as_bool()
+                && could_be_the_titles(hwnd)
             {
                 *(found.0 as *mut Option<HWND>) = Some(hwnd);
                 return false.into();
@@ -10689,6 +10689,69 @@ fn title_window() -> Option<HWND> {
     // SAFETY: the callback only writes `found`, which outlives the call.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
     found
+}
+
+/// A visible window with no owner that is not a tool window, as the
+/// taskbar counts an application's windows. Launched from a terminal, the
+/// process also has the console's "PseudoConsoleWindow": visible, of no
+/// size, owned by the terminal's window and a tool window. Presented to,
+/// it showed nothing while the title's window stayed frozen, in about a
+/// third of the launches, whichever came first in the enumeration.
+fn could_be_the_titles(hwnd: HWND) -> bool {
+    // SAFETY: plain queries of a window handle.
+    unsafe {
+        let owned = GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| !owner.is_invalid());
+        let tool = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0;
+        IsWindowVisible(hwnd).as_bool() && !owned && !tool
+    }
+}
+
+#[cfg(test)]
+mod title_window_tests {
+    use super::could_be_the_titles;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::core::w;
+
+    fn make(ex_style: WINDOW_EX_STYLE, owner: Option<HWND>) -> HWND {
+        // SAFETY: a system class; far off the screen, destroyed by the test.
+        unsafe {
+            CreateWindowExW(
+                ex_style | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP | WS_VISIBLE,
+                -10_000,
+                -10_000,
+                10,
+                10,
+                owner,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn the_consoles_window_is_never_the_titles() {
+        let title = make(WINDOW_EX_STYLE(0), None);
+        // The pseudo console's window: owned, a tool window, of no size.
+        let console = make(WS_EX_TOOLWINDOW, Some(title));
+        let owned = make(WINDOW_EX_STYLE(0), Some(title));
+        let tool = make(WS_EX_TOOLWINDOW, None);
+        assert!(could_be_the_titles(title));
+        assert!(!could_be_the_titles(console));
+        assert!(!could_be_the_titles(owned));
+        assert!(!could_be_the_titles(tool));
+        // SAFETY: this thread's windows.
+        unsafe {
+            for hwnd in [console, owned, tool, title] {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+    }
 }
 
 /// `state` without the bits the host texture's flags forbid: the console
