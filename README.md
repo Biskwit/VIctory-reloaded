@@ -176,6 +176,22 @@ nothing from the game goes in the tree.*
       its fill after the title's records rather than before, as on the
       console; in the cell no slot is both (a diagnostics count,
       `VICTORY_SLOT_ORDER_COUNT=1`). Its gate ran at 37.8-40.0 ms a frame;
+    - the title's words in card blocks that shaders in flight may write go
+      up by mask, a bit a word for each 4 KiB, and a pass on the card stores
+      the words of set bits alone (`VICTORY_UNDER_MASKS=0`: as runs of
+      words, as before). They were about 100,000 runs a frame, most in the
+      title's 174 MB heap, which a view of the skinning passes declares
+      written whole 8.7 times a frame. In-run over 2 launches 37.8 -> 36.0
+      and 38.1 -> 36.6 ms a frame; a check launch each way found no copy
+      stale after a refresh. Its gate ran at 37.0 ms over 12 minutes;
+    - a host copy keeps a stamp of the range a look found up to date, which
+      every write the journal notes on its pages takes away: a refresh its
+      stamp holds is left out at once, with no lock taken
+      (`VICTORY_REFRESH_STAMPS=0`: looked at each time, as before). Of some
+      10,500 refreshes a frame, about 9,000 copied nothing. In-run over 2
+      launches 36.9 -> 36.4 and 38.1 -> 37.6 ms a frame; a check compared
+      about 1.7 million skipped refreshes with title memory and none
+      differed;
     - the write watch's journal keeps its pages in 4 MiB pieces instead of
       one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
       of 111; the submitting thread about 1 ms less a frame;
