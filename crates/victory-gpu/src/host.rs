@@ -5874,7 +5874,7 @@ impl Host {
     fn send_published(&self, mut h: Handoff) {
         let began = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        let split = Split::begin();
+        let split = Split::begin_sending();
         let mut stage = crate::timeline::span("sending: copies in the card's memory");
         // The compare's results start from the beginning only when no plan
         // is out: until the flights sent so far have landed (those published
@@ -8282,19 +8282,31 @@ impl std::hash::Hasher for AddressHash {
 #[cfg(feature = "diagnostics")]
 static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 
+/// [`SPLIT`]'s parts of a published submission done by the thread that sends
+/// it ([`Host::send_published`]), apart from the submitting thread's: what
+/// goes up to copies in the card's memory recorded (4), the wait for the
+/// heaps' records with the slots after it (15), the lists sent (5).
+#[cfg(feature = "diagnostics")]
+static SEND_SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
 /// Since the last frame-rate line: flushes of refreshes, their refreshes,
 /// those known to copy nothing, and those done on several threads.
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Counts into [`SPLIT`].
+/// Counts into [`SPLIT`], or [`SEND_SPLIT`].
 #[cfg(feature = "diagnostics")]
-struct Split(std::cell::Cell<std::time::Instant>);
+struct Split(std::cell::Cell<std::time::Instant>, &'static [std::sync::atomic::AtomicU64; 16]);
 
 #[cfg(feature = "diagnostics")]
 impl Split {
     fn begin() -> Split {
-        Split(std::cell::Cell::new(std::time::Instant::now()))
+        Split(std::cell::Cell::new(std::time::Instant::now()), &SPLIT)
+    }
+
+    /// On the thread that sends published submissions.
+    fn begin_sending() -> Split {
+        Split(std::cell::Cell::new(std::time::Instant::now()), &SEND_SPLIT)
     }
 
     /// Nanoseconds since the last part.
@@ -8305,7 +8317,7 @@ impl Split {
     /// What came since the last part was part `i`.
     fn part(&self, i: usize) {
         let now = std::time::Instant::now();
-        SPLIT[i].fetch_add((now - self.0.replace(now)).as_nanos() as u64, Ordering::Relaxed);
+        self.1[i].fetch_add((now - self.0.replace(now)).as_nanos() as u64, Ordering::Relaxed);
     }
 }
 
@@ -8349,6 +8361,17 @@ fn split_line(frames: f64) {
         e[0],
         e[1] / 1e3,
     );
+    let sent: Vec<f64> = SEND_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+    if sent.iter().any(|&ms| ms > 0.0) {
+        tracing::info!(
+            "the sending thread's part of the preparing per frame (VICTORY_SUBMIT_SPLIT): {:.1} ms recording what goes up to copies in \
+             the card's memory, {:.1} ms until the heaps' records were made (and the slots after them), {:.1} ms putting the lists on \
+             the queue",
+            sent[4],
+            sent[15],
+            sent[5],
+        );
+    }
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
          written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
