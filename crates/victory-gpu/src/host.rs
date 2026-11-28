@@ -8369,7 +8369,8 @@ fn split_line(frames: f64) {
     if sent.iter().any(|&ms| ms > 0.0) {
         tracing::info!(
             "the sending thread's part of the preparing per frame (VICTORY_SUBMIT_SPLIT): {:.1} ms recording what goes up to copies in \
-             the card's memory, {:.1} ms until the heaps' records were made (and the slots after them), {:.1} ms putting the lists on \
+             the card's memory, {:.1} ms recording the lists' preludes and until the heaps' records were made (and the slots after \
+             them), {:.1} ms putting the lists on \
              the queue",
             sent[4],
             sent[15],
