@@ -215,6 +215,16 @@ nothing from the game goes in the tree.*
       the noise between identical arms (about half of a saving on that
       thread reaches the frame now); its gate ran at 34.4 ms over 12
       minutes;
+    - the present's copy into the back buffer is sent by the sending
+      thread like the other submissions, and that thread also makes the
+      swap chain's Present behind it; every other call on the swap chain
+      first waits until the presents handed over are made, and at most one
+      is in the air (`VICTORY_PRESENT_OFF_LINE=0`: the present's thread,
+      as before). The submitting thread no longer waits for the sending
+      one at each present: in-run over 2 launches 35.9 -> 35.0 and 36.2 ->
+      35.5 ms a frame, the title's wait at presents 8.4 -> 6.65 and 9.0 ->
+      7.7. Its gate ran at 35.5-36.2 ms a frame; the frame's chain now
+      holds about 8 ms of the title's own work;
     - the write watch's journal keeps its pages in 4 MiB pieces instead of
       one tree: a look at a range, some 10,000 a frame, takes 20 ns instead
       of 111; the submitting thread about 1 ms less a frame;
