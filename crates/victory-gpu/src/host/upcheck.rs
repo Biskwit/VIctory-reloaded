@@ -98,8 +98,22 @@ pub(crate) struct Taken {
     new: Vec<u8>,
 }
 
-/// Refreshes since the last send, per copy (by its number).
-static NOTED: Mutex<BTreeMap<u64, Vec<Taken>>> = Mutex::new(BTreeMap::new());
+/// Refreshes, per copy (by its number).
+pub(super) type Noted = BTreeMap<u64, Vec<Taken>>;
+
+/// Refreshes since the last take ([`noted`]).
+static NOTED: Mutex<Noted> = Mutex::new(BTreeMap::new());
+
+/// The refreshes noted since the last call: those of the submission whose
+/// sends are being taken (`Host::card_take`, on the thread that prepares
+/// them, behind its refreshes). Taken there and not when its sends are
+/// recorded: with published submissions the thread that sends records them
+/// while later ones are prepared, and a later one's refresh, looked at ahead
+/// of this one's sends, held what they bring (an older value found where
+/// there is none).
+pub(super) fn noted() -> Noted {
+    std::mem::take(&mut *NOTED.lock().unwrap_or_else(|e| e.into_inner()))
+}
 
 /// At most this much is looked at per submission.
 const MOST: usize = 128 << 20;
@@ -151,13 +165,13 @@ struct Stale {
 static STALE: Mutex<BTreeMap<(u64, u64), Stale>> = Mutex::new(BTreeMap::new());
 
 /// Records the looks at what `dirty` sends up into `list`, ahead of the
-/// sends.
+/// sends, at what was `noted` with them.
 pub(super) fn record(
     host: &Host,
     list: &ID3D12GraphicsCommandList,
     dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
+    mut noted: Noted,
 ) -> Option<Looks> {
-    let mut noted = std::mem::take(&mut *NOTED.lock().unwrap_or_else(|e| e.into_inner()));
     let mut all: Vec<(std::sync::Arc<Shadow>, Taken)> = Vec::new();
     let mut total = 0;
     for (shadow, _) in dirty {

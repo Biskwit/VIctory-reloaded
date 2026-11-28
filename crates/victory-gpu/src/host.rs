@@ -4020,6 +4020,8 @@ struct CardTake {
     masked: Vec<Vec<crate::masked::Masked>>,
     whole: Vec<std::sync::Arc<crate::shadow::Shadow>>,
     own: Option<send::Own>,
+    /// With [`upcheck`]: the refreshes noted with what is taken.
+    noted: upcheck::Noted,
 }
 
 /// The queue fence behind a submission and, if it was sent ahead, the
@@ -6079,6 +6081,7 @@ impl Host {
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let (mut dirty, mut masked) = crate::shadow::card_dirty(sent_as);
         gathering.end();
+        let noted = if upcheck::on() { upcheck::noted() } else { upcheck::Noted::new() };
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
         }
@@ -6111,6 +6114,7 @@ impl Host {
             masked,
             whole,
             own,
+            noted,
         })
     }
 
@@ -6127,6 +6131,7 @@ impl Host {
             masked,
             whole,
             own,
+            noted,
         } = take;
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
@@ -6147,7 +6152,7 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     if upcheck::on() {
-                        looks = upcheck::record(self, list, &dirty);
+                        looks = upcheck::record(self, list, &dirty, noted);
                     }
                     // Every copy first, then one barrier call, then every
                     // pass: a wait between each copy and its pass had the
