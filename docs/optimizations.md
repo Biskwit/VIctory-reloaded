@@ -198,12 +198,16 @@ i9-12900K with an RTX 4090 unless it says otherwise. The
       35.0-36.5 ms a frame and 34.3-35.5 ms a minute over 12 minutes;
     - the plan of a submission's steps on the card, made when deciding
       whether to cut it, is kept for the same submission's steps instead of
-      made again (`VICTORY_PLAN_ONCE=0`: planned twice, as before), and the
-      card work is found ready without its lock: the submitting thread's
-      card steps 0.5 ms shorter in 3 launches. The frame moves less than
-      the noise between identical arms (about half of a saving on that
-      thread reaches the frame now); its gate ran at 34.4 ms over 12
-      minutes;
+      made again (`VICTORY_PLAN_ONCE=0`: planned twice, as before): the
+      submitting thread's card steps 0.5 ms shorter in 3 launches. The frame
+      moves less than the noise between identical arms (about half of a
+      saving on that thread reaches the frame now); its gate ran at 34.4 ms
+      over 12 minutes. The card work found ready without its lock, merged
+      with it (bc435150), was taken back (2ddf804f): it let the next
+      submission's taking overlap the sending thread's recording of the one
+      before, and the up-copy check's older values sent over the card's
+      words rose from 0-2% of its looks to 9-18% (a bisection over the
+      merged builds); with the wait back, 1-5%, for ~0.36 ms of that thread;
     - the present's copy into the back buffer is sent by the sending
       thread like the other submissions, and that thread also makes the
       swap chain's Present behind it; every other call on the swap chain

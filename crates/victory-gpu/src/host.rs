@@ -6082,11 +6082,7 @@ impl Host {
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
         }
-        // (Not under CARD_WORK's lock, which the thread that sends holds while
-        // it records: the work is made once, before any copy is the card's.)
-        if !self.card_ready() {
-            return None;
-        }
+        CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?;
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
